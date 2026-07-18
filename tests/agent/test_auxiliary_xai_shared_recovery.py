@@ -192,3 +192,80 @@ def test_proxy_adapter_uses_canonical_and_retries_403(shared_env, monkeypatch):
     assert retry is not None
     assert retry.bearer == "fresh-at"
     assert posts == ["rt-1"]
+
+
+def test_f6_fallback_chain_passes_rejected_bearer(shared_env, monkeypatch):
+    """F6: fallback-chain 401 recovery passes rejected bearer (adopt winner)."""
+    from agent import auxiliary_client as aux
+
+    old = _jwt(int(time.time()) + 30)
+    _write_shared(shared_env, access=old, refresh="rt-1", generation=1)
+    posts = []
+
+    def fake_pure(access, refresh, **kwargs):
+        posts.append(refresh)
+        return {
+            "access_token": "should-not",
+            "refresh_token": "should-not",
+            "token_type": "Bearer",
+            "last_refresh": "2026-07-18T00:00:00Z",
+        }
+
+    monkeypatch.setattr(auth, "refresh_xai_oauth_pure", fake_pure)
+    # Concurrent winner already rotated the grant.
+    _write_shared(shared_env, access="winner-at", refresh="winner-rt", generation=2)
+
+    class BoomCompletions:
+        def create(self, **kwargs):
+            err = Exception("401 unauthorized")
+            err.status_code = 401
+            raise err
+
+    class BoomChat:
+        completions = BoomCompletions()
+
+    class BoomClient:
+        api_key = old
+        base_url = "https://api.x.ai/v1/"
+        chat = BoomChat()
+
+    retry_client = SimpleNamespace(
+        api_key="winner-at",
+        base_url="https://api.x.ai/v1/",
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **kw: SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+                )
+            )
+        ),
+    )
+
+    with patch.object(aux, "_is_auth_error", return_value=True), patch.object(
+        aux, "_auth_refresh_provider_for_route", return_value="xai-oauth"
+    ), patch.object(
+        aux, "_get_cached_client", return_value=(retry_client, "grok")
+    ), patch.object(
+        aux, "_validate_llm_response", side_effect=lambda r, t: r
+    ), patch.object(
+        aux, "_build_call_kwargs", return_value={"model": "grok", "messages": []}
+    ), patch.object(
+        aux, "_evict_cached_clients"
+    ), patch.object(
+        aux, "_mark_provider_unhealthy"
+    ):
+        result = aux._call_fallback_candidate_sync(
+            BoomClient(),
+            "grok",
+            "fallback_chain[0](xai-oauth)",
+            task="compression",
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=None,
+            max_tokens=16,
+            tools=None,
+            effective_timeout=30.0,
+            effective_extra_body={},
+            reasoning_config=None,
+        )
+    assert result is not None
+    assert posts == []  # adopted winner — no second POST

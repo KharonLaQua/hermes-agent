@@ -785,3 +785,320 @@ def test_persistence_guard_strips_device_code_rt(shared_env):
     assert len(entries) == 1
     assert not entries[0].get("refresh_token")
     assert entries[0]["source"] == auth.XAI_SHARED_SOURCE
+
+
+# ---------------------------------------------------------------------------
+# Round-3 F1–F7: fail-closed / fail-loud / auto-promote
+# ---------------------------------------------------------------------------
+
+
+def test_f1_load_pool_empty_shared_promotes_device_code_rt(shared_env):
+    """F1: empty shared + sole device_code RT → promote, never lose the RT."""
+    from agent.credential_pool import load_pool
+
+    assert not shared_env["store"].exists()
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="solo-at", refresh="solo-rt", manual=False
+    )
+
+    pool = load_pool("xai-oauth")
+    assert pool.has_credentials()
+
+    shared = json.loads(shared_env["store"].read_text(encoding="utf-8"))
+    assert shared["refresh_token"] == "solo-rt"
+    assert shared["access_token"] == "solo-at"
+
+    profile = json.loads(shared_env["profile_auth"].read_text(encoding="utf-8"))
+    assert not auth._auth_store_holds_durable_xai_refresh_token(profile)
+    for entry in pool.entries():
+        assert not entry.refresh_token
+        assert entry.source == auth.XAI_SHARED_SOURCE
+
+
+def test_f1_load_pool_empty_shared_promotes_manual_rt(shared_env):
+    """F1: empty shared + sole manual RT → promote, never lose the RT."""
+    from agent.credential_pool import load_pool
+
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="man-at", refresh="man-rt", manual=True
+    )
+    # Pool-only manual (providers tokens also present via seed helper).
+    pool = load_pool("xai-oauth")
+    shared = json.loads(shared_env["store"].read_text(encoding="utf-8"))
+    assert shared["refresh_token"] == "man-rt"
+    profile = json.loads(shared_env["profile_auth"].read_text(encoding="utf-8"))
+    assert not auth._auth_store_holds_durable_xai_refresh_token(profile)
+    assert pool.has_credentials()
+
+
+def test_f1_resolve_empty_shared_promotes_local_rt(shared_env):
+    """F1: resolve with empty shared + local RT promotes rather than failing."""
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="r-at", refresh="r-rt", manual=False
+    )
+    assert not shared_env["store"].exists()
+    creds = auth.resolve_xai_oauth_runtime_credentials(refresh_if_expiring=False)
+    assert creds["api_key"] == "r-at"
+    shared = json.loads(shared_env["store"].read_text(encoding="utf-8"))
+    assert shared["refresh_token"] == "r-rt"
+
+
+def test_f1_poisoned_shared_write_preserves_local_rt(shared_env, monkeypatch):
+    """F1: if shared write fails, local RT must remain and error surfaces."""
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="keep-at", refresh="keep-rt"
+    )
+
+    def boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "open", boom)
+    with pytest.raises(AuthError):
+        auth.ensure_shared_xai_grant_from_local(strip_legacy=True)
+
+    assert not shared_env["store"].exists()
+    profile = json.loads(shared_env["profile_auth"].read_text(encoding="utf-8"))
+    assert auth._auth_store_holds_durable_xai_refresh_token(profile)
+    tokens = profile["providers"]["xai-oauth"]["tokens"]
+    assert tokens["refresh_token"] == "keep-rt"
+
+
+def test_f2_resolve_http_fail_closed_profile_disabled(shared_env, monkeypatch):
+    """F2: shared mode + profile disabled + surviving manual row → not returned."""
+    from tools.xai_http import has_xai_credentials, resolve_xai_http_credentials
+
+    _write_shared(shared_env, access="shared-at", refresh="shared-rt")
+    auth.disable_profile_xai_shared_auth()
+    # Plant a surviving manual-style row that legacy would have picked.
+    store = json.loads(shared_env["profile_auth"].read_text(encoding="utf-8"))
+    store.setdefault("credential_pool", {})["xai-oauth"] = [
+        {
+            "id": "manual-surviving",
+            "source": "manual:device_code",
+            "auth_type": "oauth",
+            "access_token": "manual-at",
+            "refresh_token": "manual-rt",
+            "priority": 0,
+        }
+    ]
+    shared_env["profile_auth"].write_text(json.dumps(store), encoding="utf-8")
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+
+    assert has_xai_credentials() is False
+    creds = resolve_xai_http_credentials()
+    assert creds.get("api_key") in ("", None)
+    assert creds.get("source") != auth.XAI_SHARED_SOURCE
+    assert creds.get("api_key") != "manual-at"
+
+
+def test_f2_resolve_http_fail_closed_empty_canonical(shared_env, monkeypatch):
+    """F2: empty shared + no promotable grant + leftover access-only pool row."""
+    from tools.xai_http import has_xai_credentials, resolve_xai_http_credentials
+
+    # Access-only pool row (no RT) — cannot promote; must not win under shared.
+    shared_env["profile_auth"].write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "credential_pool": {
+                    "xai-oauth": [
+                        {
+                            "id": "orphan",
+                            "source": "manual:device_code",
+                            "auth_type": "oauth",
+                            "access_token": "orphan-at",
+                            "priority": 0,
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    assert has_xai_credentials() is False
+    creds = resolve_xai_http_credentials()
+    assert creds.get("api_key") != "orphan-at"
+
+
+def test_f2_proxy_fail_closed_profile_disabled(shared_env):
+    """F2: proxy does not return a legacy pool row when profile is disabled."""
+    from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
+
+    _write_shared(shared_env, access="shared-at", refresh="shared-rt")
+    auth.disable_profile_xai_shared_auth()
+    store = json.loads(shared_env["profile_auth"].read_text(encoding="utf-8"))
+    store.setdefault("credential_pool", {})["xai-oauth"] = [
+        {
+            "id": "manual-1",
+            "source": "manual:device_code",
+            "auth_type": "oauth",
+            "access_token": "manual-at",
+            "refresh_token": "manual-rt",
+            "priority": 0,
+        }
+    ]
+    shared_env["profile_auth"].write_text(json.dumps(store), encoding="utf-8")
+
+    adapter = XAIGrokAdapter()
+    assert adapter.is_authenticated() is False
+    with pytest.raises(RuntimeError, match="disabled"):
+        adapter.get_credential()
+
+
+def test_f3a_enumeration_failure_fails_strip(shared_env, monkeypatch):
+    """F3a: profile enumeration failure fails migration/strip (no silent omit)."""
+
+    def boom():
+        raise OSError("profiles root unreadable")
+
+    monkeypatch.setattr("hermes_cli.profiles._get_profiles_root", boom)
+    with pytest.raises(AuthError) as exc:
+        auth._strip_legacy_xai_oauth_secrets(include_global_root=True, fail_loud=True)
+    assert exc.value.code == "xai_shared_profile_enum_failed"
+
+
+def test_f3b_disable_marker_write_failure_raises(shared_env, monkeypatch):
+    """F3b: disable marker write failure raises — no false success."""
+    _write_shared(shared_env, access="a", refresh="r")
+
+    def boom(*_a, **_k):
+        raise OSError("cannot write auth.json")
+
+    monkeypatch.setattr(auth, "_save_auth_store", boom)
+    with pytest.raises(AuthError) as exc:
+        auth.disable_profile_xai_shared_auth()
+    assert exc.value.code in {
+        "xai_shared_reference_write_failed",
+        "xai_shared_disable_failed",
+    }
+    # Marker must not falsely claim disabled.
+    assert auth._profile_xai_shared_disabled() is False
+
+
+def test_f3c_global_logout_surfaces_strip_failure(shared_env, monkeypatch, capsys):
+    """F3c: global logout does not report success when fleet strip fails."""
+    from types import SimpleNamespace
+
+    _write_shared(shared_env, access="a", refresh="r")
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="left", refresh="left-rt"
+    )
+
+    def fail_strip(**_k):
+        raise AuthError(
+            "residual rt",
+            provider="xai-oauth",
+            code="xai_shared_strip_incomplete",
+        )
+
+    monkeypatch.setattr(auth, "_strip_legacy_xai_oauth_secrets", fail_strip)
+    args = SimpleNamespace(
+        provider="xai-oauth",
+        reset_config=False,
+        global_logout=True,
+        shared=False,
+        **{"global": False},
+    )
+    with pytest.raises(SystemExit) as exc:
+        auth.logout_command(args)
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "ERROR" in out
+    assert "Logged out" not in out
+
+
+def test_f4a_enable_gate_off_no_strip(monkeypatch, tmp_path):
+    """F4a: enable with gate OFF does not strip multi-profile RTs."""
+    monkeypatch.delenv("HERMES_XAI_SHARED_AUTH", raising=False)
+    monkeypatch.delenv("HERMES_SHARED_AUTH_PROVIDERS", raising=False)
+    hermes_home = tmp_path / "profile"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    auth_path = hermes_home / "auth.json"
+    _seed_legacy_pool_auth(auth_path, access="local-at", refresh="local-rt")
+
+    with pytest.raises(AuthError) as exc:
+        auth.enable_profile_xai_shared_auth()
+    assert exc.value.code == "xai_shared_not_enabled"
+
+    store = json.loads(auth_path.read_text(encoding="utf-8"))
+    assert auth._auth_store_holds_durable_xai_refresh_token(store)
+
+
+def test_f4a_enable_empty_shared_no_strip(shared_env):
+    """F4a: enable with empty shared store refuses and leaves local RT."""
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="local-at", refresh="local-rt"
+    )
+    with pytest.raises(AuthError) as exc:
+        auth.enable_profile_xai_shared_auth()
+    assert exc.value.code == "xai_shared_empty"
+    profile = json.loads(shared_env["profile_auth"].read_text(encoding="utf-8"))
+    assert auth._auth_store_holds_durable_xai_refresh_token(profile)
+
+
+def test_f4b_disable_gate_off_raises(monkeypatch, tmp_path):
+    """F4b: disable-shared requires gate ON; does not strip tokens when off."""
+    monkeypatch.delenv("HERMES_XAI_SHARED_AUTH", raising=False)
+    monkeypatch.delenv("HERMES_SHARED_AUTH_PROVIDERS", raising=False)
+    hermes_home = tmp_path / "profile"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    auth_path = hermes_home / "auth.json"
+    _seed_legacy_pool_auth(auth_path, access="local-at", refresh="local-rt")
+
+    with pytest.raises(AuthError) as exc:
+        auth.disable_profile_xai_shared_auth()
+    assert exc.value.code == "xai_shared_not_enabled"
+    store = json.loads(auth_path.read_text(encoding="utf-8"))
+    assert auth._auth_store_holds_durable_xai_refresh_token(store)
+
+
+def test_f4b_write_reference_gate_off_does_not_strip(monkeypatch, tmp_path):
+    """F4b: reference writer must not strip tokens when shared mode is off."""
+    monkeypatch.delenv("HERMES_XAI_SHARED_AUTH", raising=False)
+    monkeypatch.delenv("HERMES_SHARED_AUTH_PROVIDERS", raising=False)
+    hermes_home = tmp_path / "profile"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    auth_path = hermes_home / "auth.json"
+    _seed_legacy_pool_auth(auth_path, access="local-at", refresh="local-rt")
+
+    # Direct writer call with gate off should preserve RTs.
+    auth._write_profile_xai_shared_reference(enabled=False)
+    store = json.loads(auth_path.read_text(encoding="utf-8"))
+    assert auth._auth_store_holds_durable_xai_refresh_token(store)
+
+
+def test_f7_migrate_preserves_id_token(shared_env):
+    """F7: migration copies tokens.id_token into the shared store."""
+    shared_env["profile_auth"].write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "providers": {
+                    "xai-oauth": {
+                        "tokens": {
+                            "access_token": "legacy-at",
+                            "refresh_token": "legacy-rt",
+                            "id_token": "legacy-id-token",
+                        },
+                        "last_refresh": "2026-06-01T00:00:00Z",
+                        "auth_mode": "oauth_device_code",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    written = auth.migrate_xai_oauth_to_shared_store(source="profile", strip_legacy=True)
+    assert written.get("id_token") == "legacy-id-token"
+    shared = json.loads(shared_env["store"].read_text(encoding="utf-8"))
+    assert shared.get("id_token") == "legacy-id-token"

@@ -2478,6 +2478,10 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         # canonical shared store. Do NOT re-fork the refresh_token into the
         # profile pool (G1). A3/A4: rewrite/discard pre-existing device_code
         # and same-family manual rows so they cannot pure-refresh a local RT.
+        #
+        # F1 (CRITICAL): NEVER strip the last local RT while the canonical
+        # store is empty. Auto-promote first (durable shared write), THEN
+        # strip. If promotion cannot write, leave local intact and surface.
         if auth_mod._xai_shared_auth_enabled():
             if auth_mod._profile_xai_shared_disabled():
                 return changed, active_sources
@@ -2485,7 +2489,16 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
             if _is_suppressed(provider, source) or _is_suppressed(provider, "device_code"):
                 return changed, active_sources
 
-            # A3/A4: rewrite legacy local rows in-place before seeding.
+            # Promote local → shared BEFORE any in-memory or on-disk strip.
+            # Raises AuthError on write/strip failure after a local grant was
+            # found (local RT preserved when the shared write itself failed).
+            shared = auth_mod.ensure_shared_xai_grant_from_local(strip_legacy=True)
+            if not auth_mod._xai_shared_state_has_usable_tokens(shared):
+                # Truly empty — leave any residual local rows alone; do not
+                # invent a "shared" seed and do not destroy local grants.
+                return changed, active_sources
+
+            # Shared has a durable grant: safe to rewrite/drop local forks.
             rewritten: List[PooledCredential] = []
             for entry in list(entries):
                 entry_source = str(entry.source or "")
@@ -2519,37 +2532,34 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                 entries[:] = rewritten
                 changed = True
 
-            shared = auth_mod._read_shared_xai_state()
-            if auth_mod._xai_shared_state_has_usable_tokens(shared):
-                assert shared is not None
-                active_sources.add(source)
-                from hermes_cli.auth import DEFAULT_XAI_OAUTH_BASE_URL
+            assert shared is not None
+            active_sources.add(source)
+            from hermes_cli.auth import DEFAULT_XAI_OAUTH_BASE_URL
 
-                access = str(shared.get("access_token") or "")
-                changed |= _upsert_entry(
-                    entries,
-                    provider,
-                    source,
-                    {
-                        "source": source,
-                        "auth_type": AUTH_TYPE_OAUTH,
-                        "access_token": access,
-                        # Raw RT stripped at the persistence boundary via
-                        # borrowed-source sanitization; never seed it here.
-                        "refresh_token": None,
-                        "base_url": DEFAULT_XAI_OAUTH_BASE_URL,
-                        "last_refresh": shared.get("last_refresh"),
-                        "label": label_from_token(access, source),
-                    },
-                )
+            access = str(shared.get("access_token") or "")
+            changed |= _upsert_entry(
+                entries,
+                provider,
+                source,
+                {
+                    "source": source,
+                    "auth_type": AUTH_TYPE_OAUTH,
+                    "access_token": access,
+                    # Raw RT stripped at the persistence boundary via
+                    # borrowed-source sanitization; never seed it here.
+                    "refresh_token": None,
+                    "base_url": DEFAULT_XAI_OAUTH_BASE_URL,
+                    "last_refresh": shared.get("last_refresh"),
+                    "label": label_from_token(access, source),
+                },
+            )
 
-            # First shared use / load_pool: also strip providers.xai-oauth
-            # durable secrets on the active profile so a leftover singleton RT
-            # cannot outlive the pool rewrite (A1/A3).
-            try:
-                if auth_mod._auth_store_holds_durable_xai_refresh_token(
-                    _load_auth_store()
-                ):
+            # Active-profile residual strip (A1/A3). Fail loud (F3c) — never
+            # silently leave a durable local RT after seeding shared.
+            if auth_mod._auth_store_holds_durable_xai_refresh_token(
+                _load_auth_store()
+            ):
+                try:
                     with _auth_store_lock():
                         store = _load_auth_store()
                         if auth_mod._strip_xai_secrets_in_store(
@@ -2557,10 +2567,27 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                         ):
                             _save_auth_store(store)
                             changed = True
-            except Exception as exc:
-                logger.debug(
-                    "xAI shared: load_pool profile secret strip failed: %s", exc
-                )
+                        verify = _load_auth_store()
+                        if auth_mod._auth_store_holds_durable_xai_refresh_token(
+                            verify
+                        ):
+                            raise auth_mod.AuthError(
+                                "Shared xAI OAuth load_pool could not strip residual "
+                                "durable refresh_token from the active profile after "
+                                "seeding the shared reference.",
+                                provider="xai-oauth",
+                                code="xai_shared_strip_incomplete",
+                                relogin_required=False,
+                            )
+                except auth_mod.AuthError:
+                    raise
+                except Exception as exc:
+                    raise auth_mod.AuthError(
+                        f"Shared xAI OAuth load_pool profile secret strip failed: {exc}",
+                        provider="xai-oauth",
+                        code="xai_shared_strip_incomplete",
+                        relogin_required=False,
+                    ) from exc
             return changed, active_sources
 
         # Legacy: When the user logs in via ``hermes model`` -> xAI Grok OAuth,

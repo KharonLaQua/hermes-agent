@@ -4021,7 +4021,13 @@ def _call_fallback_candidate_sync(
         if not _is_auth_error(fb_err):
             raise
         fb_provider = _auth_refresh_provider_for_route(fb_label, fb_base)
-        if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider):
+        # F6: pass the rejected bearer so shared xAI adopts a concurrent winner
+        # instead of force-rotating the single-use RT a second time.
+        _rejected_bearer = str(getattr(fb_client, "api_key", None) or "").strip() or None
+        if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(
+            fb_provider,
+            rejected_api_key=_rejected_bearer,
+        ):
             retry_client, retry_model = _get_cached_client(fb_provider, fb_model)
             if retry_client is not None:
                 retry_kwargs = _build_call_kwargs(
@@ -4087,7 +4093,13 @@ async def _call_fallback_candidate_async(
         if not _is_auth_error(fb_err):
             raise
         fb_provider = _auth_refresh_provider_for_route(fb_label, fb_base)
-        if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider):
+        # F6: pass the rejected bearer so shared xAI adopts a concurrent winner
+        # instead of force-rotating the single-use RT a second time.
+        _rejected_bearer = str(getattr(fb_client, "api_key", None) or "").strip() or None
+        if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(
+            fb_provider,
+            rejected_api_key=_rejected_bearer,
+        ):
             retry_client, retry_model = _get_cached_client(
                 fb_provider, fb_model, async_mode=True)
             if retry_client is not None:

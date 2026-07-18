@@ -26,13 +26,13 @@ def has_xai_credentials() -> bool:
     Resolution order, fast-to-slow:
 
     1. ``XAI_API_KEY`` env var (cheapest; covers explicit-key users).
-    2. **Shared mode (C2):** the canonical shared store has usable tokens
+    2. **Shared mode (C2/F2):** the canonical shared store has usable tokens
        (single file read, no refresh). Profile-disabled → False.
-    3. ``~/.hermes/auth.json`` has a non-empty ``providers.xai-oauth.tokens.access_token``
-       (single file read, no expiry check, no refresh).
-    4. ``credential_pool.xai-oauth`` has any entry with a non-empty
-       ``access_token`` (covers multi-account ``hermes auth add xai-oauth``
-       grants that are pool-only / ``manual:device_code``).
+       Empty shared + local grant that can be auto-promoted (F1) → True.
+       Never treats a surviving legacy pool/manual row as available when
+       shared mode is on and the profile is disabled / canonical is broken.
+    3. (gate OFF only) ``~/.hermes/auth.json`` providers.xai-oauth access_token
+       or pool-only grants.
 
     Returns False on any exception so a corrupted auth store can't block
     other availability scans. Truthful refresh + expiry handling happens
@@ -49,9 +49,15 @@ def has_xai_credentials() -> bool:
             shared = auth_mod._read_shared_xai_state()
             if auth_mod._xai_shared_state_has_usable_tokens(shared):
                 return True
-            # Clean shared mode with no grant → not available.
-            # Fall through only when shared file is empty so legacy pool
-            # rows during migration still light up availability.
+            # F1/F2: empty shared still counts when a local grant can be
+            # auto-promoted. Do NOT fall through to treat a surviving manual
+            # row as "available" when the profile is disabled (already
+            # returned) or when no promotable grant exists.
+            try:
+                local = auth_mod._xai_oauth_state_from_store(auth_mod._load_auth_store())
+            except Exception:
+                local = None
+            return bool(auth_mod._xai_oauth_state_has_usable_tokens(local))
     except Exception:
         pass
     try:
@@ -280,15 +286,18 @@ def resolve_xai_http_credentials(
     so a freshly loaded multi-account pool refreshes the exact issuing entry,
     not whichever entry its strategy would otherwise select first.
 
-    **Shared mode (C1/A6):** resolves the canonical shared store first — never
-    pool-first — so a legacy local/manual pool row cannot win over the fleet
-    grant.
+    **Shared mode (C1/A6/F2):** resolves the canonical shared store first —
+    never pool-first — so a legacy local/manual pool row cannot win over the
+    fleet grant. On canonical failure / empty / profile-disabled, FAIL CLOSED:
+    do not select a surviving legacy pool row. Only ``XAI_API_KEY`` remains as
+    a non-OAuth fallback. Empty shared + sole local grant auto-promotes (F1)
+    via the shared resolver before any strip.
     """
-    try:
-        import hermes_cli.auth as auth_mod
+    import hermes_cli.auth as auth_mod
 
-        # C1/A6: shared mode → canonical-first (not pool-first).
-        if auth_mod._xai_shared_auth_enabled():
+    # C1/A6/F2: shared mode → canonical only (no legacy pool fallback).
+    if auth_mod._xai_shared_auth_enabled():
+        try:
             creds = auth_mod.resolve_xai_oauth_runtime_credentials(
                 force_refresh=force_refresh,
                 refresh_if_expiring=not force_refresh,
@@ -314,12 +323,22 @@ def resolve_xai_http_credentials(
                     "source": auth_mod.XAI_SHARED_SOURCE,
                     "generation": creds.get("generation"),
                 }
-    except Exception:
-        pass
+        except Exception:
+            # Fail closed: do not select a legacy manual/pool OAuth row.
+            pass
+        # Non-OAuth API key is still allowed; OAuth pool is not.
+        api_key = str(get_env_value("XAI_API_KEY") or "").strip()
+        base_url = str(
+            get_env_value("XAI_BASE_URL") or "https://api.x.ai/v1"
+        ).strip().rstrip("/")
+        return {
+            "provider": "xai",
+            "api_key": api_key,
+            "base_url": base_url,
+        }
 
     try:
         from agent.credential_pool import load_pool
-        import hermes_cli.auth as auth_mod
 
         pool = load_pool("xai-oauth")
         entry = (

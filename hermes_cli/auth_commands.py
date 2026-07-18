@@ -825,11 +825,22 @@ def auth_xai_command(args) -> None:
             raise SystemExit(
                 "Shared xAI OAuth is not enabled. Set HERMES_XAI_SHARED_AUTH=1 first."
             )
-        auth_mod.enable_profile_xai_shared_auth()
+        try:
+            auth_mod.enable_profile_xai_shared_auth()
+        except auth_mod.AuthError as exc:
+            raise SystemExit(str(exc)) from exc
         print("Enabled shared xAI OAuth for this profile.")
         return
     if action == "disable-shared":
-        auth_mod.disable_profile_xai_shared_auth()
+        # F4b: gate must be on; never strip local tokens when shared mode is off.
+        if not auth_mod._xai_shared_auth_enabled():
+            raise SystemExit(
+                "Shared xAI OAuth is not enabled. Set HERMES_XAI_SHARED_AUTH=1 first."
+            )
+        try:
+            auth_mod.disable_profile_xai_shared_auth()
+        except auth_mod.AuthError as exc:
+            raise SystemExit(str(exc)) from exc
         print(
             "Disabled shared xAI OAuth for this profile only. "
             "Canonical grant is unchanged. Use `hermes logout --provider xai-oauth --global` "
