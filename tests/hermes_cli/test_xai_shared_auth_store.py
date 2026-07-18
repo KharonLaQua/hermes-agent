@@ -1409,69 +1409,84 @@ def test_r10_global_logout_leaves_non_promotable_tombstone(shared_env):
 # ---------------------------------------------------------------------------
 
 
-def test_h1_logout_after_recheck_before_write_aborts(shared_env, monkeypatch):
-    """H1 exact window: clear local AFTER recheck confirms identity, BEFORE write.
+def test_h1_concurrent_real_logout_cannot_install_removed_grant(shared_env):
+    """H1: REAL concurrent clear_provider_auth vs unpatched promote.
 
-    Hermes race: profile lock was released after recheck; concurrent logout
-    cleared the source; promote still wrote the in-memory snapshot. Fix holds
-    the profile-source lock through a final re-verify + canonical write, so a
-    clear that lands after recheck is observed and promotion aborts.
+    A second thread runs the real logout path (``clear_provider_auth``), which
+    acquires the profile auth lock the normal way — no monkeypatch bypass of
+    the lock or of the election helper. Invariants after both threads join:
 
-    Call sequence under the fix:
-      1) ensure collect elect (live)
-      2) migrate collect elect (live)
-      3) commit recheck elect (live) → clear disk HERE (exact window)
-      4) commit final elect → sees gone → xai_promote_local_race
+    - If the canonical store holds ``race-rt``, promote must have reported
+      success under the held lock (logout blocked until commit, or ran after).
+    - If promote did not install a grant, the canonical store must NOT hold
+      the removed ``race-rt`` (no gap that writes a cleared source).
     """
     _seed_legacy_pool_auth(
         shared_env["profile_auth"], access="race-at", refresh="race-rt"
     )
     assert not shared_env["store"].exists()
 
-    real_elect = auth._elect_sole_promotable_xai_under_lock
-    live_returns = {"n": 0}
-    cleared_after_recheck = {"v": False}
+    barrier = threading.Barrier(2)
+    outcomes = {"promote": "unset", "logout": "unset", "promote_exc": None}
 
-    def elect_clear_after_recheck(path):
-        state = real_elect(path)
-        identity = auth._xai_oauth_refresh_identity(state)
-        if identity == "race-rt":
-            live_returns["n"] += 1
-            # After the commit recheck (3rd live return) succeeds, clear the
-            # local source — this is Hermes' after-recheck-before-write window.
-            if live_returns["n"] == 3 and not cleared_after_recheck["v"]:
-                shared_env["profile_auth"].write_text(
-                    json.dumps({"version": 1, "providers": {}}),
-                    encoding="utf-8",
-                )
-                cleared_after_recheck["v"] = True
-        return state
+    def do_promote():
+        barrier.wait(timeout=5.0)
+        try:
+            result = auth.migrate_xai_oauth_to_shared_store(
+                source="profile", strip_legacy=True
+            )
+            outcomes["promote"] = result
+        except Exception as exc:
+            outcomes["promote"] = None
+            outcomes["promote_exc"] = exc
 
-    real_write = auth._write_shared_xai_state
-    writes = {"n": 0}
+    def do_logout():
+        barrier.wait(timeout=5.0)
+        try:
+            outcomes["logout"] = auth.clear_provider_auth("xai-oauth")
+        except Exception as exc:
+            outcomes["logout"] = exc
 
-    def write_counting(*args, **kwargs):
-        writes["n"] += 1
-        return real_write(*args, **kwargs)
+    t_promote = threading.Thread(target=do_promote, name="h1-promote")
+    t_logout = threading.Thread(target=do_logout, name="h1-logout")
+    t_promote.start()
+    t_logout.start()
+    t_promote.join(timeout=30.0)
+    t_logout.join(timeout=30.0)
+    assert not t_promote.is_alive() and not t_logout.is_alive()
 
-    monkeypatch.setattr(
-        auth, "_elect_sole_promotable_xai_under_lock", elect_clear_after_recheck
+    store = shared_env["store"]
+    shared = None
+    if store.is_file():
+        shared = json.loads(store.read_text(encoding="utf-8"))
+
+    promote_ok = (
+        isinstance(outcomes["promote"], dict)
+        and outcomes["promote"].get("refresh_token") == "race-rt"
     )
-    monkeypatch.setattr(auth, "_write_shared_xai_state", write_counting)
-
-    result = auth.ensure_shared_xai_grant_from_local(strip_legacy=True)
-    assert result is None
-    assert cleared_after_recheck["v"] is True
-    # Write must not have committed the raced grant.
-    assert writes["n"] == 0
-    if shared_env["store"].exists():
-        shared = json.loads(shared_env["store"].read_text(encoding="utf-8"))
-        assert shared.get("refresh_token") not in {"race-rt"}
-        assert not auth._xai_shared_state_has_usable_tokens(shared)
+    if promote_ok:
+        assert shared is not None
+        assert shared.get("refresh_token") == "race-rt"
+        assert auth._xai_shared_state_has_usable_tokens(shared)
+    else:
+        # Promote lost the race or aborted — must not install removed grant.
+        if shared is not None:
+            assert shared.get("refresh_token") != "race-rt"
+            assert not (
+                auth._xai_shared_state_has_usable_tokens(shared)
+                and shared.get("refresh_token") == "race-rt"
+            )
+        # Race abort / empty source are acceptable; lock failures are not.
+        if outcomes["promote_exc"] is not None:
+            assert isinstance(outcomes["promote_exc"], AuthError)
+            assert outcomes["promote_exc"].code in {
+                "xai_promote_local_race",
+                "xai_migrate_source_empty",
+            }
 
 
 def test_h1_profile_lock_held_through_canonical_write(shared_env, monkeypatch):
-    """H1: profile-source lock is held across the canonical write (no gap)."""
+    """H1: foreign LOCK_NB probe — profile-source lock held across write."""
     _seed_legacy_pool_auth(
         shared_env["profile_auth"], access="hold-at", refresh="hold-rt"
     )
@@ -1479,12 +1494,7 @@ def test_h1_profile_lock_held_through_canonical_write(shared_env, monkeypatch):
     real_write = auth._write_shared_xai_state
 
     def write_probe(state, **kwargs):
-        # Non-blocking probe: if promote holds the profile auth lock, a second
-        # acquire with timeout 0 must fail / wait. Use the reentrancy tracker:
-        # same-thread re-acquire succeeds (RLock-like). Instead check the
-        # lock file is locked by attempting a foreign-thread acquire.
-        import threading
-
+        # Non-blocking foreign-thread probe against the REAL lock file.
         result_box = {"acquired": None}
 
         def try_acquire():
@@ -1510,9 +1520,7 @@ def test_h1_profile_lock_held_through_canonical_write(shared_env, monkeypatch):
         t = threading.Thread(target=try_acquire)
         t.start()
         t.join(timeout=2.0)
-        held_during_write["value"] = (
-            result_box["acquired"] is False
-        )  # False acquire ⇒ lock held
+        held_during_write["value"] = result_box["acquired"] is False
         return real_write(state, **kwargs)
 
     monkeypatch.setattr(auth, "_write_shared_xai_state", write_probe)
@@ -1550,6 +1558,64 @@ def test_h2_distinct_profile_and_root_rts_are_ambiguous(shared_env, tmp_path, mo
     if shared_env["store"].exists():
         shared = json.loads(shared_env["store"].read_text(encoding="utf-8"))
         assert shared.get("refresh_token") not in {"prof-rt-A", "root-rt-B"}
+
+
+def test_h2_unreadable_store_fails_election(shared_env, tmp_path, monkeypatch):
+    """H2 fail-closed: unreadable/corrupt store fails election (never omit)."""
+    hermes_root = tmp_path / "home" / ".hermes"
+    hermes_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_default_hermes_home", lambda: hermes_root
+    )
+    monkeypatch.setattr(
+        "hermes_constants.get_default_hermes_root", lambda: hermes_root
+    )
+    root_auth = hermes_root / "auth.json"
+    root_auth.write_text("{not-json", encoding="utf-8")
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="prof-at", refresh="prof-rt"
+    )
+    monkeypatch.setattr(auth, "_global_auth_file_path", lambda: root_auth)
+
+    with pytest.raises(AuthError) as exc:
+        auth.ensure_shared_xai_grant_from_local(strip_legacy=True)
+    assert exc.value.code in {
+        "xai_auth_store_unreadable",
+        "auth_store_unreadable",
+    }
+    # Must not have silently promoted the readable profile grant.
+    if shared_env["store"].exists():
+        shared = json.loads(shared_env["store"].read_text(encoding="utf-8"))
+        assert shared.get("refresh_token") != "prof-rt"
+
+
+def test_h2_availability_probe_no_profile_first_short_circuit(
+    shared_env, tmp_path, monkeypatch
+):
+    """H2: has_xai_credentials / is_authenticated match promoter on ambiguity."""
+    from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
+    from tools.xai_http import has_xai_credentials
+
+    hermes_root = tmp_path / "home" / ".hermes"
+    hermes_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_default_hermes_home", lambda: hermes_root
+    )
+    monkeypatch.setattr(
+        "hermes_constants.get_default_hermes_root", lambda: hermes_root
+    )
+    root_auth = hermes_root / "auth.json"
+    _seed_legacy_pool_auth(root_auth, access="root-at", refresh="root-rt-B")
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="prof-at", refresh="prof-rt-A"
+    )
+    monkeypatch.setattr(auth, "_global_auth_file_path", lambda: root_auth)
+    # Empty/never-initialized shared so probes fall into local promote check.
+    assert not shared_env["store"].exists()
+
+    assert has_xai_credentials() is False
+    adapter = XAIGrokAdapter()
+    assert adapter.is_authenticated() is False
 
 
 def test_h3_stale_marker_reaudits_restored_profile_rt(
@@ -1597,11 +1663,217 @@ def test_h3_stale_marker_reaudits_restored_profile_rt(
     assert auth._xai_shared_state_has_usable_tokens(result2)
     store = json.loads(other.read_text(encoding="utf-8"))
     assert not auth._auth_store_holds_durable_xai_refresh_token(store)
-    # Marker refreshed with a new digest.
+    # Marker refreshed — digest must change vs the pre-restore clean fleet
+    # (restored path is now present and RT-free, so inventory differs).
     marker_after = json.loads(marker.read_text(encoding="utf-8"))
     assert marker_after.get("fleet_digest")
-    assert marker_after["fleet_digest"] != digest_before or True  # may equal if path gone
+    assert marker_after["fleet_digest"] != digest_before
     assert auth._xai_sole_owner_marker_is_valid(generation=7) is True
+
+
+def test_h3_concurrent_restore_cannot_certify_dirty_fleet(
+    shared_env, tmp_path, monkeypatch
+):
+    """H3: REAL concurrent writer during strip→inventory vs unpatched ensure.
+
+    Thread A runs the production fleet sole-owner path. Thread B uses the real
+    auth-store lock path to restore a durable RT. Invariant after both join:
+    a valid marker must NEVER certify a fleet that still holds a durable RT
+    (atomic locks prevent restore mid-window, or post-window dirt invalidates
+    the digest on next check).
+    """
+    hermes_root = tmp_path / "home" / ".hermes"
+    hermes_root.mkdir(parents=True, exist_ok=True)
+    profiles_root = hermes_root / "profiles"
+    profiles_root.mkdir()
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_default_hermes_home", lambda: hermes_root
+    )
+    monkeypatch.setattr(
+        "hermes_constants.get_default_hermes_root", lambda: hermes_root
+    )
+
+    _write_shared(shared_env, access="canon-at", refresh="canon-rt", generation=5)
+    dirty = profiles_root / "dirty" / "auth.json"
+    _seed_legacy_pool_auth(dirty, access="dirty-at", refresh="dirty-rt")
+    target = profiles_root / "race" / "auth.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    barrier = threading.Barrier(2)
+    errors = []
+
+    def do_ensure():
+        barrier.wait(timeout=5.0)
+        try:
+            auth.ensure_shared_xai_grant_from_local(strip_legacy=True)
+        except Exception as exc:
+            errors.append(("ensure", exc))
+
+    def do_restore():
+        barrier.wait(timeout=5.0)
+        # Real lock acquisition — no monkeypatch of strip/inventory/marker.
+        try:
+            with auth._auth_store_lock(target_path=target):
+                _seed_legacy_pool_auth(
+                    target, access="race-at", refresh="race-restore-rt"
+                )
+        except Exception as exc:
+            errors.append(("restore", exc))
+
+    t_a = threading.Thread(target=do_ensure, name="h3-ensure")
+    t_b = threading.Thread(target=do_restore, name="h3-restore")
+    t_a.start()
+    t_b.start()
+    t_a.join(timeout=30.0)
+    t_b.join(timeout=30.0)
+    assert not t_a.is_alive() and not t_b.is_alive()
+
+    # Ensure must not fail-open past strip/inventory errors.
+    for label, exc in errors:
+        if label == "ensure":
+            raise AssertionError(f"ensure failed unexpectedly: {exc}") from exc
+
+    # Core invariant: valid marker ⇒ every audited store is RT-free.
+    paths = auth._iter_xai_auth_json_paths(include_global_root=True, fail_loud=True)
+    residual = []
+    for path in paths:
+        if not path.is_file():
+            continue
+        store = json.loads(path.read_text(encoding="utf-8"))
+        if auth._auth_store_holds_durable_xai_refresh_token(store):
+            residual.append(str(path))
+
+    if auth._xai_sole_owner_marker_is_valid(generation=5):
+        assert residual == [], (
+            f"valid sole-owner marker certified dirty fleet: {residual}"
+        )
+    else:
+        # Writer restored after marker commit — digest must not match dirty fleet.
+        assert residual, "expected residual RT when marker is invalid"
+        # Next consume must strip and refuse to leave a dirty-certified marker.
+        auth.ensure_shared_xai_grant_from_local(strip_legacy=True)
+        for path in paths:
+            if not path.is_file():
+                continue
+            store = json.loads(path.read_text(encoding="utf-8"))
+            assert not auth._auth_store_holds_durable_xai_refresh_token(store)
+        assert auth._xai_sole_owner_marker_is_valid(generation=5) is True
+
+
+def test_h3_inventory_read_error_rejects_marker(shared_env, tmp_path, monkeypatch):
+    """H3 fail-closed: inventory read/stat error must reject marker creation.
+
+    Uses a real unreadable file (chmod 0) — not a tautology monkeypatch — so
+    the pre-fix path (hash error entries into the digest) fails this test and
+    the fail-closed path raises.
+    """
+    hermes_root = tmp_path / "home" / ".hermes"
+    hermes_root.mkdir(parents=True, exist_ok=True)
+    (hermes_root / "profiles").mkdir()
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_default_hermes_home", lambda: hermes_root
+    )
+    monkeypatch.setattr(
+        "hermes_constants.get_default_hermes_root", lambda: hermes_root
+    )
+
+    _write_shared(shared_env, access="c-at", refresh="c-rt", generation=2)
+    profile = shared_env["profile_auth"]
+    profile.write_text(
+        json.dumps({"version": 1, "providers": {}}),
+        encoding="utf-8",
+    )
+    marker = auth._xai_sole_owner_marker_path()
+    if marker.is_file():
+        marker.unlink()
+
+    profile.chmod(0o000)
+    try:
+        with pytest.raises(AuthError) as exc:
+            auth._write_xai_sole_owner_marker(generation=2)
+        assert exc.value.code in {
+            "xai_shared_fleet_inventory_failed",
+            "xai_shared_strip_incomplete",
+            "auth_store_unreadable",
+            "xai_auth_store_unreadable",
+        }
+        # Marker must not certify an unreadable fleet.
+        assert not marker.is_file() or not auth._xai_sole_owner_marker_is_valid(
+            generation=2
+        )
+    finally:
+        profile.chmod(0o600)
+
+
+def test_h3_rt_after_strip_before_marker_not_certified(
+    shared_env, tmp_path, monkeypatch
+):
+    """H3 window: durable RT reappears after strip returns, before marker commit.
+
+    Wraps the production strip so that immediately after it returns a durable
+    RT is restored (the exact pre-fix strip→inventory gap). A valid marker
+    must never certify that dirty fleet — either marker creation aborts
+    (fail-closed re-audit under held locks) or the marker is invalid while
+    residual RT remains.
+    """
+    hermes_root = tmp_path / "home" / ".hermes"
+    hermes_root.mkdir(parents=True, exist_ok=True)
+    profiles_root = hermes_root / "profiles"
+    profiles_root.mkdir()
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_default_hermes_home", lambda: hermes_root
+    )
+    monkeypatch.setattr(
+        "hermes_constants.get_default_hermes_root", lambda: hermes_root
+    )
+
+    _write_shared(shared_env, access="canon-at", refresh="canon-rt", generation=9)
+    target = profiles_root / "window" / "auth.json"
+    _seed_legacy_pool_auth(target, access="pre-at", refresh="pre-rt")
+    marker = auth._xai_sole_owner_marker_path()
+    if marker.is_file():
+        marker.unlink()
+
+    def _restore_after(fn):
+        def wrapped(*args, **kwargs):
+            out = fn(*args, **kwargs)
+            _seed_legacy_pool_auth(
+                target, access="window-at", refresh="window-rt"
+            )
+            return out
+
+        return wrapped
+
+    monkeypatch.setattr(
+        auth,
+        "_strip_legacy_xai_oauth_secrets",
+        _restore_after(auth._strip_legacy_xai_oauth_secrets),
+    )
+    if hasattr(auth, "_strip_legacy_xai_oauth_secrets_under_held_locks"):
+        monkeypatch.setattr(
+            auth,
+            "_strip_legacy_xai_oauth_secrets_under_held_locks",
+            _restore_after(auth._strip_legacy_xai_oauth_secrets_under_held_locks),
+        )
+
+    raised = None
+    try:
+        auth._ensure_xai_fleet_sole_owner_verified(force=True, generation=9)
+    except AuthError as exc:
+        raised = exc
+
+    residual = auth._auth_store_holds_durable_xai_refresh_token(
+        json.loads(target.read_text(encoding="utf-8"))
+    )
+    valid = auth._xai_sole_owner_marker_is_valid(generation=9)
+    # HARD invariant (must fail on pre-fix: marker written over restored RT).
+    assert not (valid and residual), (
+        "sole-owner marker certified a dirty fleet after strip→marker window restore"
+    )
+    if residual:
+        # Dirty residual is only acceptable when marker creation aborted or
+        # the marker does not validate.
+        assert raised is not None or not valid
 
 
 def test_h3_existence_only_marker_never_skips_audit(shared_env, tmp_path, monkeypatch):

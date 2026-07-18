@@ -66,25 +66,10 @@ class XAIGrokAdapter(UpstreamAdapter):
                         return True
                     if auth_mod._shared_xai_state_is_quarantined(shared):
                         return False
-                    # F1/R7: profile then global-root promotable grants.
-                    try:
-                        local = auth_mod._xai_oauth_state_from_store(
-                            auth_mod._load_auth_store(),
-                            sole_live=True,
-                        )
-                    except Exception:
-                        local = None
-                    if auth_mod._xai_oauth_state_has_usable_tokens(local):
-                        return True
-                    try:
-                        root_local = auth_mod._xai_oauth_state_from_store(
-                            auth_mod._load_global_auth_store(),
-                            sole_live=True,
-                        )
-                    except Exception:
-                        root_local = None
+                    # F1/R7/H2: sole live across profile AND root together
+                    # (no profile-first short-circuit vs promoter ambiguity).
                     return bool(
-                        auth_mod._xai_oauth_state_has_usable_tokens(root_local)
+                        auth_mod._xai_sole_live_promotable_across_profile_and_root_for_probe()
                     )
                 except Exception:
                     return False

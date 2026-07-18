@@ -26,11 +26,13 @@ def has_xai_credentials() -> bool:
     Resolution order, fast-to-slow:
 
     1. ``XAI_API_KEY`` env var (cheapest; covers explicit-key users).
-    2. **Shared mode (C2/F2/R7):** the canonical shared store has usable tokens
-       (single file read, no refresh). Profile-disabled → False.
-       Empty shared + local grant that can be auto-promoted (F1) → True
-       (profile OR global-root). Canonical READ errors fail closed (False)
-       with NO legacy fallthrough.
+    2. **Shared mode (C2/F2/R7/H2):** the canonical shared store has usable
+       tokens (single file read, no refresh). Profile-disabled → False.
+       Empty shared + sole live local grant that can be auto-promoted (F1) →
+       True only when profile AND root together yield exactly one distinct
+       live identity (matches the promoter; no profile-first short-circuit).
+       Canonical READ / unreadable-store errors fail closed (False) with NO
+       legacy fallthrough.
     3. (gate OFF only) ``~/.hermes/auth.json`` providers.xai-oauth access_token
        or pool-only grants.
 
@@ -56,25 +58,13 @@ def has_xai_credentials() -> bool:
             # Tombstoned / quarantined: not available, not promotable.
             if auth_mod._shared_xai_state_is_quarantined(shared):
                 return False
-            # F1/R7: never-initialized shared still counts when a sole live
-            # local grant can be auto-promoted (active profile OR global root).
-            try:
-                local = auth_mod._xai_oauth_state_from_store(
-                    auth_mod._load_auth_store(),
-                    sole_live=True,
-                )
-            except Exception:
-                local = None
-            if auth_mod._xai_oauth_state_has_usable_tokens(local):
-                return True
-            try:
-                root_store = auth_mod._load_global_auth_store()
-                root_local = auth_mod._xai_oauth_state_from_store(
-                    root_store, sole_live=True
-                )
-            except Exception:
-                root_local = None
-            return bool(auth_mod._xai_oauth_state_has_usable_tokens(root_local))
+            # F1/R7/H2: never-initialized shared still counts when a sole live
+            # local grant can be auto-promoted. Consider profile AND root
+            # together (no profile-first short-circuit that would advertise
+            # available while the promoter rejects cross-store ambiguity).
+            return bool(
+                auth_mod._xai_sole_live_promotable_across_profile_and_root_for_probe()
+            )
         except Exception:
             # Shared-mode read/audit failure → fail closed (no legacy scan).
             return False
