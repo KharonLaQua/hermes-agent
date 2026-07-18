@@ -50,26 +50,44 @@ class XAIGrokAdapter(UpstreamAdapter):
         return _ALLOWED_PATHS
 
     def is_authenticated(self) -> bool:
-        # C1/F2: shared mode probes the canonical store (and promotable local
-        # grants), never a surviving legacy pool row after profile disable.
+        # C1/F2/R7: shared mode probes the canonical store (and promotable
+        # local grants on profile OR root), never a surviving legacy pool row
+        # after profile disable. Canonical READ errors fail closed (False)
+        # with no pool fallthrough.
         try:
             from hermes_cli import auth as auth_mod
 
             if auth_mod._xai_shared_auth_enabled():
-                if auth_mod._profile_xai_shared_disabled():
-                    return False
-                if auth_mod._xai_shared_state_has_usable_tokens(
-                    auth_mod._read_shared_xai_state()
-                ):
-                    return True
-                # F1: empty shared + promotable local grant still counts.
                 try:
-                    local = auth_mod._xai_oauth_state_from_store(
-                        auth_mod._load_auth_store()
+                    if auth_mod._profile_xai_shared_disabled():
+                        return False
+                    shared = auth_mod._read_shared_xai_state(raise_on_unreadable=True)
+                    if auth_mod._xai_shared_state_has_usable_tokens(shared):
+                        return True
+                    if auth_mod._shared_xai_state_is_quarantined(shared):
+                        return False
+                    # F1/R7: profile then global-root promotable grants.
+                    try:
+                        local = auth_mod._xai_oauth_state_from_store(
+                            auth_mod._load_auth_store(),
+                            sole_live=True,
+                        )
+                    except Exception:
+                        local = None
+                    if auth_mod._xai_oauth_state_has_usable_tokens(local):
+                        return True
+                    try:
+                        root_local = auth_mod._xai_oauth_state_from_store(
+                            auth_mod._load_global_auth_store(),
+                            sole_live=True,
+                        )
+                    except Exception:
+                        root_local = None
+                    return bool(
+                        auth_mod._xai_oauth_state_has_usable_tokens(root_local)
                     )
                 except Exception:
-                    local = None
-                return bool(auth_mod._xai_oauth_state_has_usable_tokens(local))
+                    return False
         except Exception:
             pass
         pool = self._load_pool()
@@ -148,20 +166,36 @@ class XAIGrokAdapter(UpstreamAdapter):
                 if shared_on:
                     return None
 
-            # Gate-off (or 429): pool rotation path.
+            # R9: under shared mode a 429 is sole-grant / rate-limit policy —
+            # do NOT run generic OAuth-pool rotation (would mark the wrong
+            # reference after another process rotated). Let 429 flow back.
+            if status_code == 429 and shared_on:
+                logger.info(
+                    "proxy: xAI upstream returned 429 under shared mode; "
+                    "canonical sole-grant policy (no pool rotation)"
+                )
+                return None
+
+            # Gate-off (or non-shared 429): pool rotation path.
             pool = self._pool or self._load_pool()
             if pool is None:
                 return None
 
             if status_code == 429:
                 # Mark the rate-limited key with its 1-hour cooldown and rotate
-                # to the next available credential. Returns None when the pool
-                # has no other key to offer — the 429 will flow back to the client.
-                refreshed = pool.mark_exhausted_and_rotate(status_code=status_code)
+                # to the next available credential. Pass the failed bearer so a
+                # freshly loaded pool cannot mark the wrong/newer entry.
+                refreshed = pool.mark_exhausted_and_rotate(
+                    status_code=status_code,
+                    api_key_hint=failed_credential.bearer,
+                )
             else:
                 refreshed = pool.try_refresh_current()
                 if refreshed is None:
-                    refreshed = pool.mark_exhausted_and_rotate(status_code=status_code)
+                    refreshed = pool.mark_exhausted_and_rotate(
+                        status_code=status_code,
+                        api_key_hint=failed_credential.bearer,
+                    )
             if refreshed is None:
                 return None
 

@@ -26,11 +26,11 @@ def has_xai_credentials() -> bool:
     Resolution order, fast-to-slow:
 
     1. ``XAI_API_KEY`` env var (cheapest; covers explicit-key users).
-    2. **Shared mode (C2/F2):** the canonical shared store has usable tokens
+    2. **Shared mode (C2/F2/R7):** the canonical shared store has usable tokens
        (single file read, no refresh). Profile-disabled → False.
-       Empty shared + local grant that can be auto-promoted (F1) → True.
-       Never treats a surviving legacy pool/manual row as available when
-       shared mode is on and the profile is disabled / canonical is broken.
+       Empty shared + local grant that can be auto-promoted (F1) → True
+       (profile OR global-root). Canonical READ errors fail closed (False)
+       with NO legacy fallthrough.
     3. (gate OFF only) ``~/.hermes/auth.json`` providers.xai-oauth access_token
        or pool-only grants.
 
@@ -42,24 +42,43 @@ def has_xai_credentials() -> bool:
         return True
     try:
         from hermes_cli import auth as auth_mod
+    except Exception:
+        auth_mod = None
 
-        if auth_mod._xai_shared_auth_enabled():
+    # R7: under shared mode, never fall through to the legacy profile scan.
+    if auth_mod is not None and auth_mod._xai_shared_auth_enabled():
+        try:
             if auth_mod._profile_xai_shared_disabled():
                 return False
-            shared = auth_mod._read_shared_xai_state()
+            shared = auth_mod._read_shared_xai_state(raise_on_unreadable=True)
             if auth_mod._xai_shared_state_has_usable_tokens(shared):
                 return True
-            # F1/F2: empty shared still counts when a local grant can be
-            # auto-promoted. Do NOT fall through to treat a surviving manual
-            # row as "available" when the profile is disabled (already
-            # returned) or when no promotable grant exists.
+            # Tombstoned / quarantined: not available, not promotable.
+            if auth_mod._shared_xai_state_is_quarantined(shared):
+                return False
+            # F1/R7: never-initialized shared still counts when a sole live
+            # local grant can be auto-promoted (active profile OR global root).
             try:
-                local = auth_mod._xai_oauth_state_from_store(auth_mod._load_auth_store())
+                local = auth_mod._xai_oauth_state_from_store(
+                    auth_mod._load_auth_store(),
+                    sole_live=True,
+                )
             except Exception:
                 local = None
-            return bool(auth_mod._xai_oauth_state_has_usable_tokens(local))
-    except Exception:
-        pass
+            if auth_mod._xai_oauth_state_has_usable_tokens(local):
+                return True
+            try:
+                root_store = auth_mod._load_global_auth_store()
+                root_local = auth_mod._xai_oauth_state_from_store(
+                    root_store, sole_live=True
+                )
+            except Exception:
+                root_local = None
+            return bool(auth_mod._xai_oauth_state_has_usable_tokens(root_local))
+        except Exception:
+            # Shared-mode read/audit failure → fail closed (no legacy scan).
+            return False
+
     try:
         from hermes_constants import get_hermes_home
 

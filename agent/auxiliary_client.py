@@ -3912,10 +3912,27 @@ def _auth_refresh_provider_for_route(
     after _get_cached_client() selects a concrete backend. Infer the backend
     from the selected client's base URL so auth refresh works for auto →
     Copilot/Codex/Anthropic/Nous/xAI routes too. (#20832, D2)
+
+    Configured fallback-chain labels look like
+    ``fallback_chain[0](xai-oauth)`` — extract the real provider id so refresh
+    hits the xai-oauth branch rather than treating the composite label as the
+    provider name (R6).
     """
-    normalized = _normalize_aux_provider(resolved_provider)
+    raw = (resolved_provider or "").strip()
+    # R6: unwrap fallback_chain[N](<provider>) before normalization.
+    chain_match = re.search(
+        r"fallback_chain\[\d+\]\(([^)]+)\)\s*$",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if chain_match:
+        raw = chain_match.group(1).strip()
+    normalized = _normalize_aux_provider(raw)
     if normalized and normalized != "auto":
-        return normalized
+        # Composite leftovers (e.g. still containing "fallback_chain") are not
+        # real providers — fall through to base-URL inference.
+        if "fallback_chain" not in normalized:
+            return normalized
     if base_url_host_matches(client_base_url, "api.githubcopilot.com"):
         return "copilot"
     if base_url_host_matches(client_base_url, "chatgpt.com"):
@@ -3928,7 +3945,7 @@ def _auth_refresh_provider_for_route(
     # rejected bearer because the route label stayed "auto".
     if base_url_host_matches(client_base_url, "api.x.ai"):
         return "xai-oauth"
-    return normalized
+    return normalized if "fallback_chain" not in (normalized or "") else "auto"
 
 
 def _fallback_entry_timeout(task: Optional[str], fb_label: str) -> Optional[float]:

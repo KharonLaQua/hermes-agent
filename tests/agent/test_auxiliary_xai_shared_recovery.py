@@ -194,13 +194,40 @@ def test_proxy_adapter_uses_canonical_and_retries_403(shared_env, monkeypatch):
     assert posts == ["rt-1"]
 
 
+def test_auth_refresh_provider_unwraps_fallback_chain_label():
+    """R6: composite fallback_chain[N](xai-oauth) must resolve to xai-oauth."""
+    from agent.auxiliary_client import _auth_refresh_provider_for_route
+
+    assert (
+        _auth_refresh_provider_for_route(
+            "fallback_chain[0](xai-oauth)",
+            "https://api.x.ai/v1/",
+        )
+        == "xai-oauth"
+    )
+    # Even without a usable base URL, the label unwrap must win.
+    assert (
+        _auth_refresh_provider_for_route(
+            "fallback_chain[2](xai-oauth)",
+            "",
+        )
+        == "xai-oauth"
+    )
+
+
 def test_f6_fallback_chain_passes_rejected_bearer(shared_env, monkeypatch):
-    """F6: fallback-chain 401 recovery passes rejected bearer (adopt winner)."""
+    """F6/R6: real fallback-chain path refreshes xAI without route-helper patch.
+
+    Critical: do NOT patch ``_auth_refresh_provider_for_route`` — the bug was
+    that composite labels like ``fallback_chain[0](xai-oauth)`` never resolved
+    to the xai-oauth refresh branch. This test exercises the real path.
+    """
     from agent import auxiliary_client as aux
 
     old = _jwt(int(time.time()) + 30)
     _write_shared(shared_env, access=old, refresh="rt-1", generation=1)
     posts = []
+    refresh_providers = []
 
     def fake_pure(access, refresh, **kwargs):
         posts.append(refresh)
@@ -241,8 +268,14 @@ def test_f6_fallback_chain_passes_rejected_bearer(shared_env, monkeypatch):
         ),
     )
 
+    real_refresh = aux._refresh_provider_credentials
+
+    def tracking_refresh(provider, **kwargs):
+        refresh_providers.append(provider)
+        return real_refresh(provider, **kwargs)
+
     with patch.object(aux, "_is_auth_error", return_value=True), patch.object(
-        aux, "_auth_refresh_provider_for_route", return_value="xai-oauth"
+        aux, "_refresh_provider_credentials", side_effect=tracking_refresh
     ), patch.object(
         aux, "_get_cached_client", return_value=(retry_client, "grok")
     ), patch.object(
@@ -269,3 +302,5 @@ def test_f6_fallback_chain_passes_rejected_bearer(shared_env, monkeypatch):
         )
     assert result is not None
     assert posts == []  # adopted winner — no second POST
+    # R6 de-mask: real route resolution must hand "xai-oauth" to refresh.
+    assert refresh_providers == ["xai-oauth"]

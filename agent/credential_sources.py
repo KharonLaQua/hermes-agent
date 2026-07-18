@@ -283,23 +283,37 @@ def _remove_xai_oauth_device_code(provider: str, removed) -> RemovalResult:
     result = RemovalResult()
     try:
         from hermes_cli import auth as auth_mod
-
-        if auth_mod._xai_shared_auth_enabled():
-            # B1: clear local reference first, THEN re-write the durable
-            # disable marker so it survives the provider-block deletion.
-            if _clear_auth_store_provider(provider):
-                result.cleaned.append(f"Cleared {provider} profile reference from auth store")
-            auth_mod.disable_profile_xai_shared_auth()
-            result.cleaned.append(
-                "Disabled shared xAI OAuth for this profile (canonical grant unchanged)"
-            )
-            result.hints.append(
-                "To delete the grant for all profiles: "
-                "`hermes logout --provider xai-oauth --global`"
-            )
-            return result
+        from hermes_cli.auth import AuthError
     except Exception:
-        pass
+        auth_mod = None
+        AuthError = Exception  # type: ignore[misc, assignment]
+
+    if auth_mod is not None and auth_mod._xai_shared_auth_enabled():
+        # B1/R8: clear local reference first, THEN re-write the durable
+        # disable marker so it survives the provider-block deletion.
+        # Disable failures must surface — never claim cleanup success when
+        # the durable disable marker did not land.
+        if _clear_auth_store_provider(provider):
+            result.cleaned.append(
+                f"Cleared {provider} profile reference from auth store"
+            )
+        try:
+            auth_mod.disable_profile_xai_shared_auth()
+        except AuthError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to disable shared xAI OAuth for this profile: {exc}"
+            ) from exc
+        result.cleaned.append(
+            "Disabled shared xAI OAuth for this profile (canonical grant unchanged)"
+        )
+        result.hints.append(
+            "To delete the grant for all profiles: "
+            "`hermes logout --provider xai-oauth --global`"
+        )
+        return result
+
     if _clear_auth_store_provider(provider):
         result.cleaned.append(f"Cleared {provider} OAuth tokens from auth store")
     result.hints.append(

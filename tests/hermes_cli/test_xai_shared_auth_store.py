@@ -517,7 +517,11 @@ def test_strip_covers_all_profiles_and_manuals(shared_env, tmp_path, monkeypatch
 
 
 def test_migrate_with_legacy_pools_leaves_no_fork(shared_env, tmp_path, monkeypatch):
-    """Pre-populated device_code + manual RTs are gone after migrate."""
+    """Pre-populated device_code + same-RT pool fork is gone after migrate.
+
+    R2: a *different* live RT (true multi-grant) is refused as ambiguous —
+    this test uses a same-identity pool fork so promote is well-defined.
+    """
     hermes_root = tmp_path / "home" / ".hermes"
     hermes_root.mkdir(parents=True, exist_ok=True)
     (hermes_root / "profiles").mkdir()
@@ -531,15 +535,15 @@ def test_migrate_with_legacy_pools_leaves_no_fork(shared_env, tmp_path, monkeypa
     _seed_legacy_pool_auth(
         shared_env["profile_auth"], access="legacy-at", refresh="legacy-rt"
     )
-    # Extra manual row in the same store
+    # Same-identity pool fork (duplicate RT) — still a sole live grant.
     store = json.loads(shared_env["profile_auth"].read_text(encoding="utf-8"))
     store["credential_pool"]["xai-oauth"].append(
         {
             "id": "manual-fork",
             "source": "manual:device_code",
             "auth_type": "oauth",
-            "access_token": "manual-at",
-            "refresh_token": "manual-rt",
+            "access_token": "legacy-at",
+            "refresh_token": "legacy-rt",
             "priority": 1,
         }
     )
@@ -1102,3 +1106,298 @@ def test_f7_migrate_preserves_id_token(shared_env):
     assert written.get("id_token") == "legacy-id-token"
     shared = json.loads(shared_env["store"].read_text(encoding="utf-8"))
     assert shared.get("id_token") == "legacy-id-token"
+
+
+# ---------------------------------------------------------------------------
+# Round-4: quarantine / race / upgrade / corrupt / availability / 429 / remove
+# ---------------------------------------------------------------------------
+
+
+def test_r1_quarantine_then_promote_no_resurrection(shared_env):
+    """R1/G6: tombstoned canonical + dead local must NOT resurrect."""
+    # Terminal quarantine of the shared grant.
+    _write_shared(shared_env, access="old-at", refresh="old-rt", generation=3)
+    cleared = auth._clear_shared_xai_state(
+        "invalid_grant",
+        terminal_error={
+            "provider": "xai-oauth",
+            "code": "invalid_grant",
+            "message": "refresh token revoked",
+            "relogin_required": True,
+        },
+        only_if_refresh_token="old-rt",
+        only_if_generation=3,
+    )
+    assert cleared is True
+    shared = json.loads(shared_env["store"].read_text(encoding="utf-8"))
+    assert not shared.get("refresh_token")
+    assert shared.get("last_auth_error", {}).get("code") == "invalid_grant"
+
+    # Plant a local row that looks like a grant (even a dead one).
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="zombie-at", refresh="zombie-rt"
+    )
+    store = json.loads(shared_env["profile_auth"].read_text(encoding="utf-8"))
+    store["credential_pool"]["xai-oauth"][0]["last_status"] = "dead"
+    store["credential_pool"]["xai-oauth"][0]["last_error_reason"] = "invalid_grant"
+    # Also mark the providers singleton as terminal.
+    store["providers"]["xai-oauth"]["last_auth_error"] = {
+        "code": "invalid_grant",
+        "relogin_required": True,
+    }
+    shared_env["profile_auth"].write_text(json.dumps(store), encoding="utf-8")
+
+    result = auth.ensure_shared_xai_grant_from_local(strip_legacy=True)
+    assert result is None
+    # Canonical stays tombstoned — no resurrection.
+    after = json.loads(shared_env["store"].read_text(encoding="utf-8"))
+    assert not after.get("refresh_token")
+    assert after.get("last_auth_error", {}).get("code") == "invalid_grant"
+    assert after.get("access_token", "") in ("", None)
+
+
+def test_r1_live_local_also_refused_when_quarantined(shared_env):
+    """R1: even a *live* local grant must not resurrect a tombstoned store."""
+    _write_shared(shared_env, access="a", refresh="r", generation=1)
+    auth._clear_shared_xai_state(
+        "invalid_grant",
+        terminal_error={
+            "code": "invalid_grant",
+            "message": "dead",
+            "relogin_required": True,
+        },
+        only_if_refresh_token="r",
+        only_if_generation=1,
+    )
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="live-at", refresh="live-rt"
+    )
+    assert auth.ensure_shared_xai_grant_from_local(strip_legacy=True) is None
+    after = json.loads(shared_env["store"].read_text(encoding="utf-8"))
+    assert not after.get("refresh_token")
+    assert after.get("last_auth_error")
+
+
+def test_r2_rejects_dead_and_ambiguous_local(shared_env):
+    """R2: dead rows rejected; multiple distinct live RTs are ambiguous."""
+    # Dead-only pool: not promotable.
+    shared_env["profile_auth"].write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "providers": {},
+                "credential_pool": {
+                    "xai-oauth": [
+                        {
+                            "id": "dead-1",
+                            "source": "device_code",
+                            "auth_type": "oauth",
+                            "access_token": "d-at",
+                            "refresh_token": "d-rt",
+                            "last_status": "dead",
+                            "last_error_reason": "invalid_grant",
+                            "priority": 0,
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = auth._load_auth_store()
+    assert auth._xai_oauth_state_from_store(store, sole_live=True) is None
+
+    # Two distinct live RTs → ambiguous.
+    shared_env["profile_auth"].write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "providers": {
+                    "xai-oauth": {
+                        "tokens": {
+                            "access_token": "a1",
+                            "refresh_token": "rt-1",
+                        }
+                    }
+                },
+                "credential_pool": {
+                    "xai-oauth": [
+                        {
+                            "id": "other",
+                            "source": "manual:device_code",
+                            "auth_type": "oauth",
+                            "access_token": "a2",
+                            "refresh_token": "rt-2",
+                            "priority": 1,
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = auth._load_auth_store()
+    with pytest.raises(AuthError) as exc:
+        auth._xai_oauth_state_from_store(store, sole_live=True)
+    assert exc.value.code == "xai_promote_ambiguous_local"
+
+
+def test_r3_logout_during_promote_does_not_resurrect(shared_env, monkeypatch):
+    """R3: concurrent local logout wins — promotion must not write removed grant.
+
+    Sequence: ensure probe elects live grant → migrate elects live grant →
+    concurrent logout clears local → recheck under profile lock sees identity
+    gone → refuse write.
+    """
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="race-at", refresh="race-rt"
+    )
+    assert not shared_env["store"].exists()
+
+    real_elect = auth._elect_sole_promotable_xai_under_lock
+    calls = {"n": 0}
+
+    def elect_then_logout(path):
+        calls["n"] += 1
+        state = real_elect(path)
+        # After migrate's first elect (call 2: ensure probe is call 1), clear
+        # the local source so the recheck (call 3) observes logout.
+        if calls["n"] == 2 and state is not None:
+            shared_env["profile_auth"].write_text(
+                json.dumps({"version": 1, "providers": {}}),
+                encoding="utf-8",
+            )
+        return state
+
+    monkeypatch.setattr(auth, "_elect_sole_promotable_xai_under_lock", elect_then_logout)
+    result = auth.ensure_shared_xai_grant_from_local(strip_legacy=True)
+    assert result is None
+    # Canonical must not hold the removed grant.
+    if shared_env["store"].exists():
+        shared = json.loads(shared_env["store"].read_text(encoding="utf-8"))
+        assert shared.get("refresh_token") not in {"race-rt"}
+        assert not auth._xai_shared_state_has_usable_tokens(shared)
+    # Local remains cleared.
+    profile = json.loads(shared_env["profile_auth"].read_text(encoding="utf-8"))
+    assert not auth._auth_store_holds_durable_xai_refresh_token(profile)
+    assert calls["n"] >= 3  # probe + elect + recheck
+
+
+def test_r4_upgrade_state_sweeps_all_profiles(shared_env, tmp_path, monkeypatch):
+    """R4: populated canonical + dormant per-profile RTs → first consume sweeps."""
+    hermes_root = tmp_path / "home" / ".hermes"
+    hermes_root.mkdir(parents=True, exist_ok=True)
+    profiles_root = hermes_root / "profiles"
+    profiles_root.mkdir()
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_default_hermes_home", lambda: hermes_root
+    )
+    monkeypatch.setattr(
+        "hermes_constants.get_default_hermes_root", lambda: hermes_root
+    )
+
+    # Pre-existing canonical grant (deploy upgrade state).
+    _write_shared(shared_env, access="canon-at", refresh="canon-rt", generation=7)
+    # Dormant per-profile RTs left from earlier rounds.
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="p-at", refresh="p-rt"
+    )
+    other = profiles_root / "worker" / "auth.json"
+    _seed_legacy_pool_auth(other, access="w-at", refresh="w-rt", manual=True)
+    root_auth = hermes_root / "auth.json"
+    _seed_legacy_pool_auth(root_auth, access="r-at", refresh="r-rt")
+
+    # Marker must not exist yet.
+    marker = auth._xai_sole_owner_marker_path()
+    assert not marker.exists()
+
+    result = auth.ensure_shared_xai_grant_from_local(strip_legacy=True)
+    assert auth._xai_shared_state_has_usable_tokens(result)
+    assert result["refresh_token"] == "canon-rt"
+    assert marker.is_file()
+
+    for path in (shared_env["profile_auth"], other, root_auth):
+        store = json.loads(path.read_text(encoding="utf-8"))
+        assert not auth._auth_store_holds_durable_xai_refresh_token(store), path
+
+
+def test_r5_corrupt_auth_store_fails_sole_owner_audit(shared_env, tmp_path, monkeypatch):
+    """R5: unreadable auth.json holding a live RT must FAIL the audit."""
+    hermes_root = tmp_path / "home" / ".hermes"
+    hermes_root.mkdir(parents=True, exist_ok=True)
+    (hermes_root / "profiles").mkdir()
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_default_hermes_home", lambda: hermes_root
+    )
+    monkeypatch.setattr(
+        "hermes_constants.get_default_hermes_root", lambda: hermes_root
+    )
+
+    # Write a valid seed then corrupt the file bytes while keeping it present.
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="c-at", refresh="c-rt"
+    )
+    # Overwrite with non-JSON so parse fails (live RT bytes still on disk).
+    shared_env["profile_auth"].write_bytes(
+        b'{"version":1,"providers":{"xai-oauth":{"tokens":'
+        b'{"access_token":"c-at","refresh_token":"c-rt"}}}'  # truncated / corrupt
+        b"NOT-JSON-TRAILER"
+    )
+
+    with pytest.raises(AuthError) as exc:
+        auth._strip_legacy_xai_oauth_secrets(include_global_root=True, fail_loud=True)
+    assert exc.value.code in {
+        "xai_shared_strip_incomplete",
+        "auth_store_unreadable",
+    }
+    # Must not certify clean.
+    assert "unreadable" in str(exc.value).lower() or "corrupt" in str(exc.value).lower() or "incomplete" in str(exc.value).lower()
+
+
+def test_r9_shared_mode_429_no_pool_rotation(shared_env, monkeypatch):
+    """R9: shared-mode proxy 429 stays on canonical policy (no wrong-ref mark)."""
+    from hermes_cli.proxy.adapters.xai import XAIGrokAdapter
+    from hermes_cli.proxy.adapters.base import UpstreamCredential
+
+    _write_shared(shared_env, access="shared-at", refresh="shared-rt", generation=1)
+    adapter = XAIGrokAdapter()
+    rotate_calls = []
+
+    class FakePool:
+        def mark_exhausted_and_rotate(self, **kwargs):
+            rotate_calls.append(kwargs)
+            return None
+
+        def try_refresh_current(self):
+            return None
+
+    adapter._pool = FakePool()  # type: ignore[assignment]
+    retry = adapter.get_retry_credential(
+        failed_credential=UpstreamCredential(
+            bearer="shared-at",
+            base_url="https://api.x.ai/v1",
+            expires_at=None,
+        ),
+        status_code=429,
+    )
+    assert retry is None
+    assert rotate_calls == []
+
+
+def test_r10_global_logout_leaves_non_promotable_tombstone(shared_env):
+    """R1/R10: global logout tombstones the store (no auto-promote resurrection)."""
+    _write_shared(shared_env, access="a", refresh="r", generation=2)
+    cleared = auth._clear_shared_xai_state("global_logout")
+    assert cleared is True
+    assert shared_env["store"].is_file()
+    shared = json.loads(shared_env["store"].read_text(encoding="utf-8"))
+    assert not shared.get("refresh_token")
+    assert shared.get("logged_out") is True or shared.get("last_auth_error")
+    assert auth._shared_xai_state_is_quarantined(shared)
+
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="z-at", refresh="z-rt"
+    )
+    assert auth.ensure_shared_xai_grant_from_local(strip_legacy=True) is None
+    after = json.loads(shared_env["store"].read_text(encoding="utf-8"))
+    assert after.get("refresh_token") in ("", None)

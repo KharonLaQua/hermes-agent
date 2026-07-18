@@ -74,6 +74,72 @@ def test_has_xai_credentials_false_when_profile_disabled(shared_env):
     assert has_xai_credentials() is False
 
 
+def test_has_xai_credentials_fail_closed_on_shared_read_error(shared_env, monkeypatch):
+    """R7: shared-mode canonical READ error → False (no legacy fallthrough)."""
+    from tools.xai_http import has_xai_credentials
+
+    _write_shared(shared_env, access="shared-at", refresh="shared-rt")
+    # Plant a legacy pool row that would have been "available" under gate-off.
+    shared_env["profile_auth"].write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "providers": {
+                    "xai-oauth": {
+                        "tokens": {
+                            "access_token": "legacy-at",
+                            "refresh_token": "legacy-rt",
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def boom(**_k):
+        raise auth.AuthError(
+            "unreadable",
+            provider="xai-oauth",
+            code="xai_shared_store_unreadable",
+        )
+
+    monkeypatch.setattr(auth, "_read_shared_xai_state", boom)
+    assert has_xai_credentials() is False
+
+
+def test_has_xai_credentials_recognizes_root_only_promotable(shared_env, monkeypatch):
+    """R7: empty shared + root-only sole live grant → True (matches promoter)."""
+    from tools.xai_http import has_xai_credentials
+
+    # No shared store, no active-profile grant.
+    assert not shared_env["store"].exists()
+    root_auth = shared_env["hermes_home"].parent / "root_auth.json"
+    root_auth.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "providers": {
+                    "xai-oauth": {
+                        "tokens": {
+                            "access_token": "root-at",
+                            "refresh_token": "root-rt",
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(auth, "_global_auth_file_path", lambda: root_auth)
+    monkeypatch.setattr(
+        auth,
+        "_load_global_auth_store",
+        lambda: json.loads(root_auth.read_text(encoding="utf-8")),
+    )
+    assert has_xai_credentials() is True
+
+
 def test_resolve_canonical_first_over_legacy_pool(shared_env):
     """C1/A6: legacy pool RT must not win over the shared grant."""
     from tools.xai_http import resolve_xai_http_credentials
