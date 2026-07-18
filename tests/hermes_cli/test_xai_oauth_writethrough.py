@@ -167,3 +167,76 @@ def test_write_through_failure_does_not_break_profile_save(profile_and_root, mon
 
     profile = _read_store(profile_path)
     assert profile["providers"]["xai-oauth"]["tokens"]["refresh_token"] == "r"
+
+
+# ---------------------------------------------------------------------------
+# Shared-mode override (issue #65394): no profile fork, no root write-through
+# ---------------------------------------------------------------------------
+
+
+def test_shared_mode_save_does_not_fork_into_profile(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    profile_path = tmp_path / "profiles" / "work" / "auth.json"
+    profile_path.parent.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_path.parent))
+    monkeypatch.setenv("HERMES_SHARED_AUTH_DIR", str(shared_dir))
+    monkeypatch.setenv("HERMES_XAI_SHARED_AUTH", "1")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(auth, "_auth_file_path", lambda: profile_path)
+    monkeypatch.setattr(auth, "_global_auth_file_path", lambda: None)
+    _write_store(profile_path, {"version": 1, "providers": {}})
+
+    auth._save_xai_oauth_tokens(
+        {"access_token": "shared-at", "refresh_token": "shared-rt"}
+    )
+
+    shared = json.loads((shared_dir / "xai_oauth.json").read_text(encoding="utf-8"))
+    assert shared["refresh_token"] == "shared-rt"
+
+    profile = _read_store(profile_path)
+    state = profile["providers"]["xai-oauth"]
+    assert state.get("source") == "shared:xai-oauth"
+    assert "tokens" not in state
+    # Absolute precedence: no local RT may re-grow.
+    assert state.get("refresh_token") in (None, "")
+
+
+def test_shared_mode_disables_root_write_through(tmp_path, monkeypatch):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    profile_path = tmp_path / "profiles" / "work" / "auth.json"
+    root_path = tmp_path / "root" / "auth.json"
+    profile_path.parent.mkdir(parents=True)
+    root_path.parent.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_path.parent))
+    monkeypatch.setenv("HERMES_SHARED_AUTH_DIR", str(shared_dir))
+    monkeypatch.setenv("HERMES_XAI_SHARED_AUTH", "1")
+    monkeypatch.setenv("HOME", str(tmp_path / "not-root"))
+    monkeypatch.setattr(auth, "_auth_file_path", lambda: profile_path)
+    monkeypatch.setattr(auth, "_global_auth_file_path", lambda: root_path)
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                "xai-oauth": {
+                    "tokens": {
+                        "access_token": "root-old",
+                        "refresh_token": "root-old-rt",
+                    }
+                }
+            },
+        },
+    )
+
+    auth._save_xai_oauth_tokens(
+        {"access_token": "new-at", "refresh_token": "new-rt"}
+    )
+
+    root = _read_store(root_path)
+    # Root must NOT receive the rotated chain — shared store is the only home.
+    assert root["providers"]["xai-oauth"]["tokens"]["refresh_token"] == "root-old-rt"
+    shared = json.loads((shared_dir / "xai_oauth.json").read_text(encoding="utf-8"))
+    assert shared["refresh_token"] == "new-rt"

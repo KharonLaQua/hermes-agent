@@ -275,8 +275,29 @@ def _remove_xai_oauth_device_code(provider: str, removed) -> RemovalResult:
     entry from the still-present singleton — credentials reappear with no
     user feedback. Clearing the singleton in step with the suppression set
     by the central dispatcher makes the removal stick.
+
+    Under shared xAI mode the canonical grant is NOT deleted here — that
+    requires an explicit global logout. Removal only disables this profile's
+    use of the shared store and clears local non-secret references.
     """
     result = RemovalResult()
+    try:
+        from hermes_cli import auth as auth_mod
+
+        if auth_mod._xai_shared_auth_enabled():
+            auth_mod.disable_profile_xai_shared_auth()
+            result.cleaned.append(
+                "Disabled shared xAI OAuth for this profile (canonical grant unchanged)"
+            )
+            result.hints.append(
+                "To delete the grant for all profiles: "
+                "`hermes logout --provider xai-oauth --global`"
+            )
+            if _clear_auth_store_provider(provider):
+                result.cleaned.append(f"Cleared {provider} profile reference from auth store")
+            return result
+    except Exception:
+        pass
     if _clear_auth_store_provider(provider):
         result.cleaned.append(f"Cleared {provider} OAuth tokens from auth store")
     result.hints.append(

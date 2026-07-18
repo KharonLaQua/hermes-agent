@@ -3828,6 +3828,8 @@ def _refresh_provider_credentials(provider: str) -> bool:
             creds = resolve_xai_oauth_runtime_credentials(force_refresh=True)
             if not str(creds.get("api_key", "") or "").strip():
                 return False
+            # G10: refresh success is insufficient if a cached aux client still
+            # holds the old bearer — always evict after canonical rotation.
             _evict_cached_clients(normalized)
             return True
         if normalized == "vertex":
