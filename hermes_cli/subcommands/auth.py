@@ -118,11 +118,8 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
         action="store_true",
         help="Overwrite an existing canonical shared grant",
     )
-    auth_xai_migrate.add_argument(
-        "--keep-legacy",
-        action="store_true",
-        help="Do not strip legacy secret material (not recommended)",
-    )
+    # A8: --keep-legacy removed — sole ownership requires stripping every
+    # durable local RT. Keeping legacy copies directly forks the grant.
     auth_xai_sub.add_parser(
         "enable-shared",
         help="Re-enable this profile's use of the shared xAI grant",

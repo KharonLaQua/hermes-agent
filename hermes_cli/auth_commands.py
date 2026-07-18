@@ -806,7 +806,7 @@ def auth_xai_command(args) -> None:
         try:
             written = auth_mod.migrate_xai_oauth_to_shared_store(
                 source=getattr(args, "source", "auto") or "auto",
-                strip_legacy=not getattr(args, "keep_legacy", False),
+                strip_legacy=True,  # A8: --keep-legacy removed; sole ownership required
                 force=bool(getattr(args, "force", False)),
             )
         except auth_mod.AuthError as exc:
@@ -816,9 +816,8 @@ def auth_xai_command(args) -> None:
         print(f"  Generation:  {written.get('generation')}")
         print(f"  Last refresh:{written.get('last_refresh')}")
         print(
-            "  Legacy secret material was "
-            + ("kept (--keep-legacy)." if getattr(args, "keep_legacy", False)
-               else "stripped from profile/root stores.")
+            "  Legacy secret material was stripped from all profiles + root "
+            "(sole ownership)."
         )
         return
     if action == "enable-shared":

@@ -441,3 +441,347 @@ def test_merge_shared_updates_local_dict(shared_env):
     assert auth._merge_shared_xai_state(local) is True
     assert local["refresh_token"] == "sr"
     assert local["generation"] == 9
+
+
+# ---------------------------------------------------------------------------
+# A1/A3/A4/A5 — multi-profile legacy pool strip + sole ownership
+# ---------------------------------------------------------------------------
+
+
+def _seed_legacy_pool_auth(path: Path, *, access: str, refresh: str, manual: bool = False):
+    source = "manual:device_code" if manual else "device_code"
+    payload = {
+        "version": 1,
+        "providers": {
+            "xai-oauth": {
+                "tokens": {
+                    "access_token": access,
+                    "refresh_token": refresh,
+                },
+                "auth_mode": "oauth_device_code",
+            }
+        },
+        "credential_pool": {
+            "xai-oauth": [
+                {
+                    "id": f"{source}-{refresh[:8]}",
+                    "source": source,
+                    "auth_type": "oauth",
+                    "access_token": access,
+                    "refresh_token": refresh,
+                    "priority": 0,
+                }
+            ]
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_strip_covers_all_profiles_and_manuals(shared_env, tmp_path, monkeypatch):
+    """A1/A4: strip removes RTs from EVERY profile + root + manual pool rows."""
+    # Make default hermes root == tmp home so profile enumeration is in-sandbox.
+    hermes_root = tmp_path / "home" / ".hermes"
+    hermes_root.mkdir(parents=True, exist_ok=True)
+    profiles_root = hermes_root / "profiles"
+    profiles_root.mkdir()
+
+    # Active profile (HERMES_HOME)
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="p-at", refresh="p-rt", manual=False
+    )
+    # Second named profile with a manual RT
+    other = profiles_root / "coder" / "auth.json"
+    _seed_legacy_pool_auth(other, access="c-at", refresh="c-rt", manual=True)
+    # Root auth.json with device_code RT
+    root_auth = hermes_root / "auth.json"
+    _seed_legacy_pool_auth(root_auth, access="r-at", refresh="r-rt", manual=False)
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_default_hermes_home", lambda: hermes_root
+    )
+    monkeypatch.setattr(
+        "hermes_constants.get_default_hermes_root", lambda: hermes_root
+    )
+
+    audit = auth._strip_legacy_xai_oauth_secrets(include_global_root=True, fail_loud=True)
+    assert audit  # something was cleaned
+
+    for path in (shared_env["profile_auth"], other, root_auth):
+        store = json.loads(path.read_text(encoding="utf-8"))
+        assert not auth._auth_store_holds_durable_xai_refresh_token(store), path
+        pool = store.get("credential_pool", {}).get("xai-oauth", [])
+        for entry in pool:
+            assert not entry.get("refresh_token")
+            assert not str(entry.get("source") or "").startswith("manual")
+
+
+def test_migrate_with_legacy_pools_leaves_no_fork(shared_env, tmp_path, monkeypatch):
+    """Pre-populated device_code + manual RTs are gone after migrate."""
+    hermes_root = tmp_path / "home" / ".hermes"
+    hermes_root.mkdir(parents=True, exist_ok=True)
+    (hermes_root / "profiles").mkdir()
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_default_hermes_home", lambda: hermes_root
+    )
+    monkeypatch.setattr(
+        "hermes_constants.get_default_hermes_root", lambda: hermes_root
+    )
+
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="legacy-at", refresh="legacy-rt"
+    )
+    # Extra manual row in the same store
+    store = json.loads(shared_env["profile_auth"].read_text(encoding="utf-8"))
+    store["credential_pool"]["xai-oauth"].append(
+        {
+            "id": "manual-fork",
+            "source": "manual:device_code",
+            "auth_type": "oauth",
+            "access_token": "manual-at",
+            "refresh_token": "manual-rt",
+            "priority": 1,
+        }
+    )
+    shared_env["profile_auth"].write_text(json.dumps(store), encoding="utf-8")
+
+    written = auth.migrate_xai_oauth_to_shared_store(source="profile", strip_legacy=True)
+    assert written["refresh_token"] == "legacy-rt"
+
+    profile = json.loads(shared_env["profile_auth"].read_text(encoding="utf-8"))
+    assert not auth._auth_store_holds_durable_xai_refresh_token(profile)
+    pool = profile.get("credential_pool", {}).get("xai-oauth", [])
+    assert all(not e.get("refresh_token") for e in pool)
+    assert all(not str(e.get("source") or "").startswith("manual") for e in pool)
+
+
+def test_strip_fails_loud_when_residual_rt_remains(shared_env, monkeypatch):
+    """A1: migration/login must fail if a durable RT cannot be removed."""
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="a", refresh="rt-stuck"
+    )
+
+    real_save = auth._save_auth_store
+
+    def save_but_restore_rt(store, target_path=None):
+        # Pretend write succeeded but leave a residual RT (poisoned write).
+        path = real_save(store, target_path=target_path)
+        poisoned = json.loads(path.read_text(encoding="utf-8"))
+        poisoned.setdefault("providers", {})["xai-oauth"] = {
+            "tokens": {"access_token": "a", "refresh_token": "rt-stuck"}
+        }
+        path.write_text(json.dumps(poisoned), encoding="utf-8")
+        return path
+
+    monkeypatch.setattr(auth, "_save_auth_store", save_but_restore_rt)
+    with pytest.raises(AuthError) as exc:
+        auth._strip_legacy_xai_oauth_secrets(include_global_root=False, fail_loud=True)
+    assert exc.value.code == "xai_shared_strip_incomplete"
+
+
+def test_logout_preserves_disable_marker(shared_env):
+    """B1: hermes logout --provider xai-oauth keeps shared_disabled marker."""
+    _write_shared(shared_env, access="a", refresh="r", generation=1)
+    auth._write_profile_xai_shared_reference(enabled=True, generation=1)
+
+    # Simulate logout_command shared-mode profile path (clear then disable).
+    auth.clear_provider_auth("xai-oauth")
+    auth.disable_profile_xai_shared_auth()
+
+    profile = json.loads(shared_env["profile_auth"].read_text(encoding="utf-8"))
+    state = profile["providers"]["xai-oauth"]
+    assert state.get("enabled") is False
+    assert state.get("shared_disabled") is True
+    # Canonical grant still present.
+    assert shared_env["store"].is_file()
+    with pytest.raises(AuthError) as exc:
+        auth.resolve_xai_oauth_runtime_credentials(refresh_if_expiring=False)
+    assert exc.value.code == "xai_shared_profile_disabled"
+
+
+def test_logout_command_shared_profile_path(shared_env):
+    """B1 end-to-end via logout_command."""
+    from types import SimpleNamespace
+
+    _write_shared(shared_env, access="a", refresh="r")
+    auth._write_profile_xai_shared_reference(enabled=True)
+
+    args = SimpleNamespace(
+        provider="xai-oauth",
+        reset_config=False,
+        global_logout=False,
+        shared=False,
+        **{"global": False},
+    )
+    auth.logout_command(args)
+
+    profile = json.loads(shared_env["profile_auth"].read_text(encoding="utf-8"))
+    state = profile["providers"]["xai-oauth"]
+    assert state.get("shared_disabled") is True
+    assert state.get("enabled") is False
+    shared = json.loads(shared_env["store"].read_text(encoding="utf-8"))
+    assert shared.get("refresh_token") == "r"
+
+
+def test_load_pool_rewrites_device_code_and_manual(shared_env):
+    """A3/A4: load_pool under shared mode discards local RTs."""
+    from agent.credential_pool import load_pool
+
+    _write_shared(shared_env, access="shared-at", refresh="shared-rt", generation=2)
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="old-at", refresh="old-rt", manual=False
+    )
+    store = json.loads(shared_env["profile_auth"].read_text(encoding="utf-8"))
+    store["credential_pool"]["xai-oauth"].append(
+        {
+            "id": "manual-1",
+            "source": "manual:device_code",
+            "auth_type": "oauth",
+            "access_token": "manual-at",
+            "refresh_token": "manual-rt",
+            "priority": 1,
+        }
+    )
+    shared_env["profile_auth"].write_text(json.dumps(store), encoding="utf-8")
+
+    pool = load_pool("xai-oauth")
+    assert pool.has_credentials()
+    for entry in pool.entries():
+        assert not entry.refresh_token
+        assert str(entry.source) == auth.XAI_SHARED_SOURCE
+
+    # Persisted profile must not hold RTs either.
+    profile = json.loads(shared_env["profile_auth"].read_text(encoding="utf-8"))
+    assert not auth._auth_store_holds_durable_xai_refresh_token(profile)
+
+
+def test_manual_row_does_not_pure_refresh_under_shared(shared_env, monkeypatch):
+    """A4: legacy manual entry cannot pure-refresh a local RT outside the lock."""
+    from agent.credential_pool import CredentialPool, PooledCredential, AUTH_TYPE_OAUTH
+
+    _write_shared(shared_env, access="shared-at", refresh="shared-rt", generation=1)
+    pure_calls = []
+
+    def fake_pure(access, refresh, **kwargs):
+        pure_calls.append(refresh)
+        return {
+            "access_token": "should-not",
+            "refresh_token": "should-not",
+            "token_type": "Bearer",
+            "last_refresh": "2026-07-18T00:00:00Z",
+        }
+
+    monkeypatch.setattr(auth, "refresh_xai_oauth_pure", fake_pure)
+    monkeypatch.setattr(
+        auth,
+        "_xai_oauth_discovery",
+        lambda *_a, **_k: {"token_endpoint": "https://auth.x.ai/oauth/token"},
+    )
+
+    entry = PooledCredential(
+        id="manual-1",
+        provider="xai-oauth",
+        label="manual-1",
+        source="manual:device_code",
+        auth_type=AUTH_TYPE_OAUTH,
+        access_token="manual-at",
+        refresh_token="manual-rt",
+        priority=0,
+    )
+    pool = CredentialPool("xai-oauth", [entry])
+    # Force refresh path
+    refreshed = pool._refresh_entry(entry, force=True)
+    assert pure_calls == []  # must not pure-refresh local RT
+    assert refreshed is not None
+    assert refreshed.refresh_token is None
+    assert refreshed.source == auth.XAI_SHARED_SOURCE
+
+
+def test_write_shared_persists_id_token(shared_env):
+    """D3: id_token from refresh is persisted in the canonical store."""
+    written = auth._write_shared_xai_state(
+        {
+            "access_token": "at",
+            "refresh_token": "rt",
+            "id_token": "id-tok-1",
+        }
+    )
+    assert written.get("id_token") == "id-tok-1"
+    on_disk = json.loads(shared_env["store"].read_text(encoding="utf-8"))
+    assert on_disk.get("id_token") == "id-tok-1"
+
+
+def test_save_strips_root_rt(shared_env, tmp_path, monkeypatch):
+    """A5: shared save clears root providers.xai-oauth refresh_token."""
+    hermes_root = tmp_path / "home" / ".hermes"
+    hermes_root.mkdir(parents=True, exist_ok=True)
+    root_auth = hermes_root / "auth.json"
+    _seed_legacy_pool_auth(root_auth, access="root-at", refresh="root-rt")
+    monkeypatch.setattr(auth, "_global_auth_file_path", lambda: root_auth)
+    monkeypatch.setattr(
+        "hermes_constants.get_default_hermes_root", lambda: hermes_root
+    )
+
+    auth._save_xai_oauth_tokens(
+        {
+            "access_token": "new-at",
+            "refresh_token": "new-rt",
+            "token_type": "Bearer",
+            "id_token": "id-1",
+        }
+    )
+    root = json.loads(root_auth.read_text(encoding="utf-8"))
+    assert not auth._auth_store_holds_durable_xai_refresh_token(root)
+    shared = json.loads(shared_env["store"].read_text(encoding="utf-8"))
+    assert shared["refresh_token"] == "new-rt"
+    assert shared.get("id_token") == "id-1"
+
+
+def test_login_refuses_silent_replace_when_disabled(shared_env, monkeypatch):
+    """B2: disabled profile login does not silently clobber the fleet grant."""
+    from types import SimpleNamespace
+
+    _write_shared(shared_env, access="fleet-at", refresh="fleet-rt", generation=3)
+    auth.disable_profile_xai_shared_auth()
+
+    # Non-interactive decline
+    monkeypatch.setattr("builtins.input", lambda *_a, **_k: "n")
+    login_called = {"n": 0}
+
+    def boom_login(**kwargs):
+        login_called["n"] += 1
+        raise AssertionError("device login must not run without confirmation")
+
+    monkeypatch.setattr(auth, "_xai_oauth_device_code_login", boom_login)
+    auth._login_xai_oauth(
+        SimpleNamespace(timeout=5, no_browser=True),
+        auth.PROVIDER_REGISTRY["xai-oauth"],
+        force_new_login=True,
+    )
+    assert login_called["n"] == 0
+    shared = json.loads(shared_env["store"].read_text(encoding="utf-8"))
+    assert shared["refresh_token"] == "fleet-rt"
+
+
+def test_persistence_guard_strips_device_code_rt(shared_env):
+    """A2: write_credential_pool under shared mode cannot persist a device_code RT."""
+    from hermes_cli.auth import write_credential_pool
+
+    write_credential_pool(
+        "xai-oauth",
+        [
+            {
+                "id": "dc-1",
+                "source": "device_code",
+                "auth_type": "oauth",
+                "access_token": "at",
+                "refresh_token": "rt-should-die",
+                "priority": 0,
+            }
+        ],
+    )
+    store = json.loads(shared_env["profile_auth"].read_text(encoding="utf-8"))
+    entries = store["credential_pool"]["xai-oauth"]
+    assert len(entries) == 1
+    assert not entries[0].get("refresh_token")
+    assert entries[0]["source"] == auth.XAI_SHARED_SOURCE

@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
@@ -1561,6 +1561,14 @@ def write_credential_pool(
             if isinstance(entry, dict) else entry
             for entry in entries
         ]
+        # A2: final shared-mode guard — no durable xAI RT except the ephemeral
+        # shared reference, regardless of source label (device_code/manual/etc).
+        if str(provider_id or "").strip().lower() == "xai-oauth" and _xai_shared_auth_enabled():
+            sanitized_entries = [
+                sanitize_xai_shared_pool_payload(entry, provider_id)
+                if isinstance(entry, dict) else entry
+                for entry in sanitized_entries
+            ]
         existing = pool.get(provider_id)
         existing_list = existing if isinstance(existing, list) else []
         existing_by_id = {
@@ -1587,7 +1595,28 @@ def write_credential_pool(
             disk_id = disk_entry.get("id")
             if not disk_id or disk_id in new_ids or disk_id in removed:
                 continue
-            merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
+            merged_entry = sanitize_borrowed_credential_payload(disk_entry, provider_id)
+            if str(provider_id or "").strip().lower() == "xai-oauth" and _xai_shared_auth_enabled():
+                merged_entry = sanitize_xai_shared_pool_payload(merged_entry, provider_id)
+            merged.append(merged_entry)
+        # Collapse duplicate shared refs after merge (sole ownership).
+        if str(provider_id or "").strip().lower() == "xai-oauth" and _xai_shared_auth_enabled():
+            collapsed: List[Dict[str, Any]] = []
+            saw_shared = False
+            for entry in merged:
+                if not isinstance(entry, dict):
+                    continue
+                source = str(entry.get("source") or "")
+                if source == XAI_SHARED_SOURCE or not source.startswith("manual"):
+                    if saw_shared:
+                        continue
+                    collapsed.append(sanitize_xai_shared_pool_payload(entry, provider_id))
+                    saw_shared = True
+                else:
+                    # manual:* under shared mode is rewritten to shared ref above;
+                    # anything still labeled manual is dropped.
+                    continue
+            merged = collapsed
         pool[provider_id] = merged
         return _save_auth_store(auth_store)
 
@@ -4513,6 +4542,13 @@ def _write_shared_xai_state(
             else {},
             "redirect_uri": str(state.get("redirect_uri") or ""),
         }
+        # D3: refresh responses supply id_token; keep it in the canonical grant.
+        id_token = str(state.get("id_token") or "").strip()
+        if id_token:
+            shared["id_token"] = id_token
+        elif existing.get("id_token"):
+            # Preserve prior id_token when a write omits it (metadata-only updates).
+            shared["id_token"] = existing.get("id_token")
         if state.get("last_auth_error") is not None:
             shared["last_auth_error"] = state.get("last_auth_error")
 
@@ -4718,6 +4754,7 @@ def _merge_shared_xai_state(into: Dict[str, Any]) -> bool:
     for key in (
         "access_token",
         "refresh_token",
+        "id_token",
         "token_type",
         "expires_in",
         "last_refresh",
@@ -4765,12 +4802,203 @@ def _profile_xai_shared_disabled(auth_store: Optional[Dict[str, Any]] = None) ->
     return False
 
 
+def _xai_shared_pool_secret_keys() -> frozenset:
+    return frozenset(
+        {
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "agent_key",
+            "api_key",
+            "token",
+            "tokens",
+        }
+    )
+
+
+def _strip_xai_pool_entry_to_shared_ref(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Rewrite one pool entry to a non-secret shared reference."""
+    secret_keys = _xai_shared_pool_secret_keys()
+    ref = {k: v for k, v in entry.items() if k not in secret_keys}
+    ref["source"] = XAI_SHARED_SOURCE
+    ref["auth_type"] = str(ref.get("auth_type") or "oauth")
+    # Explicitly clear any residual secret fields that slipped past filtering.
+    for key in secret_keys:
+        ref.pop(key, None)
+    return ref
+
+
+def _auth_store_holds_durable_xai_refresh_token(store: Dict[str, Any]) -> bool:
+    """True when any durable xAI OAuth refresh_token remains in ``store``."""
+    providers = store.get("providers") if isinstance(store, dict) else None
+    if isinstance(providers, dict):
+        state = providers.get("xai-oauth")
+        if isinstance(state, dict):
+            tokens = state.get("tokens")
+            if isinstance(tokens, dict) and str(tokens.get("refresh_token") or "").strip():
+                return True
+            if str(state.get("refresh_token") or "").strip():
+                return True
+    pool = store.get("credential_pool") if isinstance(store, dict) else None
+    if isinstance(pool, dict):
+        entries = pool.get("xai-oauth")
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("refresh_token") or "").strip():
+                    return True
+    return False
+
+
+def _strip_xai_secrets_in_store(
+    store: Dict[str, Any],
+    *,
+    remove_manuals: bool = True,
+    audit: Optional[List[str]] = None,
+) -> bool:
+    """Strip durable xAI OAuth secrets from one auth store in place.
+
+    When ``remove_manuals`` is True (shared sole-ownership mode), same-family
+    ``manual:*`` pool rows are removed rather than left as independent RT
+    holders. Returns True when the store was mutated.
+    """
+    changed = False
+    providers = store.get("providers")
+    if isinstance(providers, dict) and isinstance(providers.get("xai-oauth"), dict):
+        state = dict(providers["xai-oauth"])
+        had_tokens = "tokens" in state or "access_token" in state or "refresh_token" in state
+        state.pop("tokens", None)
+        state.pop("access_token", None)
+        state.pop("refresh_token", None)
+        state.pop("id_token", None)
+        # Preserve an explicit per-profile disable marker if present.
+        if state.get("enabled") is False or is_truthy_value(
+            state.get("shared_disabled"), default=False
+        ):
+            state["source"] = XAI_SHARED_SOURCE
+            state["enabled"] = False
+            state["shared_disabled"] = True
+        else:
+            state["source"] = XAI_SHARED_SOURCE
+        providers["xai-oauth"] = state
+        if had_tokens:
+            changed = True
+
+    pool = store.get("credential_pool")
+    if isinstance(pool, dict) and isinstance(pool.get("xai-oauth"), list):
+        cleaned: List[Dict[str, Any]] = []
+        saw_shared_ref = False
+        for entry in pool["xai-oauth"]:
+            if not isinstance(entry, dict):
+                continue
+            source = str(entry.get("source") or "")
+            if source.startswith("manual"):
+                if remove_manuals:
+                    changed = True
+                    if audit is not None:
+                        audit.append(
+                            f"removed same-family manual pool entry "
+                            f"(source={source!r}, id={entry.get('id')!r})"
+                        )
+                    continue
+                cleaned.append(entry)
+                continue
+            if str(entry.get("refresh_token") or "").strip() or source != XAI_SHARED_SOURCE:
+                changed = True
+            ref = _strip_xai_pool_entry_to_shared_ref(entry)
+            if not saw_shared_ref:
+                cleaned.append(ref)
+                saw_shared_ref = True
+            else:
+                # Collapse duplicate non-manual rows into a single shared ref.
+                changed = True
+        pool["xai-oauth"] = cleaned
+    return changed
+
+
+def _iter_xai_auth_json_paths(*, include_global_root: bool = True) -> List[Path]:
+    """Return every durable auth.json path that may hold xAI OAuth secrets.
+
+    Covers the active HERMES_HOME, the global/default root, and every named
+    profile under the profiles root. Dedupes by resolved path.
+    """
+    paths: List[Path] = []
+    seen: set = set()
+
+    def _add(path: Optional[Path]) -> None:
+        if path is None:
+            return
+        try:
+            key = str(path.resolve(strict=False))
+        except Exception:
+            key = str(path)
+        if key in seen:
+            return
+        seen.add(key)
+        paths.append(path)
+
+    try:
+        _add(_auth_file_path())
+    except Exception:
+        pass
+
+    if include_global_root:
+        try:
+            _add(_global_auth_file_path())
+        except Exception:
+            pass
+        try:
+            from hermes_constants import get_default_hermes_root
+
+            _add(get_default_hermes_root() / "auth.json")
+        except Exception:
+            pass
+
+    try:
+        from hermes_cli.profiles import _get_profiles_root
+
+        profiles_root = _get_profiles_root()
+        if profiles_root.is_dir():
+            for entry in sorted(profiles_root.iterdir()):
+                if entry.is_dir() and not entry.name.startswith("."):
+                    _add(entry / "auth.json")
+    except Exception as exc:
+        logger.debug("xAI shared: profile enumeration for strip failed: %s", exc)
+
+    return paths
+
+
+def sanitize_xai_shared_pool_payload(
+    payload: Mapping[str, Any],
+    provider_id: Any = None,
+) -> Dict[str, Any]:
+    """Final persistence guard for xAI pool rows under shared mode (A2).
+
+    Strips every refresh_token / secret field from xai-oauth pool entries when
+    shared mode is on, regardless of source label (device_code, manual,
+    singleton). The only durable pool shape is a non-secret
+    ``shared:xai-oauth`` reference. Callers outside shared mode get a no-op.
+    """
+    result = dict(payload)
+    if str(provider_id or "").strip().lower() not in {"xai-oauth", "xai", "grok-oauth"}:
+        return result
+    if not _xai_shared_auth_enabled():
+        return result
+    source = str(result.get("source") or "")
+    # Manual same-family rows must not survive as durable local RTs.
+    if source.startswith("manual"):
+        return _strip_xai_pool_entry_to_shared_ref(result)
+    return _strip_xai_pool_entry_to_shared_ref(result)
+
+
 def _write_profile_xai_shared_reference(
     *,
     enabled: bool = True,
     last_refresh: Optional[str] = None,
     generation: Optional[int] = None,
     set_active: bool = False,
+    target_path: Optional[Path] = None,
 ) -> None:
     """Persist NON-SECRET profile metadata referencing the shared store.
 
@@ -4778,8 +5006,8 @@ def _write_profile_xai_shared_reference(
     Must be called AFTER releasing the shared lock (G3).
     """
     try:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
+        with _auth_store_lock(target_path=target_path):
+            auth_store = _load_auth_store(target_path) if target_path is not None else _load_auth_store()
             state = {}
             providers = auth_store.get("providers")
             if isinstance(providers, dict) and isinstance(providers.get("xai-oauth"), dict):
@@ -4789,6 +5017,7 @@ def _write_profile_xai_shared_reference(
                 prior.pop("tokens", None)
                 prior.pop("access_token", None)
                 prior.pop("refresh_token", None)
+                prior.pop("id_token", None)
                 state = prior
             state["source"] = XAI_SHARED_SOURCE
             state["enabled"] = bool(enabled)
@@ -4802,40 +5031,28 @@ def _write_profile_xai_shared_reference(
             # Ensure no nested secret blobs survive.
             state.pop("tokens", None)
             _store_provider_state(auth_store, "xai-oauth", state, set_active=set_active)
-            # Strip any profile-local pool rows that still hold raw RTs for the
-            # shared singleton (manual:* rows are independent and preserved).
+            # Strip any profile-local pool rows that still hold raw RTs. Under
+            # shared sole-ownership, same-family manuals are removed too (A4).
             pool = auth_store.get("credential_pool")
             if isinstance(pool, dict):
                 entries = pool.get("xai-oauth")
                 if isinstance(entries, list):
                     cleaned = []
+                    saw_shared = False
                     for entry in entries:
                         if not isinstance(entry, dict):
                             continue
                         source = str(entry.get("source") or "")
                         if source.startswith("manual"):
-                            cleaned.append(entry)
+                            # Same-family manuals pure-refresh outside the
+                            # shared lock — drop them so sole ownership holds.
                             continue
-                        # Reference-backed shared entry: strip secrets.
-                        ref = {
-                            k: v
-                            for k, v in entry.items()
-                            if k
-                            not in {
-                                "access_token",
-                                "refresh_token",
-                                "id_token",
-                                "agent_key",
-                                "api_key",
-                                "token",
-                                "tokens",
-                            }
-                        }
-                        ref["source"] = XAI_SHARED_SOURCE
-                        ref["auth_type"] = "oauth"
-                        cleaned.append(ref)
+                        if saw_shared:
+                            continue
+                        cleaned.append(_strip_xai_pool_entry_to_shared_ref(entry))
+                        saw_shared = True
                     pool["xai-oauth"] = cleaned
-            _save_auth_store(auth_store)
+            _save_auth_store(auth_store, target_path=target_path)
     except Exception as exc:
         logger.debug("xAI shared: failed to write profile reference metadata: %s", exc)
 
@@ -4964,79 +5181,152 @@ def migrate_xai_oauth_to_shared_store(
     return written
 
 
-def _strip_legacy_xai_oauth_secrets(*, include_global_root: bool = True) -> None:
-    """Remove raw xAI tokens from profile (and optionally root) auth stores."""
+def _strip_legacy_xai_oauth_secrets(
+    *,
+    include_global_root: bool = True,
+    fail_loud: bool = True,
+) -> List[str]:
+    """Hard-strip durable xAI OAuth secrets from ALL profiles + root.
 
-    def _strip_in_place(store: Dict[str, Any]) -> None:
-        providers = store.get("providers")
-        if isinstance(providers, dict) and isinstance(providers.get("xai-oauth"), dict):
-            state = dict(providers["xai-oauth"])
-            state.pop("tokens", None)
-            state.pop("access_token", None)
-            state.pop("refresh_token", None)
-            state["source"] = XAI_SHARED_SOURCE
-            providers["xai-oauth"] = state
-        pool = store.get("credential_pool")
-        if isinstance(pool, dict) and isinstance(pool.get("xai-oauth"), list):
-            cleaned = []
-            for entry in pool["xai-oauth"]:
-                if not isinstance(entry, dict):
+    Shared sole ownership (A1/A4/A5): every auth.json under the default hermes
+    root, every named profile, and the active HERMES_HOME must lose local
+    refresh tokens. Same-family ``manual:*`` pool rows are removed (they
+    pure-refresh outside the shared lock). Cleanup failures and residual
+    durable refresh tokens FAIL LOUDLY so migration/login cannot report
+    success while a fork still exists.
+
+    Returns a list of audit lines describing removals.
+    """
+    audit: List[str] = []
+    failures: List[str] = []
+    residual: List[str] = []
+
+    for path in _iter_xai_auth_json_paths(include_global_root=include_global_root):
+        if not path.is_file():
+            continue
+        try:
+            with _auth_store_lock(target_path=path):
+                store = _load_auth_store(path)
+                if not isinstance(store, dict) or not store:
                     continue
-                source = str(entry.get("source") or "")
-                if source.startswith("manual"):
-                    cleaned.append(entry)
-                    continue
-                ref = {
-                    k: v
-                    for k, v in entry.items()
-                    if k
-                    not in {
-                        "access_token",
-                        "refresh_token",
-                        "id_token",
-                        "agent_key",
-                        "api_key",
-                        "token",
-                        "tokens",
-                    }
-                }
-                ref["source"] = XAI_SHARED_SOURCE
-                cleaned.append(ref)
-            pool["xai-oauth"] = cleaned
+                mutated = _strip_xai_secrets_in_store(
+                    store, remove_manuals=True, audit=audit
+                )
+                if mutated:
+                    _save_auth_store(store, target_path=path)
+                    audit.append(f"stripped xAI secrets from {path}")
+                # Re-read after save to verify no durable RT remains.
+                verify = _load_auth_store(path)
+                if _auth_store_holds_durable_xai_refresh_token(verify):
+                    residual.append(str(path))
+        except Exception as exc:
+            failures.append(f"{path}: {exc}")
+            logger.warning(
+                "xAI shared: legacy secret strip failed for %s: %s", path, exc
+            )
 
-    try:
-        with _auth_store_lock():
-            store = _load_auth_store()
-            _strip_in_place(store)
-            _save_auth_store(store)
-    except Exception as exc:
-        logger.debug("xAI shared: legacy secret strip (profile) failed: %s", exc)
+    if failures or residual:
+        parts = []
+        if failures:
+            parts.append("cleanup failures: " + "; ".join(failures))
+        if residual:
+            parts.append(
+                "durable xAI refresh_token still present after strip at: "
+                + ", ".join(residual)
+            )
+        message = (
+            "Shared xAI OAuth sole-ownership strip incomplete. "
+            + " | ".join(parts)
+            + ". Migration/login cannot proceed while a local fork remains."
+        )
+        if fail_loud:
+            raise AuthError(
+                message,
+                provider="xai-oauth",
+                code="xai_shared_strip_incomplete",
+                relogin_required=False,
+            )
+        logger.error(message)
+    return audit
 
-    if not include_global_root:
-        return
+
+def _strip_root_xai_oauth_secrets(*, fail_loud: bool = True) -> None:
+    """A5: strip durable xAI OAuth secrets from the global-root auth.json only."""
+    paths: List[Path] = []
     try:
         global_path = _global_auth_file_path()
-        if global_path is None:
-            return
-        with _auth_store_lock(target_path=global_path):
-            store = _load_global_auth_store()
-            if not store:
-                return
-            _strip_in_place(store)
-            _save_auth_store(store, target_path=global_path)
-    except Exception as exc:
-        logger.debug("xAI shared: legacy secret strip (root) failed: %s", exc)
+        if global_path is not None:
+            paths.append(global_path)
+    except Exception:
+        pass
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        root = get_default_hermes_root() / "auth.json"
+        # Avoid double-work when profile == root (classic mode).
+        if not any(_same_path(root, p) for p in paths):
+            # Only add when distinct from the active profile auth path.
+            try:
+                active = _auth_file_path()
+            except Exception:
+                active = None
+            if active is None or not _same_path(root, active):
+                paths.append(root)
+    except Exception:
+        pass
+
+    residual: List[str] = []
+    failures: List[str] = []
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            with _auth_store_lock(target_path=path):
+                store = _load_auth_store(path)
+                if not store:
+                    continue
+                if _strip_xai_secrets_in_store(store, remove_manuals=True):
+                    _save_auth_store(store, target_path=path)
+                verify = _load_auth_store(path)
+                if _auth_store_holds_durable_xai_refresh_token(verify):
+                    residual.append(str(path))
+        except Exception as exc:
+            failures.append(f"{path}: {exc}")
+    if failures or residual:
+        message = (
+            "Shared xAI OAuth root strip incomplete. "
+            + (f"failures={failures}; " if failures else "")
+            + (f"residual_rt_at={residual}" if residual else "")
+        )
+        if fail_loud:
+            raise AuthError(
+                message,
+                provider="xai-oauth",
+                code="xai_shared_root_strip_incomplete",
+                relogin_required=False,
+            )
+        logger.error(message)
 
 
 def disable_profile_xai_shared_auth() -> bool:
-    """Per-profile opt-out of the shared xAI grant (does NOT clear the grant)."""
+    """Per-profile opt-out of the shared xAI grant (does NOT clear the grant).
+
+    Writes the durable disable marker. Callers that also clear provider state
+    (logout / auth remove) MUST re-invoke this AFTER the clear so the marker
+    survives (B1).
+    """
     _write_profile_xai_shared_reference(enabled=False)
     return True
 
 
 def enable_profile_xai_shared_auth() -> bool:
-    """Re-enable this profile's use of the shared xAI grant."""
+    """Re-enable this profile's use of the shared xAI grant.
+
+    Also sweeps residual durable RTs from all profiles + root (A1) so enabling
+    cannot leave a silent fork.
+    """
     _write_profile_xai_shared_reference(enabled=True)
+    _strip_legacy_xai_oauth_secrets(include_global_root=True, fail_loud=True)
     return True
 
 
@@ -5282,6 +5572,10 @@ def _save_xai_oauth_tokens(
             generation=written.get("generation"),
             set_active=True,
         )
+        # A5: root providers.xai-oauth.tokens.refresh_token must not survive a
+        # shared save. Active profile is already reference-only above. Full
+        # multi-profile sweeps happen on migrate/login/enable (A1).
+        _strip_root_xai_oauth_secrets(fail_loud=True)
         return
 
     with _auth_store_lock():
@@ -8578,6 +8872,37 @@ def _login_openai_codex(
     print(f"  Config updated: {config_path} (model.provider=openai-codex)")
 
 
+def _confirm_replace_shared_xai_grant(args, *, profile_disabled: bool) -> bool:
+    """B2: require explicit confirmation before clobbering the fleet grant."""
+    if bool(
+        getattr(args, "force_replace_shared", False)
+        or getattr(args, "force", False)
+        or getattr(args, "yes", False)
+    ):
+        return True
+    print()
+    if profile_disabled:
+        print(
+            "This profile has shared xAI OAuth disabled. A new device login would "
+            "REPLACE the canonical shared grant used by ALL profiles."
+        )
+        print(
+            "To re-use the existing fleet grant without replacing it, run: "
+            "`hermes auth xai enable-shared`"
+        )
+    else:
+        print(
+            "A canonical shared xAI OAuth grant already exists. A new device login "
+            "would REPLACE it for EVERY Hermes profile that uses shared mode."
+        )
+    print("Pass --force-replace-shared to confirm non-interactively.")
+    try:
+        answer = input("Replace the GLOBAL shared xAI grant? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = "n"
+    return answer in {"y", "yes"}
+
+
 def _login_xai_oauth(
     args,
     pconfig: ProviderConfig,
@@ -8586,7 +8911,16 @@ def _login_xai_oauth(
 ) -> None:
     del pconfig
 
-    if not force_new_login:
+    shared_mode = _xai_shared_auth_enabled()
+    profile_disabled = shared_mode and _profile_xai_shared_disabled()
+    shared_present = False
+    if shared_mode:
+        try:
+            shared_present = _xai_shared_state_has_usable_tokens(_read_shared_xai_state())
+        except Exception:
+            shared_present = False
+
+    if not force_new_login and not profile_disabled:
         try:
             existing = resolve_xai_oauth_runtime_credentials()
             api_key = existing.get("api_key", "")
@@ -8605,8 +8939,25 @@ def _login_xai_oauth(
                     print("Login successful!")
                     print(f"  Config updated: {config_path} (model.provider=xai-oauth)")
                     return
-        except AuthError:
-            pass
+        except AuthError as exc:
+            # B2: profile-disabled must NOT fall through as "missing auth" and
+            # silently overwrite the global grant.
+            if getattr(exc, "code", None) == "xai_shared_profile_disabled":
+                profile_disabled = True
+            # Other AuthErrors (missing shared grant, etc.) fall through to login.
+
+    # B2: any fresh device-code login writes the canonical store. When a
+    # usable fleet grant already exists, require explicit confirmation so a
+    # disabled profile (or declined reuse) cannot silently clobber everyone.
+    # Empty shared store is the normal first-seed path — no confirm.
+    if shared_mode and shared_present:
+        if not _confirm_replace_shared_xai_grant(
+            args, profile_disabled=profile_disabled
+        ):
+            print("Aborted. Shared grant was not modified.")
+            if profile_disabled:
+                print("Re-enable with: hermes auth xai enable-shared")
+            return
 
     print()
     print("Signing in to xAI Grok OAuth (SuperGrok / Premium+)...")
@@ -8639,18 +8990,16 @@ def _login_xai_oauth(
     # refresh hot path, which must never mutate suppression state.
     unsuppress_credential_source("xai-oauth", "device_code")
     unsuppress_credential_source("xai-oauth", XAI_SHARED_SOURCE)
-    if _xai_shared_auth_enabled():
+    if shared_mode:
         # Login is the preferred way to seed the canonical store; also strip
         # any leftover legacy secret material so local copies cannot refresh.
-        try:
-            _strip_legacy_xai_oauth_secrets(include_global_root=True)
-        except Exception:
-            pass
+        # Fail loud (A1): login must not report success if a fork remains.
+        _strip_legacy_xai_oauth_secrets(include_global_root=True, fail_loud=True)
         enable_profile_xai_shared_auth()
     config_path = _update_config_for_provider("xai-oauth", creds.get("base_url", DEFAULT_XAI_OAUTH_BASE_URL))
     print()
     print("Login successful!")
-    if _xai_shared_auth_enabled():
+    if shared_mode:
         print(f"  Auth state (shared, canonical): {_xai_shared_store_path()}")
         print("  Profile holds a non-secret reference only (source: shared:xai-oauth).")
     else:
@@ -9957,9 +10306,10 @@ def logout_command(args) -> None:
                 print(f"No shared auth state found for {provider_name}.")
             return
 
-        # Per-profile disable (default).
-        disable_profile_xai_shared_auth()
+        # Per-profile disable (default). B1: clear first, THEN write the
+        # durable disable marker so clear_provider_auth cannot delete it.
         clear_provider_auth("xai-oauth")
+        disable_profile_xai_shared_auth()
         if should_reset_config:
             _reset_config_provider()
         print(

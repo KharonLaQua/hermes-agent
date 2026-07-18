@@ -236,7 +236,11 @@ def test_shared_mode_disables_root_write_through(tmp_path, monkeypatch):
     )
 
     root = _read_store(root_path)
-    # Root must NOT receive the rotated chain — shared store is the only home.
-    assert root["providers"]["xai-oauth"]["tokens"]["refresh_token"] == "root-old-rt"
+    # A5: root must NOT keep a durable RT after a shared save (sole ownership).
+    # Shared store is the only home for the rotating grant.
+    xai_state = root.get("providers", {}).get("xai-oauth") or {}
+    tokens = xai_state.get("tokens") if isinstance(xai_state.get("tokens"), dict) else {}
+    assert not tokens.get("refresh_token")
+    assert not xai_state.get("refresh_token")
     shared = json.loads((shared_dir / "xai_oauth.json").read_text(encoding="utf-8"))
     assert shared["refresh_token"] == "new-rt"

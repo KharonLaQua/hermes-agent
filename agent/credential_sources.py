@@ -285,6 +285,10 @@ def _remove_xai_oauth_device_code(provider: str, removed) -> RemovalResult:
         from hermes_cli import auth as auth_mod
 
         if auth_mod._xai_shared_auth_enabled():
+            # B1: clear local reference first, THEN re-write the durable
+            # disable marker so it survives the provider-block deletion.
+            if _clear_auth_store_provider(provider):
+                result.cleaned.append(f"Cleared {provider} profile reference from auth store")
             auth_mod.disable_profile_xai_shared_auth()
             result.cleaned.append(
                 "Disabled shared xAI OAuth for this profile (canonical grant unchanged)"
@@ -293,8 +297,6 @@ def _remove_xai_oauth_device_code(provider: str, removed) -> RemovalResult:
                 "To delete the grant for all profiles: "
                 "`hermes logout --provider xai-oauth --global`"
             )
-            if _clear_auth_store_provider(provider):
-                result.cleaned.append(f"Cleared {provider} profile reference from auth store")
             return result
     except Exception:
         pass
