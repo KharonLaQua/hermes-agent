@@ -1117,6 +1117,36 @@ def _auth_store_lock(
         yield
 
 
+def _empty_auth_store() -> Dict[str, Any]:
+    """Canonical empty auth-store shape (absent / empty-dict load result)."""
+    return {"version": AUTH_STORE_VERSION, "providers": {}}
+
+
+def _is_recognized_auth_store_shape(raw: Any) -> bool:
+    """True when decoded JSON is a recognized dict-shaped auth store.
+
+    Recognized:
+      - empty dict ``{}`` (legitimately empty)
+      - dict with ``providers`` mapping and/or ``credential_pool`` mapping
+      - legacy PR ``systems`` mapping (migrated on load)
+
+    Lists, strings, numbers, null, and other non-dict / unrecognized dict
+    shapes are NOT recognized — under ``fail_on_corrupt=True`` they must
+    raise rather than normalize to empty (R7-1).
+    """
+    if not isinstance(raw, dict):
+        return False
+    if not raw:
+        return True
+    if isinstance(raw.get("providers"), dict):
+        return True
+    if isinstance(raw.get("credential_pool"), dict):
+        return True
+    if isinstance(raw.get("systems"), dict):
+        return True
+    return False
+
+
 def _load_auth_store(
     auth_file: Optional[Path] = None,
     *,
@@ -1124,7 +1154,7 @@ def _load_auth_store(
 ) -> Dict[str, Any]:
     auth_file = auth_file or _auth_file_path()
     if not auth_file.exists():
-        return {"version": AUTH_STORE_VERSION, "providers": {}}
+        return _empty_auth_store()
 
     try:
         raw = json.loads(auth_file.read_text())
@@ -1149,7 +1179,31 @@ def _load_auth_store(
             "Corrupt file preserved at %s",
             auth_file, exc, corrupt_path,
         )
-        return {"version": AUTH_STORE_VERSION, "providers": {}}
+        return _empty_auth_store()
+
+    # R7-1: parseable but unsupported shapes must fail closed under strict load.
+    # Absent file → empty (above). Empty dict ``{}`` → empty. Ordinary empty
+    # provider dicts remain valid. Lists / strings / numbers / unrecognized
+    # dicts are NOT silently normalized when fail_on_corrupt=True — a hidden
+    # durable RT in an invalid-shaped store must not be treated as empty and
+    # promoted-over / certified clean.
+    if not _is_recognized_auth_store_shape(raw):
+        if fail_on_corrupt:
+            raise AuthError(
+                f"auth store at {auth_file} has unsupported shape "
+                f"({type(raw).__name__}); refusing to treat as empty under "
+                f"fail-closed load.",
+                provider="xai-oauth",
+                code="auth_store_unreadable",
+                relogin_required=False,
+            )
+        logger.warning(
+            "auth: unsupported auth store shape at %s (%s) — starting with "
+            "empty store.",
+            auth_file,
+            type(raw).__name__,
+        )
+        return _empty_auth_store()
 
     if isinstance(raw, dict) and (
         isinstance(raw.get("providers"), dict)
@@ -1160,6 +1214,10 @@ def _load_auth_store(
             _migrate_stale_nous_portal_url(raw["providers"])
         return raw
 
+    # Empty dict ``{}`` — legitimately empty recognized store.
+    if isinstance(raw, dict) and not raw:
+        return _empty_auth_store()
+
     # Migrate from PR's "systems" format if present
     if isinstance(raw, dict) and isinstance(raw.get("systems"), dict):
         systems = raw["systems"]
@@ -1169,7 +1227,17 @@ def _load_auth_store(
         return {"version": AUTH_STORE_VERSION, "providers": providers,
                 "active_provider": "nous" if providers else None}
 
-    return {"version": AUTH_STORE_VERSION, "providers": {}}
+    # Defensive: recognized-shape predicate should have covered all cases.
+    if fail_on_corrupt:
+        raise AuthError(
+            f"auth store at {auth_file} has unsupported shape "
+            f"({type(raw).__name__}); refusing to treat as empty under "
+            f"fail-closed load.",
+            provider="xai-oauth",
+            code="auth_store_unreadable",
+            relogin_required=False,
+        )
+    return _empty_auth_store()
 
 
 def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = None) -> Path:
@@ -4680,15 +4748,21 @@ def _xai_fleet_auth_inventory(
     fail_loud: bool = True,
     paths: Optional[Sequence[Path]] = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
-    """Inventory audited auth-store paths (path + mtime + content digest).
+    """Inventory audited auth-store paths for sole-owner marker binding.
 
-    Used to bind the sole-owner marker to verifiable fleet state (H3). A
-    restored/new/changed auth.json yields a different digest and forces
-    re-audit.
+    Digest is SECURITY-RELEVANT only (R7-3): per-path presence plus whether a
+    durable xAI OAuth refresh_token remains. Volatile non-secret metadata
+    (``shared_generation``, timestamps, mtime/size of metadata-only rewrites)
+    is intentionally excluded so a normal refresh does not churn the marker
+    and force a full fleet re-audit.
 
-    Fail-closed (H3): read/stat errors raise when ``fail_loud`` (default) —
-    they are NEVER hashed into a "valid" fleet digest. Callers that hold
-    fleet locks should pass ``paths`` so inventory cannot race enumeration.
+    A restored/new auth.json with (or without) a durable RT still changes the
+    digest and forces re-audit. Real RT reintroduction MUST invalidate.
+
+    Fail-closed (H3/R7-1): read/parse/unsupported-shape errors raise when
+    ``fail_loud`` (default) — they are NEVER hashed into a "valid" fleet
+    digest. Callers that hold fleet locks should pass ``paths`` so inventory
+    cannot race enumeration.
     """
     if paths is None:
         paths = _iter_xai_auth_json_paths(
@@ -4702,18 +4776,41 @@ def _xai_fleet_auth_inventory(
         except Exception:
             resolved = str(path)
         if not path.is_file():
-            entries.append({"path": resolved, "present": False})
+            entries.append(
+                {
+                    "path": resolved,
+                    "present": False,
+                    "has_durable_xai_rt": False,
+                }
+            )
             continue
         try:
-            st = path.stat()
-            raw = path.read_bytes()
+            # R7-1/R7-3: strict load — unsupported shapes / corrupt JSON fail
+            # closed rather than hashing as "empty / RT-free".
+            store = _load_auth_store(path, fail_on_corrupt=True)
+            has_rt = _auth_store_holds_durable_xai_refresh_token(store)
             entries.append(
                 {
                     "path": resolved,
                     "present": True,
-                    "mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))),
-                    "size": int(st.st_size),
-                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "has_durable_xai_rt": bool(has_rt),
+                }
+            )
+        except AuthError as exc:
+            if fail_loud:
+                raise AuthError(
+                    f"Fleet inventory cannot read auth store at {path}: "
+                    f"{exc}. Refusing to hash an unreadable store into a "
+                    f"sole-owner marker.",
+                    provider="xai-oauth",
+                    code="xai_shared_fleet_inventory_failed",
+                    relogin_required=False,
+                ) from exc
+            entries.append(
+                {
+                    "path": resolved,
+                    "present": True,
+                    "error": str(exc),
                 }
             )
         except OSError as exc:
@@ -4831,11 +4928,12 @@ def _write_xai_sole_owner_marker(
     _holding_store_locks: bool = False,
     _locked_paths: Optional[Sequence[Path]] = None,
 ) -> None:
-    """Persist a VERIFIABLE fleet sole-owner marker (R4/H3).
+    """Persist a VERIFIABLE fleet sole-owner marker (R4/H3/R7-3).
 
-    Binds to a fail-closed digest of audited auth-store paths (content sha256
-    + mtime + size). Existence alone never certifies a clean fleet —
-    consumers must validate via ``_xai_sole_owner_marker_is_valid``.
+    Binds to a fail-closed digest of audited auth-store paths covering
+    security-relevant state only (path presence + durable xAI RT presence).
+    Existence alone never certifies a clean fleet — consumers must validate
+    via ``_xai_sole_owner_marker_is_valid``.
 
     Atomicity (H3): when store locks are not already held, this acquires the
     shared lock (outer) then ALL audited-store locks (sorted) and re-audits
@@ -4890,16 +4988,25 @@ def _write_xai_sole_owner_marker(
 def _xai_sole_owner_marker_is_valid(
     *,
     generation: Optional[int] = None,
+    _holding_shared_lock: bool = False,
+    _holding_store_locks: bool = False,
+    _locked_paths: Optional[Sequence[Path]] = None,
 ) -> bool:
-    """H3: True only when the marker matches current fleet content digest.
+    """H3/R7-2: True only when the marker matches current fleet digest.
 
     A marker that cannot be parsed, whose fleet inventory cannot be read
     (fail-closed), or whose digest does not match current inventory must NOT
     skip the fleet audit.
 
+    Lock discipline (R7-2): inventory is read under the SAME protocol as
+    marker creation — shared outer lock then sorted store locks — unless the
+    caller already holds those locks and passes ``_locked_paths``. No skip may
+    be granted from an unlocked/stale inventory read (TOCTOU).
+
     Ops: generation is recorded for diagnostics but a normal canonical gen
-    bump (refresh) does NOT by itself invalidate a still-clean fleet digest —
-    that avoids a full fleet re-strip on every token refresh.
+    bump / profile metadata rewrite (refresh) does NOT by itself invalidate a
+    still-clean fleet digest (R7-3) — that avoids a full fleet re-strip on
+    every token refresh.
     """
     del generation  # retained for call-site compatibility; digest is authority
     try:
@@ -4918,16 +5025,47 @@ def _xai_sole_owner_marker_is_valid(
     if not marker_digest:
         # Pre-H3 existence-only markers are never trusted.
         return False
+
+    def _compare_under_paths(paths: Sequence[Path]) -> bool:
+        try:
+            current_digest, _entries = _xai_fleet_auth_inventory(
+                fail_loud=True,
+                paths=paths,
+            )
+        except AuthError:
+            # Cannot verify fleet → re-audit (treat as invalid).
+            return False
+        except Exception:
+            return False
+        return marker_digest == current_digest
+
+    def _with_store_locks() -> bool:
+        if _holding_store_locks:
+            if _locked_paths is None:
+                return False
+            return _compare_under_paths(_locked_paths)
+        try:
+            paths = _iter_xai_auth_json_paths(
+                include_global_root=True,
+                fail_loud=True,
+            )
+        except Exception:
+            return False
+        try:
+            with _xai_ordered_auth_store_locks(paths) as locked:
+                return _compare_under_paths(locked)
+        except AuthError:
+            return False
+        except Exception:
+            return False
+
+    if _holding_shared_lock:
+        return _with_store_locks()
     try:
-        current_digest, _entries = _xai_fleet_auth_inventory(fail_loud=True)
-    except AuthError:
-        # Cannot verify fleet → re-audit (treat as invalid).
-        return False
+        with _xai_shared_store_lock():
+            return _with_store_locks()
     except Exception:
         return False
-    if marker_digest != current_digest:
-        return False
-    return True
 
 
 def _ensure_xai_fleet_sole_owner_verified(
@@ -4935,7 +5073,7 @@ def _ensure_xai_fleet_sole_owner_verified(
     force: bool = False,
     generation: Optional[int] = None,
 ) -> None:
-    """R4/H3: on shared consumption, sweep fleet unless marker still validates.
+    """R4/H3/R7-2: on shared consumption, sweep fleet unless marker validates.
 
     A pre-existing canonical grant (deploy upgrade state) previously short-
     circuited ``ensure_shared`` and never ran the fleet strip — leaving dormant
@@ -4945,6 +5083,9 @@ def _ensure_xai_fleet_sole_owner_verified(
     Atomicity (H3): strip → inventory → marker-persist is ONE critical section
     holding the shared lock + ALL audited-store locks. No concurrent writer can
     restore an RT between strip and the digest that certifies the fleet clean.
+
+    Marker validation (R7-2) itself takes the same lock protocol, so an early
+    skip is never granted on an unlocked inventory snapshot.
     """
     if not _xai_shared_auth_enabled():
         return
@@ -4953,13 +5094,27 @@ def _ensure_xai_fleet_sole_owner_verified(
 
     with _xai_shared_store_lock():
         # Re-check under the shared lock so two consumers don't double-strip.
-        if not force and _xai_sole_owner_marker_is_valid(generation=generation):
+        # Pass _holding_shared_lock so validation does not re-enter the shared
+        # lock unnecessarily; it still acquires store locks for inventory.
+        if not force and _xai_sole_owner_marker_is_valid(
+            generation=generation,
+            _holding_shared_lock=True,
+        ):
             return
         paths = _iter_xai_auth_json_paths(
             include_global_root=True,
             fail_loud=True,
         )
         with _xai_ordered_auth_store_locks(paths) as locked_fleet:
+            # Final locked re-check: skip strip only if fleet still matches
+            # under the same locks that protect strip → marker.
+            if not force and _xai_sole_owner_marker_is_valid(
+                generation=generation,
+                _holding_shared_lock=True,
+                _holding_store_locks=True,
+                _locked_paths=locked_fleet,
+            ):
+                return
             _strip_legacy_xai_oauth_secrets_under_held_locks(
                 locked_fleet,
                 fail_loud=True,
