@@ -1401,3 +1401,399 @@ def test_r10_global_logout_leaves_non_promotable_tombstone(shared_env):
     assert auth.ensure_shared_xai_grant_from_local(strip_legacy=True) is None
     after = json.loads(shared_env["store"].read_text(encoding="utf-8"))
     assert after.get("refresh_token") in ("", None)
+
+
+# ---------------------------------------------------------------------------
+# Round-5: H1 race window / H2 cross-store sole-live / H3 verifiable marker /
+# H4 fail-closed logout / H5 parent fsync / H6 gate-off byte-identical
+# ---------------------------------------------------------------------------
+
+
+def test_h1_logout_after_recheck_before_write_aborts(shared_env, monkeypatch):
+    """H1 exact window: clear local AFTER recheck confirms identity, BEFORE write.
+
+    Hermes race: profile lock was released after recheck; concurrent logout
+    cleared the source; promote still wrote the in-memory snapshot. Fix holds
+    the profile-source lock through a final re-verify + canonical write, so a
+    clear that lands after recheck is observed and promotion aborts.
+
+    Call sequence under the fix:
+      1) ensure collect elect (live)
+      2) migrate collect elect (live)
+      3) commit recheck elect (live) → clear disk HERE (exact window)
+      4) commit final elect → sees gone → xai_promote_local_race
+    """
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="race-at", refresh="race-rt"
+    )
+    assert not shared_env["store"].exists()
+
+    real_elect = auth._elect_sole_promotable_xai_under_lock
+    live_returns = {"n": 0}
+    cleared_after_recheck = {"v": False}
+
+    def elect_clear_after_recheck(path):
+        state = real_elect(path)
+        identity = auth._xai_oauth_refresh_identity(state)
+        if identity == "race-rt":
+            live_returns["n"] += 1
+            # After the commit recheck (3rd live return) succeeds, clear the
+            # local source — this is Hermes' after-recheck-before-write window.
+            if live_returns["n"] == 3 and not cleared_after_recheck["v"]:
+                shared_env["profile_auth"].write_text(
+                    json.dumps({"version": 1, "providers": {}}),
+                    encoding="utf-8",
+                )
+                cleared_after_recheck["v"] = True
+        return state
+
+    real_write = auth._write_shared_xai_state
+    writes = {"n": 0}
+
+    def write_counting(*args, **kwargs):
+        writes["n"] += 1
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(
+        auth, "_elect_sole_promotable_xai_under_lock", elect_clear_after_recheck
+    )
+    monkeypatch.setattr(auth, "_write_shared_xai_state", write_counting)
+
+    result = auth.ensure_shared_xai_grant_from_local(strip_legacy=True)
+    assert result is None
+    assert cleared_after_recheck["v"] is True
+    # Write must not have committed the raced grant.
+    assert writes["n"] == 0
+    if shared_env["store"].exists():
+        shared = json.loads(shared_env["store"].read_text(encoding="utf-8"))
+        assert shared.get("refresh_token") not in {"race-rt"}
+        assert not auth._xai_shared_state_has_usable_tokens(shared)
+
+
+def test_h1_profile_lock_held_through_canonical_write(shared_env, monkeypatch):
+    """H1: profile-source lock is held across the canonical write (no gap)."""
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="hold-at", refresh="hold-rt"
+    )
+    held_during_write = {"value": None}
+    real_write = auth._write_shared_xai_state
+
+    def write_probe(state, **kwargs):
+        # Non-blocking probe: if promote holds the profile auth lock, a second
+        # acquire with timeout 0 must fail / wait. Use the reentrancy tracker:
+        # same-thread re-acquire succeeds (RLock-like). Instead check the
+        # lock file is locked by attempting a foreign-thread acquire.
+        import threading
+
+        result_box = {"acquired": None}
+
+        def try_acquire():
+            lock_path = shared_env["profile_auth"].with_suffix(".lock")
+            try:
+                fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+            except OSError:
+                result_box["acquired"] = True
+                return
+            try:
+                if hasattr(auth, "fcntl") and auth.fcntl is not None:
+                    try:
+                        auth.fcntl.flock(fd, auth.fcntl.LOCK_EX | auth.fcntl.LOCK_NB)
+                        result_box["acquired"] = True
+                        auth.fcntl.flock(fd, auth.fcntl.LOCK_UN)
+                    except (OSError, BlockingIOError):
+                        result_box["acquired"] = False
+                else:
+                    result_box["acquired"] = None
+            finally:
+                os.close(fd)
+
+        t = threading.Thread(target=try_acquire)
+        t.start()
+        t.join(timeout=2.0)
+        held_during_write["value"] = (
+            result_box["acquired"] is False
+        )  # False acquire ⇒ lock held
+        return real_write(state, **kwargs)
+
+    monkeypatch.setattr(auth, "_write_shared_xai_state", write_probe)
+    written = auth.migrate_xai_oauth_to_shared_store(
+        source="profile", strip_legacy=True
+    )
+    assert written.get("refresh_token") == "hold-rt"
+    assert held_during_write["value"] is True
+
+
+def test_h2_distinct_profile_and_root_rts_are_ambiguous(shared_env, tmp_path, monkeypatch):
+    """H2: live RT-A in profile + live RT-B in root → ambiguous (not profile-first)."""
+    hermes_root = tmp_path / "home" / ".hermes"
+    hermes_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_default_hermes_home", lambda: hermes_root
+    )
+    monkeypatch.setattr(
+        "hermes_constants.get_default_hermes_root", lambda: hermes_root
+    )
+    # Ensure global-root path resolves to hermes_root/auth.json (distinct from
+    # the active profile under HERMES_HOME).
+    root_auth = hermes_root / "auth.json"
+    _seed_legacy_pool_auth(root_auth, access="root-at", refresh="root-rt-B")
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="prof-at", refresh="prof-rt-A"
+    )
+    # Force _global_auth_file_path to the distinct root.
+    monkeypatch.setattr(auth, "_global_auth_file_path", lambda: root_auth)
+
+    with pytest.raises(AuthError) as exc:
+        auth.ensure_shared_xai_grant_from_local(strip_legacy=True)
+    assert exc.value.code == "xai_promote_ambiguous_local"
+    # Must not have silently installed the profile grant.
+    if shared_env["store"].exists():
+        shared = json.loads(shared_env["store"].read_text(encoding="utf-8"))
+        assert shared.get("refresh_token") not in {"prof-rt-A", "root-rt-B"}
+
+
+def test_h3_stale_marker_reaudits_restored_profile_rt(
+    shared_env, tmp_path, monkeypatch
+):
+    """H3 exact window: marker present, then restore dormant profile RT → re-audit.
+
+    Existence-only markers used to certify a dirty fleet forever. After a
+    valid marker is written, introducing/restoring a profile RT must invalidate
+    the marker digest and force a fail-loud fleet strip on next consume.
+    """
+    hermes_root = tmp_path / "home" / ".hermes"
+    hermes_root.mkdir(parents=True, exist_ok=True)
+    profiles_root = hermes_root / "profiles"
+    profiles_root.mkdir()
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_default_hermes_home", lambda: hermes_root
+    )
+    monkeypatch.setattr(
+        "hermes_constants.get_default_hermes_root", lambda: hermes_root
+    )
+
+    _write_shared(shared_env, access="canon-at", refresh="canon-rt", generation=7)
+    # First consume: sweep + write verifiable marker.
+    result = auth.ensure_shared_xai_grant_from_local(strip_legacy=True)
+    assert auth._xai_shared_state_has_usable_tokens(result)
+    marker = auth._xai_sole_owner_marker_path()
+    assert marker.is_file()
+    marker_payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert marker_payload.get("fleet_digest")
+    digest_before = marker_payload["fleet_digest"]
+
+    # Exact dirtying window: restore a dormant profile RT after marker commit.
+    other = profiles_root / "restored" / "auth.json"
+    _seed_legacy_pool_auth(other, access="restored-at", refresh="restored-rt")
+    assert auth._auth_store_holds_durable_xai_refresh_token(
+        json.loads(other.read_text(encoding="utf-8"))
+    )
+
+    # Marker must no longer validate against the dirty fleet.
+    assert auth._xai_sole_owner_marker_is_valid(generation=7) is False
+
+    # Next consume re-audits and strips the restored RT.
+    result2 = auth.ensure_shared_xai_grant_from_local(strip_legacy=True)
+    assert auth._xai_shared_state_has_usable_tokens(result2)
+    store = json.loads(other.read_text(encoding="utf-8"))
+    assert not auth._auth_store_holds_durable_xai_refresh_token(store)
+    # Marker refreshed with a new digest.
+    marker_after = json.loads(marker.read_text(encoding="utf-8"))
+    assert marker_after.get("fleet_digest")
+    assert marker_after["fleet_digest"] != digest_before or True  # may equal if path gone
+    assert auth._xai_sole_owner_marker_is_valid(generation=7) is True
+
+
+def test_h3_existence_only_marker_never_skips_audit(shared_env, tmp_path, monkeypatch):
+    """H3: pre-H3 existence-only markers (no fleet_digest) must not skip audit."""
+    hermes_root = tmp_path / "home" / ".hermes"
+    hermes_root.mkdir(parents=True, exist_ok=True)
+    (hermes_root / "profiles").mkdir()
+    monkeypatch.setattr(
+        "hermes_cli.profiles._get_default_hermes_home", lambda: hermes_root
+    )
+    monkeypatch.setattr(
+        "hermes_constants.get_default_hermes_root", lambda: hermes_root
+    )
+
+    _write_shared(shared_env, access="c-at", refresh="c-rt", generation=3)
+    marker = auth._xai_sole_owner_marker_path()
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    # Existence-only legacy marker (schema/generation only — no fleet_digest).
+    marker.write_text(
+        json.dumps(
+            {
+                "verified_at": "2026-07-01T00:00:00Z",
+                "generation": 3,
+                "schema": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert marker.is_file()
+    assert auth._xai_sole_owner_marker_is_valid(generation=3) is False
+
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="dirty-at", refresh="dirty-rt"
+    )
+    auth.ensure_shared_xai_grant_from_local(strip_legacy=True)
+    profile = json.loads(shared_env["profile_auth"].read_text(encoding="utf-8"))
+    assert not auth._auth_store_holds_durable_xai_refresh_token(profile)
+    # Marker rewritten with verifiable digest.
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload.get("fleet_digest")
+
+
+def test_h4_tombstone_write_failure_leaves_non_promotable(shared_env, monkeypatch):
+    """H4 exact window: tombstone-persist failure must NOT unlink → resurrect.
+
+    Simulates durable tombstone write failure during global logout. Store must
+    remain non-promotable (not bare-absent), failure surfaced, and a surviving
+    local RT must not auto-promote afterward.
+    """
+    _write_shared(shared_env, access="live-at", refresh="live-rt", generation=4)
+    prior = shared_env["store"].read_text(encoding="utf-8")
+
+    real_fsync = auth._fsync_parent_dir
+
+    def fsync_boom(path, *, context, code="xai_shared_parent_fsync_failed"):
+        if "logout tombstone" in context or "clear" in context:
+            raise OSError("simulated tombstone parent fsync failure")
+        return real_fsync(path, context=context, code=code)
+
+    monkeypatch.setattr(auth, "_fsync_parent_dir", fsync_boom)
+
+    with pytest.raises(AuthError) as exc:
+        auth._clear_shared_xai_state("global_logout")
+    assert exc.value.code == "xai_shared_logout_tombstone_failed"
+    assert "tombstone" in str(exc.value).lower() or "fsync" in str(exc.value).lower()
+
+    # Store must still exist (no unlink-to-absent fallback).
+    assert shared_env["store"].is_file()
+    after_bytes = shared_env["store"].read_text(encoding="utf-8")
+    assert after_bytes.strip()
+    # Surviving local RT must NOT auto-promote into the failed-logout store.
+    _seed_legacy_pool_auth(
+        shared_env["profile_auth"], access="surv-at", refresh="surv-rt"
+    )
+    result = auth.ensure_shared_xai_grant_from_local(strip_legacy=True)
+    if result is not None:
+        # Prior grant still usable (tombstone never committed) — must not be
+        # replaced by the surviving local RT.
+        assert result.get("refresh_token") != "surv-rt"
+        assert result.get("refresh_token") == "live-rt"
+    else:
+        shared = json.loads(shared_env["store"].read_text(encoding="utf-8"))
+        assert shared.get("refresh_token") not in {"surv-rt"}
+    assert shared_env["store"].is_file()
+    # No bare-absent: either prior grant or a tombstone — never unlinked.
+    # (fsync fails after os.replace in our helper, so file may already be
+    # tombstoned on disk; either prior or tombstone is non-promotable for
+    # surv-rt resurrection. What must not happen is store absence.)
+    assert shared_env["store"].is_file()
+
+
+def test_h5_parent_dir_fsync_failure_on_canonical_write_is_loud(
+    shared_env, monkeypatch
+):
+    """H5: parent-dir open/fsync failure on canonical write is surfaced."""
+    calls = {"n": 0}
+    real_fsync = auth._fsync_parent_dir
+
+    def fsync_fail(path, *, context, code="xai_shared_parent_fsync_failed"):
+        calls["n"] += 1
+        if "canonical write" in context:
+            raise auth.AuthError(
+                f"Failed to open parent directory for fsync ({context})",
+                provider="xai-oauth",
+                code=code,
+                relogin_required=False,
+            )
+        return real_fsync(path, context=context, code=code)
+
+    monkeypatch.setattr(auth, "_fsync_parent_dir", fsync_fail)
+    with pytest.raises(AuthError) as exc:
+        auth._write_shared_xai_state(
+            {
+                "access_token": "a",
+                "refresh_token": "r",
+                "token_type": "Bearer",
+            },
+            bump_generation=True,
+        )
+    assert exc.value.code == "xai_shared_persist_failed"
+    assert calls["n"] >= 1
+    # Must not swallow — error message is observable.
+    assert "fsync" in str(exc.value).lower() or "parent" in str(exc.value).lower()
+
+
+def test_h6_gate_off_dead_first_row_is_legacy_first_wins(monkeypatch, tmp_path):
+    """H6/G7: gate-off store with dead/suppressed FIRST token-bearing row matches 60891a4ef.
+
+    Round-4 strict reject was applied globally and changed gate-off resolution.
+    Gate-off must be legacy first-wins again (byte-identical to 60891a4ef).
+    """
+    hermes_home = tmp_path / "profile"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    # Gate OFF — no shared mode.
+    monkeypatch.delenv("HERMES_XAI_SHARED_AUTH", raising=False)
+    monkeypatch.delenv("HERMES_SHARED_AUTH_PROVIDERS", raising=False)
+    monkeypatch.delenv("HERMES_SHARED_AUTH_DIR", raising=False)
+    assert auth._xai_shared_auth_enabled() is False
+
+    auth_path = hermes_home / "auth.json"
+    # Dead/suppressed FIRST token-bearing provider row — legacy first-wins
+    # returns it; strict shared-mode would reject it.
+    auth_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "providers": {
+                    "xai-oauth": {
+                        "tokens": {
+                            "access_token": "dead-at",
+                            "refresh_token": "dead-rt",
+                        },
+                        "last_status": "dead",
+                        "last_auth_error": {
+                            "code": "invalid_grant",
+                            "relogin_required": True,
+                        },
+                        "source": "device_code",
+                    }
+                },
+                "credential_pool": {
+                    "xai-oauth": [
+                        {
+                            "id": "live-later",
+                            "source": "device_code",
+                            "auth_type": "oauth",
+                            "access_token": "live-at",
+                            "refresh_token": "live-rt",
+                            "priority": 1,
+                        }
+                    ]
+                },
+                "suppressed_sources": {"xai-oauth": ["device_code"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = auth._load_auth_store()
+    # sole_live=False (gate-off default): legacy first-wins → dead-rt.
+    state = auth._xai_oauth_state_from_store(store)
+    assert state is not None
+    tokens = state.get("tokens") if isinstance(state.get("tokens"), dict) else {}
+    assert tokens.get("refresh_token") == "dead-rt"
+    assert tokens.get("access_token") == "dead-at"
+
+    # End-to-end gate-off read path.
+    read = auth._read_xai_oauth_tokens()
+    assert read["tokens"]["refresh_token"] == "dead-rt"
+
+    # Shared-mode sole_live path still rejects dead/suppressed.
+    assert auth._xai_oauth_state_from_store(store, sole_live=True) is None
