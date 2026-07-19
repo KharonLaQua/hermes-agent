@@ -869,10 +869,10 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    # Optional opt-in runtime: if api_mode == claude_cli, hand the turn to
-    # a `claude -p` subprocess (Anthropic Max subscription via setup token
-    # + clean env + Hermes MCP tools + multi-turn --resume).
-    # See agent/transports/claude_cli_session.py.
+    # Claude CLI runtime: if api_mode == claude_cli (explicit config or
+    # default-when-token), hand the turn to a `claude -p` subprocess
+    # (Anthropic Max subscription via setup token + clean env + Hermes MCP
+    # tools + multi-turn --resume). See agent/transports/claude_cli_session.py.
     # Phase 2c: host-global concurrency cap may raise ClaudeCliConcurrencyError
     # after a bounded wait — activate the profile fallback (grok/gpt) and fall
     # through into the normal chat_completions / anthropic_messages loop.

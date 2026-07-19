@@ -1,36 +1,46 @@
 ---
-title: Claude CLI Runtime (optional)
+title: Claude CLI Runtime
 sidebar_label: Claude CLI Runtime
 ---
 
 # Claude CLI Runtime
 
-Hermes can optionally hand Anthropic turns to a local [`claude -p`](https://docs.anthropic.com/en/docs/claude-code) subprocess (Claude Code CLI) instead of the default Anthropic HTTP Messages API. When enabled, Max subscription billing and Claude Code's native session tools ride the CLI; Hermes still owns sessions, slash commands, the gateway, memory, and skill review.
+Hermes can hand Anthropic Claude turns to a local [`claude -p`](https://docs.anthropic.com/en/docs/claude-code) subprocess (Claude Code CLI) instead of the Anthropic HTTP Messages API. When active, Max subscription billing and Claude Code's native session tools ride the CLI; Hermes still owns sessions, slash commands, the gateway, memory, and skill review.
 
-This is **opt-in only**. Default Hermes Anthropic behavior (`anthropic_messages` HTTP) is unchanged unless you flip the runtime.
+## Default-when-token (no per-profile flag required)
 
-## Why
+For **provider `anthropic`** + a **Claude** model, Hermes defaults to `claude_cli` when **both** are true:
 
-- Run Claude against your **Anthropic Max subscription** using Claude Code's non-rotating **setup token** (no per-request API key billing path).
-- Keep Hermes' multi-profile fleet: one setup token can serve every profile (see [Fleet setup](#fleet-setup) below).
-- Hermes tools remain available via an MCP bridge on each `claude -p` spawn.
-- Multi-turn context lives in Claude's on-disk session (`--session-id` / `--resume`); Hermes maps one Claude session per agent conversation.
+1. A Claude Code **setup token** is resolvable (`CLAUDE_CODE_OAUTH_TOKEN` via profile env, credential pool, or the canonical root `~/.hermes/.env`)
+2. The **`claude` binary** is available on `PATH` (or `~/.local/bin/claude`)
 
-## Enable
+So switching **any** profile to a Claude model (CLI, gateway, desktop app model picker) lands on `claude -p` base Max **without** setting `anthropic_runtime: claude_cli` on that profile. Profiles that already have their own `config.yaml` and never inherit a root-level runtime key are covered.
 
-Set the runtime on a profile (or the default home):
+Environments **without** a setup token or without the `claude` binary are **unchanged**: they keep the HTTP `anthropic_messages` path exactly as before. Non-Anthropic providers (`openai-codex`, `xai-oauth`, etc.) are unaffected.
+
+## Precedence (explicit always wins)
+
+| Setting | Result |
+|---|---|
+| `model.anthropic_runtime: claude_cli` (or env `HERMES_ANTHROPIC_RUNTIME=claude_cli`) | Force `claude_cli` |
+| `model.anthropic_runtime: anthropic_messages` (aliases: `http`, `api`, `messages`, `off`) | Force HTTP (`anthropic_messages`) — **explicit opt-out** |
+| UNSET / `auto` + setup token + `claude` binary + Claude model | **Default** `claude_cli` |
+| UNSET / `auto` without token or binary | HTTP `anthropic_messages` (unchanged) |
+
+## Enable / opt-out
+
+Most fleets only need the setup token once in the root `.env` (see [Fleet setup](#fleet-setup)). Then any profile can switch to a Claude model:
 
 ```bash
-# Interactive model picker for a profile
+# Interactive model picker for a profile (desktop app does the same)
 hermes -p <agent> model
 
-# Or pin in config
+# Or pin provider + model — no anthropic_runtime required when token+binary exist
 hermes -p <agent> config set model.provider anthropic
-hermes -p <agent> config set model.default claude-opus-4-6   # or your preferred Claude model
-hermes -p <agent> config set model.anthropic_runtime claude_cli
+hermes -p <agent> config set model.default claude-opus-4-6
 ```
 
-Equivalent `config.yaml` fragment:
+Force the CLI runtime explicitly (optional; same as the auto default when eligible):
 
 ```yaml
 model:
@@ -39,13 +49,26 @@ model:
   anthropic_runtime: claude_cli
 ```
 
+**Opt out** of the CLI path and keep HTTP (extra-usage / API credits):
+
+```yaml
+model:
+  provider: anthropic
+  default: claude-opus-4-6
+  anthropic_runtime: anthropic_messages   # or http / api
+```
+
 One-session override (does not rewrite config):
 
 ```bash
+# Force CLI
 HERMES_ANTHROPIC_RUNTIME=claude_cli hermes -p <agent> chat
+
+# Force HTTP even if config enables claude_cli
+HERMES_ANTHROPIC_RUNTIME=anthropic_messages hermes -p <agent> chat
 ```
 
-Requires the `claude` binary on `PATH` (`npm install -g @anthropic-ai/claude-code`).
+Requires the `claude` binary on `PATH` (`npm install -g @anthropic-ai/claude-code`) for the CLI path.
 
 ## Auth: non-rotating setup token
 
@@ -69,7 +92,7 @@ First hit wins:
 4. **Canonical Hermes root** `~/.hermes/.env` → `CLAUDE_CODE_OAUTH_TOKEN` (fleet fallback)
 5. Never the rotating `~/.claude` login
 
-Only if **no** source yields a token does Hermes raise a clear setup error.
+Only if **no** source yields a token does Hermes treat the CLI path as unavailable (auto falls back to HTTP; explicit `claude_cli` raises a clear setup error at turn time).
 
 The token is a **secret**: store it in `.env` (or the credential pool), never in `config.yaml`.
 
@@ -82,16 +105,15 @@ Put the setup token **once** in the platform Hermes root env file:
 CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...   # from `claude setup-token`
 ```
 
-Every profile then resolves that same token on demand when profile env and credential_pool have none. You do **not** need to copy the token into each `~/.hermes/profiles/<name>/.env`.
+Every profile then resolves that same token on demand when profile env and credential_pool have none. You do **not** need to copy the token into each `~/.hermes/profiles/<name>/.env`, and you do **not** need `anthropic_runtime: claude_cli` on each profile's `config.yaml`.
 
-Then switch any agent to Claude CLI:
+Then switch any agent to a Claude model:
 
 ```bash
 hermes -p <agent> model
 # or
 hermes -p <agent> config set model.provider anthropic
 hermes -p <agent> config set model.default claude-opus-4-6
-hermes -p <agent> config set model.anthropic_runtime claude_cli
 ```
 
 Regenerate the setup token about yearly with `claude setup-token` and update the single root `.env` line.
@@ -99,6 +121,13 @@ Regenerate the setup token about yearly with `claude setup-token` and update the
 ### Optional: per-profile override
 
 If one profile should use a different token, set `CLAUDE_CODE_OAUTH_TOKEN` in that profile's own `.env` or credential pool — profile sources win over the canonical root.
+
+If one profile must stay on HTTP (extra-usage API path), set:
+
+```yaml
+model:
+  anthropic_runtime: anthropic_messages
+```
 
 ## Concurrency
 
@@ -116,12 +145,6 @@ See the concurrency notes in the developer guide / Phase 2c tests for slot reapi
 ## What this runtime does not change
 
 - Base Max / subscription billing still goes through Claude Code's CLI path.
-- Hermes MCP tools, multi-turn session resume, host concurrency, and auxiliary-model handling stay as implemented for `claude_cli`.
+- Hermes MCP tools, multi-turn session resume, host concurrency, and auxiliary-model handling stay as implemented for `claude_cli` (no HTTP Anthropic aux for `claude_cli` turns).
 - Non-secret settings stay in `config.yaml`; secrets stay in `.env`.
-
-## Related
-
-- [Profiles](/user-guide/profiles) — isolated `HERMES_HOME` per agent
-- [Configuring models](/user-guide/configuring-models)
-- [Environment variables](/reference/environment-variables) — `CLAUDE_CODE_OAUTH_TOKEN`
-- [Codex App-Server Runtime](./codex-app-server-runtime.md) — analogous opt-in for OpenAI Codex
+- Profiles and hosts **without** a setup token or `claude` binary keep pure HTTP Anthropic — no forced dependency.

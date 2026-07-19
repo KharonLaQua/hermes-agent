@@ -314,18 +314,23 @@ def test_build_argv_appends_system_prompt_file(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_maybe_apply_claude_cli_runtime_from_config():
+def test_maybe_apply_claude_cli_runtime_from_config(monkeypatch):
+    # Explicit enable never depends on auto-eligibility.
+    monkeypatch.setattr(rp, "_claude_cli_auto_eligible", lambda **kw: False)
     mode = rp._maybe_apply_claude_cli_runtime(
         provider="anthropic",
         api_mode="anthropic_messages",
         model_cfg={"anthropic_runtime": "claude_cli"},
+        model="claude-opus-4-8",
     )
     assert mode == "claude_cli"
 
+    # Unset + not auto-eligible → stay HTTP.
     mode_off = rp._maybe_apply_claude_cli_runtime(
         provider="anthropic",
         api_mode="anthropic_messages",
         model_cfg={},
+        model="claude-opus-4-8",
     )
     assert mode_off == "anthropic_messages"
 
@@ -334,16 +339,19 @@ def test_maybe_apply_claude_cli_runtime_from_config():
         provider="openrouter",
         api_mode="chat_completions",
         model_cfg={"anthropic_runtime": "claude_cli"},
+        model="claude-opus-4-8",
     )
     assert mode_or == "chat_completions"
 
 
 def test_maybe_apply_claude_cli_runtime_from_env(monkeypatch):
+    monkeypatch.setattr(rp, "_claude_cli_auto_eligible", lambda **kw: False)
     monkeypatch.setenv("HERMES_ANTHROPIC_RUNTIME", "claude_cli")
     mode = rp._maybe_apply_claude_cli_runtime(
         provider="anthropic",
         api_mode="anthropic_messages",
         model_cfg={},
+        model="claude-opus-4-8",
     )
     assert mode == "claude_cli"
 
@@ -352,8 +360,99 @@ def test_maybe_apply_claude_cli_runtime_from_env(monkeypatch):
         provider="anthropic",
         api_mode="anthropic_messages",
         model_cfg={"anthropic_runtime": "claude_cli"},
+        model="claude-opus-4-8",
     )
     assert mode == "anthropic_messages"
+
+
+def test_maybe_apply_claude_cli_runtime_default_when_token(monkeypatch):
+    """UNSET/auto → claude_cli when token+binary available; else HTTP."""
+    monkeypatch.delenv("HERMES_ANTHROPIC_RUNTIME", raising=False)
+
+    # Eligible auto → default claude_cli without per-profile flag.
+    monkeypatch.setattr(rp, "_claude_cli_auto_eligible", lambda **kw: True)
+    mode = rp._maybe_apply_claude_cli_runtime(
+        provider="anthropic",
+        api_mode="anthropic_messages",
+        model_cfg={},  # no anthropic_runtime (e.g. profile og)
+        model="claude-opus-4-8",
+    )
+    assert mode == "claude_cli"
+
+    # auto string same as unset.
+    mode_auto = rp._maybe_apply_claude_cli_runtime(
+        provider="anthropic",
+        api_mode="anthropic_messages",
+        model_cfg={"anthropic_runtime": "auto"},
+        model="claude-sonnet-4-6",
+    )
+    assert mode_auto == "claude_cli"
+
+    # Uses model_cfg.default when model kw omitted.
+    mode_cfg_default = rp._maybe_apply_claude_cli_runtime(
+        provider="anthropic",
+        api_mode="anthropic_messages",
+        model_cfg={"default": "claude-opus-4-8"},
+    )
+    assert mode_cfg_default == "claude_cli"
+
+    # Not eligible → HTTP unchanged.
+    monkeypatch.setattr(rp, "_claude_cli_auto_eligible", lambda **kw: False)
+    mode_http = rp._maybe_apply_claude_cli_runtime(
+        provider="anthropic",
+        api_mode="anthropic_messages",
+        model_cfg={},
+        model="claude-opus-4-8",
+    )
+    assert mode_http == "anthropic_messages"
+
+
+def test_maybe_apply_claude_cli_runtime_explicit_opt_out(monkeypatch):
+    """anthropic_runtime: anthropic_messages / http / api forces HTTP."""
+    monkeypatch.delenv("HERMES_ANTHROPIC_RUNTIME", raising=False)
+    # Even when auto would qualify, explicit opt-out wins.
+    monkeypatch.setattr(rp, "_claude_cli_auto_eligible", lambda **kw: True)
+    for opt_out in ("anthropic_messages", "http", "api", "messages", "off"):
+        mode = rp._maybe_apply_claude_cli_runtime(
+            provider="anthropic",
+            api_mode="anthropic_messages",
+            model_cfg={"anthropic_runtime": opt_out},
+            model="claude-opus-4-8",
+        )
+        assert mode == "anthropic_messages", opt_out
+
+
+def test_maybe_apply_claude_cli_runtime_non_claude_model_stays_http(monkeypatch):
+    """Auto path requires a Claude model name; non-Claude stays HTTP."""
+    monkeypatch.delenv("HERMES_ANTHROPIC_RUNTIME", raising=False)
+    # Real eligibility helper — mock only token/bin so model check is live.
+    monkeypatch.setattr(rp, "_claude_cli_binary_available", lambda: True)
+    monkeypatch.setattr(rp, "_claude_cli_token_resolvable", lambda: True)
+    mode = rp._maybe_apply_claude_cli_runtime(
+        provider="anthropic",
+        api_mode="anthropic_messages",
+        model_cfg={},
+        model="some-other-model",
+    )
+    assert mode == "anthropic_messages"
+
+
+def test_claude_cli_auto_eligible_checks_token_and_binary(monkeypatch):
+    """Auto eligibility is Claude model + binary + resolvable setup token."""
+    monkeypatch.setattr(rp, "_is_claude_model_name", lambda m: "claude" in (m or "").lower())
+    monkeypatch.setattr(rp, "_claude_cli_binary_available", lambda: True)
+    monkeypatch.setattr(rp, "_claude_cli_token_resolvable", lambda: True)
+    assert rp._claude_cli_auto_eligible(model="claude-opus-4-8") is True
+
+    monkeypatch.setattr(rp, "_claude_cli_token_resolvable", lambda: False)
+    assert rp._claude_cli_auto_eligible(model="claude-opus-4-8") is False
+
+    monkeypatch.setattr(rp, "_claude_cli_token_resolvable", lambda: True)
+    monkeypatch.setattr(rp, "_claude_cli_binary_available", lambda: False)
+    assert rp._claude_cli_auto_eligible(model="claude-opus-4-8") is False
+
+    monkeypatch.setattr(rp, "_claude_cli_binary_available", lambda: True)
+    assert rp._claude_cli_auto_eligible(model="") is False
 
 
 def test_claude_cli_in_valid_api_modes():
@@ -365,6 +464,8 @@ def test_claude_cli_in_valid_api_modes():
 def test_resolve_runtime_from_pool_entry_applies_claude_cli(monkeypatch):
     """Pool path for anthropic rewrites api_mode when anthropic_runtime set."""
     monkeypatch.delenv("HERMES_ANTHROPIC_RUNTIME", raising=False)
+    # Isolate auto path so explicit-enable / opt-out cases are deterministic.
+    monkeypatch.setattr(rp, "_claude_cli_auto_eligible", lambda **kw: False)
 
     class _Entry:
         runtime_api_key = "sk-ant-oat01-TEST"
@@ -389,7 +490,7 @@ def test_resolve_runtime_from_pool_entry_applies_claude_cli(monkeypatch):
     assert resolved["api_mode"] == "claude_cli"
     assert resolved["api_key"] == "sk-ant-oat01-TEST"
 
-    # Absent anthropic_runtime → anthropic_messages.
+    # Absent anthropic_runtime + not auto-eligible → anthropic_messages.
     resolved2 = rp._resolve_runtime_from_pool_entry(
         provider="anthropic",
         entry=_Entry(),
@@ -399,6 +500,33 @@ def test_resolve_runtime_from_pool_entry_applies_claude_cli(monkeypatch):
         target_model="claude-opus-4-8",
     )
     assert resolved2["api_mode"] == "anthropic_messages"
+
+    # Absent anthropic_runtime + auto-eligible → claude_cli (desktop / og case).
+    monkeypatch.setattr(rp, "_claude_cli_auto_eligible", lambda **kw: True)
+    resolved3 = rp._resolve_runtime_from_pool_entry(
+        provider="anthropic",
+        entry=_Entry(),
+        requested_provider="anthropic",
+        model_cfg={"provider": "anthropic", "default": "claude-opus-4-8"},
+        pool=None,
+        target_model="claude-opus-4-8",
+    )
+    assert resolved3["api_mode"] == "claude_cli"
+
+    # Explicit HTTP opt-out wins over auto-eligible.
+    resolved4 = rp._resolve_runtime_from_pool_entry(
+        provider="anthropic",
+        entry=_Entry(),
+        requested_provider="anthropic",
+        model_cfg={
+            "provider": "anthropic",
+            "default": "claude-opus-4-8",
+            "anthropic_runtime": "anthropic_messages",
+        },
+        pool=None,
+        target_model="claude-opus-4-8",
+    )
+    assert resolved4["api_mode"] == "anthropic_messages"
 
 
 def test_agent_init_accepts_claude_cli_api_mode():

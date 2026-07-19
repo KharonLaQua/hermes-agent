@@ -357,13 +357,22 @@ _VALID_API_MODES = {
     # `model.openai_runtime == "codex_app_server"` AND provider in
     # {"openai", "openai-codex"}. Default is unchanged.
     "codex_app_server",
-    # Optional opt-in: hand the entire turn to a `claude -p` subprocess so
-    # Anthropic Max subscription billing rides Claude Code's CLI (setup-token
-    # auth + clean env). Gated behind `model.anthropic_runtime == "claude_cli"`
-    # (or HERMES_ANTHROPIC_RUNTIME) AND provider == "anthropic". Default
-    # Anthropic path stays anthropic_messages HTTP.
+    # Route Anthropic Claude turns through a `claude -p` subprocess so Max
+    # subscription billing rides Claude Code's CLI (setup-token auth + clean
+    # env). Selected when provider == "anthropic" and either:
+    #   - explicit `model.anthropic_runtime: claude_cli` / HERMES_ANTHROPIC_RUNTIME, or
+    #   - UNSET/`auto` AND a setup token + `claude` binary are available
+    #     (default-when-token). Explicit `anthropic_messages`/`http`/`api` opts out.
     "claude_cli",
 }
+
+# Values that force claude_cli (explicit enable).
+_CLAUDE_CLI_RUNTIME_ENABLE = frozenset({"claude_cli", "on", "1", "true", "yes"})
+# Values that force the HTTP anthropic_messages path (explicit opt-out).
+_CLAUDE_CLI_RUNTIME_DISABLE = frozenset({
+    "off", "0", "false", "no",
+    "anthropic_messages", "http", "api", "messages",
+})
 
 
 def _parse_api_mode(raw: Any) -> Optional[str]:
@@ -412,23 +421,86 @@ def _maybe_apply_codex_app_server_runtime(
     return api_mode
 
 
+def _is_claude_model_name(model: Optional[str]) -> bool:
+    """True when the model id looks like a Claude family model."""
+    return "claude" in (model or "").lower()
+
+
+def _claude_cli_binary_available() -> bool:
+    """True when the ``claude`` binary is resolvable and executable."""
+    try:
+        from agent.transports.claude_cli import resolve_claude_bin
+        import shutil
+
+        bin_path = resolve_claude_bin()
+        if not bin_path:
+            return False
+        # Absolute / path-shaped result: require a real executable file.
+        if os.path.sep in bin_path or (os.path.altsep and os.path.altsep in bin_path):
+            return os.path.isfile(bin_path) and os.access(bin_path, os.X_OK)
+        # Bare name ("claude"): resolve_claude_bin returns this when not found.
+        # Confirm it is actually on PATH and executable.
+        found = shutil.which(bin_path)
+        return bool(found and os.access(found, os.X_OK))
+    except Exception:
+        return False
+
+
+def _claude_cli_token_resolvable() -> bool:
+    """True when resolve_claude_cli_oauth_token succeeds (env/pool/root .env)."""
+    try:
+        from agent.transports.claude_cli_session import resolve_claude_cli_oauth_token
+
+        token = resolve_claude_cli_oauth_token()
+        return bool(token and str(token).strip())
+    except Exception:
+        return False
+
+
+def _claude_cli_auto_eligible(*, model: Optional[str]) -> bool:
+    """Default-on preconditions: Claude model + setup token + claude binary.
+
+    Environments without a setup token or ``claude`` binary are unchanged
+    (stay on HTTP ``anthropic_messages``).
+    """
+    if not _is_claude_model_name(model):
+        return False
+    if not _claude_cli_binary_available():
+        return False
+    if not _claude_cli_token_resolvable():
+        return False
+    return True
+
+
 def _maybe_apply_claude_cli_runtime(
     *,
     provider: str,
     api_mode: str,
     model_cfg: Optional[Dict[str, Any]],
+    model: Optional[str] = None,
 ) -> str:
-    """Optional opt-in: rewrite api_mode → "claude_cli" for Anthropic when
-    the user has enabled that runtime via config or one-session env override.
+    """Rewrite api_mode → ``claude_cli`` for Anthropic Claude models when allowed.
 
-    Selection (first match wins):
-      1. ``HERMES_ANTHROPIC_RUNTIME`` env (one-session override; values
-         ``claude_cli`` / ``on`` enable, ``auto`` / ``off`` / empty disable)
-      2. ``model.anthropic_runtime: claude_cli`` in config.yaml
+    Precedence (explicit config / env always wins):
 
-    Only provider ``anthropic`` is eligible — other providers stay on their
-    existing api_mode. When unset/auto/empty, this is a no-op and Anthropic
-    keeps ``anthropic_messages`` (HTTP).
+      1. ``HERMES_ANTHROPIC_RUNTIME`` env (one-session override):
+         - enable: ``claude_cli`` / ``on`` / ``1`` / ``true`` / ``yes``
+         - opt-out (HTTP): ``off`` / ``0`` / ``false`` / ``no`` /
+           ``anthropic_messages`` / ``http`` / ``api`` / ``messages``
+         - empty / ``auto`` → fall through to config
+      2. ``model.anthropic_runtime`` in config.yaml:
+         - enable → force ``claude_cli``
+         - opt-out values → force ``anthropic_messages`` (HTTP)
+         - UNSET / ``auto`` / empty → **default to ``claude_cli``** when:
+             * provider is ``anthropic``,
+             * model is a Claude family model,
+             * a Claude Code setup token is resolvable
+               (``resolve_claude_cli_oauth_token`` — env / pool / canonical root),
+             * and the ``claude`` binary is available (``resolve_claude_bin``).
+           Otherwise leave the existing HTTP ``anthropic_messages`` path.
+
+    Only provider ``anthropic`` is eligible — other providers are untouched.
+    Users without a setup token or ``claude`` binary are unaffected.
 
     Returns the (possibly-rewritten) api_mode.
     """
@@ -436,18 +508,30 @@ def _maybe_apply_claude_cli_runtime(
         return api_mode
 
     env_runtime = (_getenv("HERMES_ANTHROPIC_RUNTIME", "") or "").strip().lower()
-    if env_runtime in {"claude_cli", "on", "1", "true", "yes"}:
+    if env_runtime in _CLAUDE_CLI_RUNTIME_ENABLE:
         return "claude_cli"
-    if env_runtime in {"off", "0", "false", "no", "anthropic_messages"}:
+    if env_runtime in _CLAUDE_CLI_RUNTIME_DISABLE:
         # Explicit one-session disable — force the HTTP path even if
         # config.yaml has anthropic_runtime: claude_cli.
         return "anthropic_messages"
     # env empty / "auto" → fall through to model_cfg
 
-    if not model_cfg:
+    runtime = ""
+    if model_cfg:
+        runtime = str(model_cfg.get("anthropic_runtime") or "").strip().lower()
+    if runtime in _CLAUDE_CLI_RUNTIME_ENABLE:
+        return "claude_cli"
+    if runtime in _CLAUDE_CLI_RUNTIME_DISABLE:
+        return "anthropic_messages"
+    # UNSET / "auto" / empty / unknown → default-when-token
+    if runtime and runtime != "auto":
+        # Unknown non-auto value: do not auto-enable (fail closed to HTTP).
         return api_mode
-    runtime = str(model_cfg.get("anthropic_runtime") or "").strip().lower()
-    if runtime in {"claude_cli", "on", "1", "true", "yes"}:
+
+    effective_model = model
+    if not effective_model and model_cfg:
+        effective_model = str(model_cfg.get("default") or model_cfg.get("model") or "")
+    if _claude_cli_auto_eligible(model=effective_model):
         return "claude_cli"
     return api_mode
 
@@ -584,10 +668,14 @@ def _resolve_runtime_from_pool_entry(
     api_mode = _maybe_apply_codex_app_server_runtime(
         provider=provider, api_mode=api_mode, model_cfg=model_cfg
     )
-    # Optional opt-in: route Anthropic turns through `claude -p` (Max sub).
-    # Inert when `model.anthropic_runtime` / HERMES_ANTHROPIC_RUNTIME unset.
+    # Route Anthropic Claude turns through `claude -p` (Max sub) when
+    # explicitly enabled OR default-when-token (setup token + binary).
+    # Explicit anthropic_runtime opt-out keeps HTTP anthropic_messages.
     api_mode = _maybe_apply_claude_cli_runtime(
-        provider=provider, api_mode=api_mode, model_cfg=model_cfg
+        provider=provider,
+        api_mode=api_mode,
+        model_cfg=model_cfg,
+        model=str(effective_model or "") if effective_model else None,
     )
 
     if provider == "lmstudio":
@@ -1466,6 +1554,9 @@ def _resolve_explicit_runtime(
             provider="anthropic",
             api_mode="anthropic_messages",
             model_cfg=model_cfg,
+            model=str(
+                model_cfg.get("default") or model_cfg.get("model") or ""
+            ) or None,
         )
         return {
             "provider": "anthropic",
@@ -2066,6 +2157,9 @@ def resolve_runtime_provider(
             provider="anthropic",
             api_mode="anthropic_messages",
             model_cfg=model_cfg,
+            model=str(
+                model_cfg.get("default") or model_cfg.get("model") or ""
+            ) or None,
         )
         return {
             "provider": "anthropic",

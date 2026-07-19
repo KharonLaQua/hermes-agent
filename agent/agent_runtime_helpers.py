@@ -2023,11 +2023,12 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     if not api_mode:
         api_mode = determine_api_mode(new_provider, base_url)
 
-    # Preserve claude_cli when the profile opts in via anthropic_runtime /
-    # HERMES_ANTHROPIC_RUNTIME. determine_api_mode only knows host→wire
-    # mapping (api.anthropic.com → anthropic_messages) and would drop the
-    # CLI runtime on every in-place model switch, routing subsequent turns
-    # through HTTP Anthropic extra-usage.
+    # Preserve / default claude_cli when eligible (explicit config or
+    # default-when-token). determine_api_mode only knows host→wire mapping
+    # (api.anthropic.com → anthropic_messages) and would drop the CLI runtime
+    # on every in-place model switch, routing subsequent turns through HTTP
+    # Anthropic extra-usage. Pass new_model so auto eligibility uses the
+    # switched Claude model, not a stale config default.
     try:
         from hermes_cli.runtime_provider import (
             _get_model_config,
@@ -2038,6 +2039,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             provider=(new_provider or "").strip().lower(),
             api_mode=api_mode or "",
             model_cfg=_get_model_config(),
+            model=new_model,
         )
     except Exception:
         pass
