@@ -2403,6 +2403,16 @@ def init_agent(
     agent.compression_idle_compact_after_seconds = (
         compression_idle_compact_after_seconds
     )
+    # claude_cli: Claude Code owns native session compaction via --resume.
+    # Disable Hermes auto-compression so we never fire the HTTP aux path
+    # (extra-usage 400 on Max setup tokens). Manual /compress also no-ops
+    # via compress_context()'s api_mode guard.
+    if agent.api_mode == "claude_cli":
+        agent.compression_enabled = False
+        _ra().logger.info(
+            "claude_cli: Hermes auto-compression disabled "
+            "(Claude owns native compaction via --resume)"
+        )
 
     # Reject models whose context window is below the minimum required
     # for reliable tool-calling workflows (64K tokens).

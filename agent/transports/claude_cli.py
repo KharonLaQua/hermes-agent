@@ -479,6 +479,20 @@ class ClaudeCliError(RuntimeError):
         return base
 
 
+@dataclass
+class ClaudeCliConcurrencyError(ClaudeCliError):
+    """Host-wide ``claude -p`` concurrency cap saturated after wait timeout.
+
+    Conversation loop treats this as classifiable saturation (rate_limit-
+    flavoured) and activates the profile's fallback chain (grok/gpt) rather
+    than hanging or spawning past the cap. See
+    ``agent.transports.claude_cli_concurrency``.
+    """
+
+    max_concurrent: Optional[int] = None
+    timeout_seconds: Optional[float] = None
+
+
 # ---------------------------------------------------------------------------
 # Client: spawn one `claude -p` and stream JSONL
 # ---------------------------------------------------------------------------
@@ -850,6 +864,7 @@ __all__ = [
     "CLAUDE_EXPOSED_TOOLS",
     "CLAUDE_NATIVE_FS_EXEC_TOOLS",
     "ClaudeCliClient",
+    "ClaudeCliConcurrencyError",
     "ClaudeCliError",
     "ClaudeCliSpawnConfig",
     "HERMES_MCP_ALLOWED_TOOLS_GLOB",

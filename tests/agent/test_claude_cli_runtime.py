@@ -1,4 +1,4 @@
-"""Unit tests for the claude_cli runtime (Phase 1 + 2a MCP + 2b multi-turn).
+"""Unit tests for the claude_cli runtime (Phase 1 + 2a MCP + 2b multi-turn + 2c).
 
 Covers:
   (a) stream-json parser golden test (assistant text + result/usage + is_error)
@@ -10,6 +10,9 @@ Covers:
   (g) Phase 2b multi-turn: --session-id create, --resume reuse, mapping
       persistence, missing-session fallback, history seed note
 
+Phase 2c concurrency/aux unit tests live in test_claude_cli_concurrency.py
+and test_claude_cli_aux.py.
+
 No live `claude` / network calls.
 """
 
@@ -20,6 +23,14 @@ import os
 from typing import Optional
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _claude_cli_slot_dir_for_session_tests(tmp_path, monkeypatch):
+    """Redirect host-global claude_cli slots into tmp (never touch ~/.hermes/shared)."""
+    monkeypatch.setenv(
+        "HERMES_CLAUDE_CLI_SLOT_DIR", str(tmp_path / "claude_cli_slots")
+    )
 
 from agent.transports.claude_cli import (
     CLAUDE_CLI_CLEAR_ENV_NAMES,

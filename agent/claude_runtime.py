@@ -17,8 +17,13 @@ Phase 2b: multi-turn context via Claude's own session:
     Hermes turns. Stable cwd for Claude session files.
   * Missing resume → fresh session once; hard failures retire the session.
 
-TODO(later): concurrency semaphore, aux routing, doctor checks,
-full transcript pre-seed for resumed Hermes histories.
+Phase 2c: host-global concurrency semaphore (``claude_cli_concurrency``)
+caps concurrent ``claude -p`` spawns across all Hermes profiles; aux
+HTTP (title / Hermes compression / metadata) is skipped or silenced —
+Claude owns native session compaction via ``--resume``.
+
+TODO(later): doctor checks, full transcript pre-seed for resumed
+Hermes histories.
 """
 
 from __future__ import annotations
@@ -359,7 +364,10 @@ def run_claude_cli_turn(
     Claude retains conversation context. Mirrors codex app-server's
     ``agent._codex_session`` lifetime.
     """
-    from agent.transports.claude_cli import ClaudeCliError
+    from agent.transports.claude_cli import (
+        ClaudeCliConcurrencyError,
+        ClaudeCliError,
+    )
     from agent.transports.claude_cli_session import (
         ClaudeCliSession,
         resolve_claude_cli_oauth_token,
@@ -410,6 +418,11 @@ def run_claude_cli_turn(
             model=model,
             messages=messages,
         )
+    except ClaudeCliConcurrencyError:
+        # Propagate so conversation_loop can activate the profile fallback
+        # (grok/gpt) instead of hanging or returning a dead partial turn.
+        # Do NOT retire the multi-turn mapping — saturation is transient.
+        raise
     except ClaudeCliError as exc:
         logger.exception("claude_cli turn failed")
         _retire_claude_cli_session(agent, reason=str(exc)[:200])

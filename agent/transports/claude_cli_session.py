@@ -31,18 +31,25 @@ Codex parallel: ``agent._codex_session`` reuse across turns on one AIAgent.
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from agent.redact import redact_sensitive_text
 from agent.transports.claude_cli import (
     ClaudeCliClient,
+    ClaudeCliConcurrencyError,
     ClaudeCliError,
     ClaudeCliSpawnConfig,
     build_claude_cli_clean_env,
     resolve_claude_bin,
+)
+from agent.transports.claude_cli_concurrency import (
+    claude_cli_slot,
+    is_force_unbounded,
 )
 from agent.transports.claude_event_projector import ClaudeEventProjector
 from agent.transports.types import NormalizedResponse, Usage
@@ -137,6 +144,81 @@ class ClaudeCliTurnResult:
         )
 
 
+def _looks_like_claude_setup_or_oauth_token(token: str) -> bool:
+    """True for setup tokens (sk-ant-oat…) or Claude Code OAuth tokens (cc-…)."""
+    stripped = (token or "").strip()
+    return stripped.startswith("sk-ant-oat") or stripped.startswith("cc-")
+
+
+def _read_setup_token_keys_from_env_file(path) -> Optional[str]:
+    """Read CLAUDE_CODE_OAUTH_TOKEN (or legacy ANTHROPIC_TOKEN) from a .env file.
+
+    Read-only and crash-safe: missing/unreadable files return None.
+    Does **not** load values into ``os.environ``.
+    """
+    try:
+        from pathlib import Path
+
+        env_path = Path(path)
+        if not env_path.is_file():
+            return None
+    except OSError:
+        return None
+
+    values: dict = {}
+    try:
+        from dotenv import dotenv_values
+
+        parsed = dotenv_values(env_path) or {}
+        values = {str(k): (v if v is not None else "") for k, v in parsed.items()}
+    except Exception:
+        try:
+            text = env_path.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            return None
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            values[key] = value
+
+    for key in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_TOKEN"):
+        val = str(values.get(key) or "").strip()
+        if val:
+            return val
+    return None
+
+
+def _read_canonical_root_setup_token() -> Optional[str]:
+    """Fleet fallback: setup token from the platform Hermes root ``.env``.
+
+    Uses :func:`hermes_constants.get_default_hermes_root` so a profile with its
+    own ``HERMES_HOME`` still resolves the **one** shared non-rotating setup
+    token from ``~/.hermes/.env`` (platform-native root), not the profile dir.
+
+    Why root ``.env`` (not a new shared-auth file): it is already Hermes'
+    canonical secret store, needs no new machinery, and the setup token is a
+    secret (never ``config.yaml``). Fork-safe / non-rotating → no lock needed.
+    """
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        root_env = get_default_hermes_root() / ".env"
+    except Exception as exc:
+        logger.debug("claude_cli: canonical root path failed: %s", exc)
+        return None
+    try:
+        return _read_setup_token_keys_from_env_file(root_env)
+    except Exception as exc:
+        logger.debug("claude_cli: canonical root .env read failed: %s", exc)
+        return None
+
+
 def resolve_claude_cli_oauth_token(
     *,
     explicit: Optional[str] = None,
@@ -144,48 +226,71 @@ def resolve_claude_cli_oauth_token(
 ) -> str:
     """Resolve the non-rotating setup token for CLAUDE_CODE_OAUTH_TOKEN injection.
 
-    Priority:
-      1. explicit argument
-      2. agent.api_key when it looks like a setup/OAuth token (sk-ant-oat / cc-)
-      3. Hermes ``resolve_anthropic_token()`` (env CLAUDE_CODE_OAUTH_TOKEN /
-         ANTHROPIC_TOKEN, credential_pool claude_code / env sources, etc.)
+    Final resolution order (first hit wins):
 
-    Never relies on the rotating ~/.claude login alone for the subprocess —
-    that path errors from a forked child. The setup token is fork-safe.
+      1. Explicit / passed token (``explicit=`` argument, or agent-held
+         setup/OAuth-shaped key ``sk-ant-oat`` / ``cc-``)
+      2. Profile / process env ``CLAUDE_CODE_OAUTH_TOKEN`` (then legacy
+         ``ANTHROPIC_TOKEN``). When a profile's ``.env`` was loaded into the
+         process env at startup, that is this step.
+      3. Profile credential_pool OAuth entries (``claude_code`` /
+         ``env:CLAUDE_CODE_OAUTH_TOKEN`` and other anthropic OAuth pool rows)
+      4. **Canonical Hermes root** ``~/.hermes/.env``
+         (``get_default_hermes_root() / ".env"``) — fleet fallback so any
+         profile can run Claude on demand without copying the token into its
+         own ``.env``
+      5. **Never** the rotating ``~/.claude`` login credentials (keychain /
+         ``~/.claude/.credentials.json``)
+
+    Those login credentials are not fork-safe for a clean ``claude -p``
+    subprocess. The setup token (``sk-ant-oat…``, ~1yr) is fork-safe like an
+    API key — no shared store or lock.
+
+    Only raises when no source yields a token.
     """
     if explicit and str(explicit).strip():
         return str(explicit).strip()
 
+    # (1b) Passed via agent constructor when already setup/OAuth-shaped.
     if agent is not None:
         key = getattr(agent, "api_key", None) or getattr(agent, "_anthropic_api_key", None)
         if isinstance(key, str) and key.strip():
             stripped = key.strip()
-            # Prefer setup / OAuth tokens for the CLI injection path.
-            if stripped.startswith("sk-ant-oat") or stripped.startswith("cc-"):
+            if _looks_like_claude_setup_or_oauth_token(stripped):
                 return stripped
-            # Fall through to resolve_anthropic_token which prefers OAuth sources;
-            # keep the agent key as last resort below.
 
+    # (2) Profile / process env — first hit of the two keys.
+    for env_var in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_TOKEN"):
+        val = (os.environ.get(env_var) or "").strip()
+        if val:
+            return val
+
+    # (3) Profile-scoped credential_pool (HERMES_HOME auth.json).
+    # Read-only enumerate — never refresh/network. Intentionally does NOT
+    # call resolve_anthropic_token() (that path also reads ~/.claude login).
     try:
-        from agent.anthropic_adapter import resolve_anthropic_token
+        from agent.anthropic_adapter import _resolve_anthropic_pool_token
 
-        token = resolve_anthropic_token()
-        if token and str(token).strip():
-            return str(token).strip()
+        pool_token = _resolve_anthropic_pool_token()
+        if pool_token and str(pool_token).strip():
+            return str(pool_token).strip()
     except Exception as exc:
-        logger.debug("resolve_anthropic_token failed: %s", exc)
+        logger.debug("claude_cli: credential_pool resolve failed: %s", exc)
 
-    if agent is not None:
-        key = getattr(agent, "api_key", None) or getattr(agent, "_anthropic_api_key", None)
-        if isinstance(key, str) and key.strip():
-            return key.strip()
+    # (4) Canonical platform-root ~/.hermes/.env (fleet shared setup token).
+    root_token = _read_canonical_root_setup_token()
+    if root_token:
+        return root_token
 
     raise ClaudeCliError(
         message=(
-            "claude_cli: no Anthropic setup token found. Set CLAUDE_CODE_OAUTH_TOKEN "
-            "(or ANTHROPIC_TOKEN) in ~/.hermes/.env, or ensure the anthropic "
-            "credential_pool has an env:CLAUDE_CODE_OAUTH_TOKEN / claude_code entry. "
-            "Do NOT rely on the rotating `claude /login` session for the subprocess."
+            "claude_cli: no Anthropic setup token found. Put the non-rotating "
+            "setup token once in the canonical Hermes root ~/.hermes/.env as "
+            "CLAUDE_CODE_OAUTH_TOKEN=... (any profile resolves it), or set it in "
+            "this profile's env / anthropic credential_pool "
+            "(env:CLAUDE_CODE_OAUTH_TOKEN or claude_code). Generate with "
+            "`claude setup-token`. Do NOT rely on the rotating `claude /login` "
+            "session for the subprocess."
         )
     )
 
@@ -383,6 +488,10 @@ class ClaudeCliSession:
                 history_note=history_note,
                 resume_fallback=False,
             )
+        except ClaudeCliConcurrencyError:
+            # Host slot saturated — do not treat as resume-missing; let the
+            # conversation loop activate the profile fallback chain.
+            raise
         except ClaudeCliError as exc:
             if attempting_resume and is_resume_missing_error(str(exc)):
                 logger.warning(
@@ -478,6 +587,43 @@ class ClaudeCliSession:
             workspace,
         )
 
+        # Host-global concurrency slot: one per concurrent `claude -p` across
+        # all Hermes profiles/processes. Held for the whole spawn→stream
+        # lifetime so a long tool-using turn counts as one occupied slot.
+        # On saturation after bounded wait → ClaudeCliConcurrencyError →
+        # conversation_loop activates the profile fallback chain.
+        slot_meta = {
+            "hermes_conversation_id": self._hermes_conversation_id or "",
+            "mode": "resume" if resume_id else "create",
+            "model": str(model or self._model or ""),
+        }
+        # force_unbounded is a test hook; production always acquires.
+        slot_cm = (
+            claude_cli_slot(metadata=slot_meta)
+            if not is_force_unbounded()
+            else _null_slot_cm()
+        )
+        with slot_cm:
+            return self._drive_spawned_turn(
+                client=client,
+                cfg=cfg,
+                projector=projector,
+                result=result,
+                resume_id=resume_id,
+                create_id=create_id,
+            )
+
+    def _drive_spawned_turn(
+        self,
+        *,
+        client: Any,
+        cfg: ClaudeCliSpawnConfig,
+        projector: ClaudeEventProjector,
+        result: ClaudeCliTurnResult,
+        resume_id: Optional[str],
+        create_id: Optional[str],
+    ) -> ClaudeCliTurnResult:
+        """Spawn + stream one ``claude -p`` (called while holding a host slot)."""
         try:
             client.spawn(cfg)
         except FileNotFoundError as exc:
@@ -488,6 +634,8 @@ class ClaudeCliSession:
                     "or put `claude` on PATH."
                 )
             ) from exc
+        except ClaudeCliConcurrencyError:
+            raise
         except Exception as exc:
             raise ClaudeCliError(
                 message=f"claude_cli: failed to spawn subprocess: {exc}"
@@ -693,6 +841,12 @@ class ClaudeCliSession:
 
         self._turn_index += 1
         return result
+
+
+@contextmanager
+def _null_slot_cm() -> Iterator[None]:
+    """No-op slot context for tests that force unbounded concurrency."""
+    yield None
 
 
 def _coerce_user_text(user_input: Any) -> str:

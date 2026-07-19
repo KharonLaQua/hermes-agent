@@ -1,0 +1,186 @@
+"""Compatibility redaction helpers for Hermes tools.
+
+This module intentionally keeps the public API broad because tool entrypoints from
+nearby Hermes versions call these helpers with slightly different keyword
+arguments.  The helpers below redact common secret-looking values while accepting
+extra options without failing.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import re
+import shlex
+from typing import Any
+
+_REDACT_ENABLED = os.getenv("HERMES_REDACT_SECRETS", "true").lower() in {"1", "true", "yes", "on"}
+
+_SENSITIVE_QUERY_PARAMS = frozenset(
+    {
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "token",
+        "api_key",
+        "apikey",
+        "client_secret",
+        "password",
+        "auth",
+        "jwt",
+        "session",
+        "secret",
+        "key",
+        "code",
+        "signature",
+        "x-amz-signature",
+    }
+)
+
+_URL_WITH_QUERY_RE = re.compile(
+    r"(https?|wss?|ftp)://([^\s/?#]+)([^\s?#]*)\?([^\s#]+)(#\S*)?",
+    re.IGNORECASE,
+)
+_URL_USERINFO_RE = re.compile(r"(https?|wss?|ftp)://([^/\s:@]+):([^/\s@]+)@", re.IGNORECASE)
+_PREFIX_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])("
+    r"sk-[A-Za-z0-9_-]{10,}|"
+    r"ghp_[A-Za-z0-9]{10,}|"
+    r"github_pat_[A-Za-z0-9_]{10,}|"
+    r"xox[baprs]-[A-Za-z0-9-]{10,}|"
+    r"xai-[A-Za-z0-9]{30,}|"
+    r"AKIA[A-Z0-9]{16}"
+    r")(?![A-Za-z0-9_-])"
+)
+
+_SECRET_PATTERNS = [
+    re.compile(r"(?i)(api[_-]?key|token|secret|password|passwd|authorization|bearer)\s*[:=]\s*([^\s'\"`]+)"),
+    re.compile(r"(?i)(sk-[A-Za-z0-9_\-]{20,})"),
+    re.compile(r"(?i)(ghp_[A-Za-z0-9_]{20,})"),
+    re.compile(r"(?i)(xox[baprs]-[A-Za-z0-9\-]{20,})"),
+    re.compile(r"(?i)(AKIA[0-9A-Z]{16})"),
+]
+
+
+def _to_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _redact_query_string(query: str) -> str:
+    parts = []
+    for pair in query.split("&"):
+        if "=" not in pair:
+            parts.append(pair)
+            continue
+        key, _, _value = pair.partition("=")
+        parts.append(f"{key}=***" if key.lower() in _SENSITIVE_QUERY_PARAMS else pair)
+    return "&".join(parts)
+
+
+def _redact_url_query_params(text: Any) -> str:
+    """Compatibility helper used by browser_tool to mask URL credential params."""
+    value = _to_text(text)
+
+    def repl(match: re.Match[str]) -> str:
+        return (
+            f"{match.group(1)}://{match.group(2)}{match.group(3)}?"
+            f"{_redact_query_string(match.group(4))}{match.group(5) or ''}"
+        )
+
+    return _URL_WITH_QUERY_RE.sub(repl, value)
+
+
+def _redact_url_userinfo(text: Any) -> str:
+    """Compatibility helper used by browser_tool to mask URL userinfo passwords."""
+    return _URL_USERINFO_RE.sub(lambda m: f"{m.group(1)}://{m.group(2)}:***@", _to_text(text))
+
+
+def mask_secret(
+    value: str | None,
+    *,
+    head: int = 4,
+    tail: int = 4,
+    floor: int = 12,
+    placeholder: str = "***",
+    empty: str = "",
+) -> str:
+    if not value:
+        return empty
+    text = str(value)
+    if len(text) < floor:
+        return placeholder
+    return f"{text[:head]}...{text[-tail:]}"
+
+
+def redact_sensitive_text(text: Any, *args: Any, **kwargs: Any) -> str:
+    """Return text with common credential material redacted.
+
+    Accepts arbitrary positional/keyword arguments for compatibility with older
+    and newer Hermes tool call sites (for example: file_read=True).
+    """
+    if not _REDACT_ENABLED and not kwargs.get("force"):
+        return _to_text(text)
+    out = _to_text(text)
+    for pat in _SECRET_PATTERNS:
+        def repl(match: re.Match[str]) -> str:
+            if len(match.groups()) >= 2:
+                return f"{match.group(1)}=<REDACTED>"
+            return "<REDACTED>"
+        out = pat.sub(repl, out)
+    return out
+
+
+def redact_terminal_output(text: Any, *args: Any, **kwargs: Any) -> str:
+    """Compatibility wrapper used by terminal_tool."""
+    return redact_sensitive_text(text, *args, **kwargs)
+
+
+_ENV_DUMP_COMMANDS = frozenset({"env", "printenv", "set", "export", "declare"})
+
+
+def is_env_dump_command(command: str | None) -> bool:
+    if not command or not isinstance(command, str):
+        return False
+    for segment in re.split(r"[|;&]+", command):
+        segment = segment.strip()
+        if not segment:
+            continue
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            tokens = segment.split()
+        if tokens and tokens[0] in _ENV_DUMP_COMMANDS:
+            return True
+    return False
+
+
+def redact_file_output(text: Any, *args: Any, **kwargs: Any) -> str:
+    """Compatibility wrapper used by file tools in some Hermes builds."""
+    return redact_sensitive_text(text, *args, **kwargs)
+
+
+def redact_json(obj: Any, *args: Any, **kwargs: Any) -> Any:
+    """Best-effort recursive redaction for JSON-like objects."""
+    if isinstance(obj, str):
+        return redact_sensitive_text(obj, *args, **kwargs)
+    if isinstance(obj, list):
+        return [redact_json(x, *args, **kwargs) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(redact_json(x, *args, **kwargs) for x in obj)
+    if isinstance(obj, dict):
+        redacted = {}
+        for k, v in obj.items():
+            if re.search(r"(?i)(api[_-]?key|token|secret|password|passwd|authorization|bearer)", str(k)):
+                redacted[k] = "<REDACTED>"
+            else:
+                redacted[k] = redact_json(v, *args, **kwargs)
+        return redacted
+    return obj
+
+
+class RedactingFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_sensitive_text(super().format(record))
