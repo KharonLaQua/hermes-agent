@@ -1,10 +1,14 @@
-"""Phase 2c aux handling for claude_cli — compression skip + title skip.
+"""Phase 2c/2d aux handling for claude_cli — compression/title skip + no HTTP aux.
 
 Confirms:
   * Hermes HTTP context compression is skipped for api_mode=claude_cli
     (Claude owns native compaction via --resume)
   * Title generation skips the failing Anthropic HTTP aux path
   * Failures do not error the main turn (skip returns cleanly)
+  * Central invariant: claude_cli main runtime never constructs an HTTP
+    Anthropic aux client (extra-usage 400 path) — auto + explicit provider
+  * model_switch / switch_model preserve api_mode=claude_cli when
+    anthropic_runtime is opted in
 
 No live network / claude calls.
 """
@@ -13,11 +17,13 @@ from __future__ import annotations
 
 import logging
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agent import conversation_compression as cc
 from agent import title_generator as tg
+from agent import auxiliary_client as aux
 
 
 class _AgentStub:
@@ -262,3 +268,241 @@ def test_claude_cli_runtime_turn_does_not_raise_on_aux_skip(tmp_path, monkeypatc
         main_runtime={"api_mode": "claude_cli", "provider": "anthropic"},
     )
     assert title is None
+
+
+# ── Phase 2d: central no-HTTP-anthropic-aux invariant ──────────────────────
+
+
+def test_is_claude_cli_runtime_active_from_main_runtime():
+    assert aux._is_claude_cli_runtime_active(
+        {"api_mode": "claude_cli", "provider": "anthropic"}
+    )
+    assert not aux._is_claude_cli_runtime_active(
+        {"api_mode": "anthropic_messages", "provider": "anthropic"}
+    )
+
+
+def test_try_anthropic_refuses_http_when_claude_cli_main_runtime(monkeypatch):
+    """Spy: build_anthropic_client must never run for claude_cli main."""
+    built = {"n": 0}
+
+    def _boom(*_a, **_k):
+        built["n"] += 1
+        raise AssertionError("HTTP Anthropic client must not be built")
+
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.build_anthropic_client",
+        _boom,
+        raising=False,
+    )
+    # Also prevent config/env from interfering: only main_runtime matters.
+    monkeypatch.delenv("HERMES_ANTHROPIC_RUNTIME", raising=False)
+    monkeypatch.setattr(
+        aux,
+        "_is_claude_cli_runtime_active",
+        lambda main_runtime=None: (
+            isinstance(main_runtime, dict)
+            and str(main_runtime.get("api_mode") or "").lower() == "claude_cli"
+        ),
+    )
+
+    client, model = aux._try_anthropic(
+        explicit_api_key="sk-ant-oat01-TEST",
+        main_runtime={"api_mode": "claude_cli", "provider": "anthropic"},
+    )
+    assert client is None
+    assert model is None
+    assert built["n"] == 0
+
+
+def test_resolve_provider_client_anthropic_refuses_claude_cli(monkeypatch):
+    """Explicit provider=anthropic still refuses HTTP under claude_cli."""
+    built = {"n": 0}
+
+    def _boom_build(*_a, **_k):
+        built["n"] += 1
+        raise AssertionError("must not build HTTP anthropic")
+
+    monkeypatch.setenv("HERMES_ANTHROPIC_RUNTIME", "claude_cli")
+
+    with patch(
+        "agent.anthropic_adapter.build_anthropic_client",
+        side_effect=_boom_build,
+    ):
+        client, model = aux.resolve_provider_client(
+            "anthropic",
+            model="claude-haiku-4-5-20251001",
+            main_runtime={
+                "api_mode": "claude_cli",
+                "provider": "anthropic",
+                "model": "claude-opus-4-8",
+            },
+        )
+    assert client is None
+    assert model is None
+    assert built["n"] == 0
+
+
+def test_resolve_auto_skips_http_anthropic_for_claude_cli(monkeypatch, caplog):
+    """auto aux with claude_cli main_runtime must not land on Anthropic HTTP."""
+    # Force Step-1 skip path; make fallback chain empty so we see the skip.
+    monkeypatch.setattr(aux, "_try_configured_fallback_chain", lambda *a, **k: (None, None, None))
+    monkeypatch.setattr(aux, "_try_main_fallback_chain", lambda *a, **k: (None, None, None))
+    monkeypatch.setattr(aux, "_get_provider_chain", lambda: [])
+    monkeypatch.setattr(aux, "_is_provider_unhealthy", lambda *_a, **_k: False)
+
+    def _must_not_try_anthropic(*_a, **_k):
+        raise AssertionError("_try_anthropic must not be called from auto Step-1")
+
+    monkeypatch.setattr(aux, "_try_anthropic", _must_not_try_anthropic)
+
+    with caplog.at_level(logging.INFO, logger="agent.auxiliary_client"):
+        client, model = aux._resolve_auto(
+            main_runtime={
+                "provider": "anthropic",
+                "model": "claude-opus-4-8",
+                "api_mode": "claude_cli",
+                "api_key": "sk-ant-oat01-TEST",
+                "base_url": "https://api.anthropic.com",
+            }
+        )
+    assert client is None
+    assert model is None
+    assert any(
+        "skipping HTTP Anthropic main provider" in r.message for r in caplog.records
+    )
+
+
+def test_switch_model_preserves_claude_cli_api_mode(monkeypatch):
+    """In-place model switch must not drop claude_cli → anthropic_messages."""
+    from agent import agent_runtime_helpers as arh
+
+    monkeypatch.setenv("HERMES_ANTHROPIC_RUNTIME", "claude_cli")
+
+    agent = SimpleNamespace(
+        model="claude-opus-4-8",
+        provider="anthropic",
+        base_url="https://api.anthropic.com",
+        api_mode="claude_cli",
+        api_key="sk-ant-oat01-TEST",
+        client=None,
+        _anthropic_client=None,
+        _anthropic_api_key="sk-ant-oat01-TEST",
+        _anthropic_base_url="https://api.anthropic.com",
+        _is_anthropic_oauth=True,
+        _config_context_length=None,
+        _client_kwargs={},
+        _credential_pool=None,
+        _claude_cli_session=None,
+        compression_enabled=False,
+        context_compressor=None,
+        _primary_runtime={},
+        max_tokens=None,
+        request_overrides={},
+        quiet_mode=True,
+        _use_prompt_caching=False,
+        _use_native_cache_layout=False,
+        reasoning_config=None,
+    )
+    agent._anthropic_prompt_cache_policy = lambda **_k: (False, False)
+    agent._ensure_lmstudio_runtime_loaded = lambda: None
+
+    monkeypatch.setattr(
+        arh,
+        "get_provider_request_timeout",
+        lambda *_a, **_k: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool.load_pool",
+        lambda *_a, **_k: None,
+        raising=False,
+    )
+
+    # switch_model imports determine_api_mode which returns anthropic_messages;
+    # our re-apply of _maybe_apply_claude_cli_runtime must restore claude_cli.
+    arh.switch_model(
+        agent,
+        new_model="claude-sonnet-4-6",
+        new_provider="anthropic",
+        api_key="sk-ant-oat01-TEST",
+        base_url="https://api.anthropic.com",
+        api_mode="",  # force determine_api_mode path
+    )
+    assert agent.api_mode == "claude_cli", (
+        f"switch_model dropped claude_cli → {agent.api_mode!r} "
+        "(HTTP anthropic extra-usage path)"
+    )
+    assert agent.client is None
+    assert agent._anthropic_client is None
+    assert agent.model == "claude-sonnet-4-6"
+
+
+def test_model_switch_resolve_preserves_claude_cli(monkeypatch):
+    """hermes_cli.model_switch host_mandated must not strip claude_cli."""
+    from hermes_cli.runtime_provider import _maybe_apply_claude_cli_runtime
+
+    # Simulate the post-host_mandated re-apply that model_switch now does.
+    api_mode = "anthropic_messages"  # what host_mandated returns for api.anthropic.com
+    monkeypatch.setenv("HERMES_ANTHROPIC_RUNTIME", "claude_cli")
+    restored = _maybe_apply_claude_cli_runtime(
+        provider="anthropic",
+        api_mode=api_mode,
+        model_cfg={"anthropic_runtime": "claude_cli"},
+    )
+    assert restored == "claude_cli"
+
+
+def test_claude_cli_conversation_makes_no_http_anthropic_aux_call(monkeypatch, tmp_path):
+    """Regression: full-lifecycle multi-turn claude_cli → zero HTTP anthropic aux.
+
+    Constructs a lightweight AIAgent-shaped object, runs title + compression
+    + resolve_provider_client as interactive would, and spies that
+    build_anthropic_client is never invoked for aux.
+    """
+    built = {"n": 0, "urls": []}
+
+    def _spy_build(token, base_url=None, **_k):
+        built["n"] += 1
+        built["urls"].append(str(base_url or ""))
+        raise AssertionError(
+            f"HTTP Anthropic aux client constructed (base_url={base_url!r}) "
+            "— claude_cli must never use api.anthropic.com for side-LLM"
+        )
+
+    monkeypatch.setenv("HERMES_ANTHROPIC_RUNTIME", "claude_cli")
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.build_anthropic_client",
+        _spy_build,
+    )
+
+    main_runtime = {
+        "provider": "anthropic",
+        "model": "claude-opus-4-8",
+        "api_mode": "claude_cli",
+        "api_key": "sk-ant-oat01-TEST",
+        "base_url": "https://api.anthropic.com",
+    }
+
+    # Title
+    monkeypatch.setattr(tg, "_auto_title_enabled", lambda: True)
+    title = tg.generate_title("u", "a", main_runtime=main_runtime)
+    assert title is None
+
+    # Compression
+    agent = _AgentStub()
+    msgs, _ = cc.compress_context(agent, [{"role": "user", "content": "x"}], None)
+    assert len(msgs) == 1
+
+    # Explicit + auto aux resolution
+    c1, _ = aux.resolve_provider_client(
+        "anthropic", model="claude-haiku-4-5-20251001", main_runtime=main_runtime
+    )
+    assert c1 is None
+    monkeypatch.setattr(aux, "_try_configured_fallback_chain", lambda *a, **k: (None, None, None))
+    monkeypatch.setattr(aux, "_try_main_fallback_chain", lambda *a, **k: (None, None, None))
+    monkeypatch.setattr(aux, "_get_provider_chain", lambda: [])
+    c2, _ = aux._resolve_auto(main_runtime=main_runtime)
+    assert c2 is None
+
+    assert built["n"] == 0, f"HTTP anthropic built {built['n']} times: {built['urls']}"

@@ -1446,6 +1446,25 @@ def switch_model(
     elif not api_mode:
         api_mode = determine_api_mode(target_provider, base_url)
 
+    # claude_cli opt-in: host_mandated_api_mode(api.anthropic.com) always
+    # returns anthropic_messages and would strip a correctly-resolved
+    # claude_cli api_mode from resolve_runtime_provider. Re-apply the
+    # profile/env gate so /model switches (and same-provider Claude model
+    # swaps) stay on `claude -p` base Max instead of HTTP extra-usage.
+    try:
+        from hermes_cli.runtime_provider import (
+            _get_model_config,
+            _maybe_apply_claude_cli_runtime,
+        )
+
+        api_mode = _maybe_apply_claude_cli_runtime(
+            provider=target_provider,
+            api_mode=api_mode or "",
+            model_cfg=_get_model_config(),
+        )
+    except Exception:
+        pass
+
     # --- Normalize model name for target provider ---
     new_model = normalize_model_for_provider(new_model, target_provider)
 

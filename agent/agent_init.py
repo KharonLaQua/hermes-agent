@@ -1091,6 +1091,35 @@ def init_agent(
         agent.base_url = "moa://local"
         if not agent.quiet_mode:
             print(f"🤖 AI Agent initialized with MoA preset: {agent.model}")
+    elif agent.api_mode == "claude_cli":
+        # Claude CLI runtime: main turns spawn `claude -p` (base Max).
+        # Do not construct an HTTP Anthropic / OpenAI client against
+        # api.anthropic.com — that path bills EXTRA USAGE on Max setup
+        # tokens and is the source of "You're out of extra usage" 400s.
+        from agent.anthropic_adapter import resolve_anthropic_token, _is_oauth_token
+
+        _is_native_anthropic = agent.provider == "anthropic"
+        effective_key = (
+            (api_key or resolve_anthropic_token() or "")
+            if _is_native_anthropic
+            else (api_key or "")
+        )
+        agent.api_key = effective_key
+        agent._anthropic_api_key = effective_key
+        agent._anthropic_base_url = base_url or "https://api.anthropic.com"
+        agent._anthropic_client = None
+        agent._is_anthropic_oauth = (
+            _is_oauth_token(effective_key)
+            if (_is_native_anthropic and isinstance(effective_key, str))
+            else False
+        )
+        agent.client = None
+        agent._client_kwargs = {}
+        if not agent.quiet_mode:
+            print(
+                f"🤖 AI Agent initialized with model: {agent.model} "
+                f"(Claude CLI runtime — base Max via claude -p)"
+            )
     elif agent.api_mode == "bedrock_converse":
         # AWS Bedrock — uses boto3 directly, no OpenAI client needed.
         # Region is extracted from the base_url or defaults to us-east-1.
