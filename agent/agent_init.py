@@ -615,7 +615,14 @@ def init_agent(
     agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
-    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
+    if api_mode in {
+        "chat_completions",
+        "codex_responses",
+        "anthropic_messages",
+        "bedrock_converse",
+        "codex_app_server",
+        "claude_cli",
+    }:
         agent.api_mode = api_mode
     elif agent.provider == "openai-codex":
         agent.api_mode = "codex_responses"
@@ -631,6 +638,9 @@ def init_agent(
         agent.api_mode = "codex_responses"
         agent.provider = "xai"
     elif agent.provider == "anthropic" or (provider_name is None and agent._base_url_hostname == "api.anthropic.com"):
+        # Default Anthropic HTTP path. Opt-in claude_cli is only set when the
+        # caller passes api_mode explicitly (resolve_runtime_provider applies
+        # model.anthropic_runtime / HERMES_ANTHROPIC_RUNTIME before init).
         agent.api_mode = "anthropic_messages"
         agent.provider = "anthropic"
     elif agent._base_url_lower.rstrip("/").endswith("/anthropic"):

@@ -869,6 +869,19 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
+    # Optional opt-in runtime: if api_mode == claude_cli, hand the turn to
+    # a `claude -p` subprocess (Anthropic Max subscription via setup token
+    # + clean env). Phase 1 = single-turn text + streaming only.
+    # See agent/transports/claude_cli_session.py.
+    if agent.api_mode == "claude_cli":
+        return agent._run_claude_cli_turn(
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=_should_review_memory,
+        )
+
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:

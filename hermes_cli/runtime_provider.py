@@ -357,6 +357,12 @@ _VALID_API_MODES = {
     # `model.openai_runtime == "codex_app_server"` AND provider in
     # {"openai", "openai-codex"}. Default is unchanged.
     "codex_app_server",
+    # Optional opt-in: hand the entire turn to a `claude -p` subprocess so
+    # Anthropic Max subscription billing rides Claude Code's CLI (setup-token
+    # auth + clean env). Gated behind `model.anthropic_runtime == "claude_cli"`
+    # (or HERMES_ANTHROPIC_RUNTIME) AND provider == "anthropic". Default
+    # Anthropic path stays anthropic_messages HTTP.
+    "claude_cli",
 }
 
 
@@ -403,6 +409,46 @@ def _maybe_apply_codex_app_server_runtime(
     runtime = str(model_cfg.get("openai_runtime") or "").strip().lower()
     if runtime == "codex_app_server":
         return "codex_app_server"
+    return api_mode
+
+
+def _maybe_apply_claude_cli_runtime(
+    *,
+    provider: str,
+    api_mode: str,
+    model_cfg: Optional[Dict[str, Any]],
+) -> str:
+    """Optional opt-in: rewrite api_mode → "claude_cli" for Anthropic when
+    the user has enabled that runtime via config or one-session env override.
+
+    Selection (first match wins):
+      1. ``HERMES_ANTHROPIC_RUNTIME`` env (one-session override; values
+         ``claude_cli`` / ``on`` enable, ``auto`` / ``off`` / empty disable)
+      2. ``model.anthropic_runtime: claude_cli`` in config.yaml
+
+    Only provider ``anthropic`` is eligible — other providers stay on their
+    existing api_mode. When unset/auto/empty, this is a no-op and Anthropic
+    keeps ``anthropic_messages`` (HTTP).
+
+    Returns the (possibly-rewritten) api_mode.
+    """
+    if provider != "anthropic":
+        return api_mode
+
+    env_runtime = (_getenv("HERMES_ANTHROPIC_RUNTIME", "") or "").strip().lower()
+    if env_runtime in {"claude_cli", "on", "1", "true", "yes"}:
+        return "claude_cli"
+    if env_runtime in {"off", "0", "false", "no", "anthropic_messages"}:
+        # Explicit one-session disable — force the HTTP path even if
+        # config.yaml has anthropic_runtime: claude_cli.
+        return "anthropic_messages"
+    # env empty / "auto" → fall through to model_cfg
+
+    if not model_cfg:
+        return api_mode
+    runtime = str(model_cfg.get("anthropic_runtime") or "").strip().lower()
+    if runtime in {"claude_cli", "on", "1", "true", "yes"}:
+        return "claude_cli"
     return api_mode
 
 
@@ -536,6 +582,11 @@ def _resolve_runtime_from_pool_entry(
     # Optional opt-in: route OpenAI/Codex turns through `codex app-server`.
     # Inert when `model.openai_runtime` is unset or "auto".
     api_mode = _maybe_apply_codex_app_server_runtime(
+        provider=provider, api_mode=api_mode, model_cfg=model_cfg
+    )
+    # Optional opt-in: route Anthropic turns through `claude -p` (Max sub).
+    # Inert when `model.anthropic_runtime` / HERMES_ANTHROPIC_RUNTIME unset.
+    api_mode = _maybe_apply_claude_cli_runtime(
         provider=provider, api_mode=api_mode, model_cfg=model_cfg
     )
 
@@ -1411,9 +1462,14 @@ def _resolve_explicit_runtime(
                     "No Anthropic credentials found. Set ANTHROPIC_TOKEN or ANTHROPIC_API_KEY, "
                     "run 'claude setup-token', or authenticate with 'claude /login'."
                 )
+        api_mode = _maybe_apply_claude_cli_runtime(
+            provider="anthropic",
+            api_mode="anthropic_messages",
+            model_cfg=model_cfg,
+        )
         return {
             "provider": "anthropic",
-            "api_mode": "anthropic_messages",
+            "api_mode": api_mode,
             "base_url": base_url,
             "api_key": api_key,
             "source": "explicit",
@@ -2006,9 +2062,14 @@ def resolve_runtime_provider(
                     "No Anthropic credentials found. Set ANTHROPIC_TOKEN or ANTHROPIC_API_KEY, "
                     "run 'claude setup-token', or authenticate with 'claude /login'."
                 )
+        api_mode = _maybe_apply_claude_cli_runtime(
+            provider="anthropic",
+            api_mode="anthropic_messages",
+            model_cfg=model_cfg,
+        )
         return {
             "provider": "anthropic",
-            "api_mode": "anthropic_messages",
+            "api_mode": api_mode,
             "base_url": base_url,
             "api_key": token,
             "source": "env",
