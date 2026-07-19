@@ -104,7 +104,8 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
         "migrate-shared",
         help=(
             "Install a chosen legacy xAI grant into the shared store and strip "
-            "profile-local secret copies (requires HERMES_XAI_SHARED_AUTH=1)"
+            "profile-local secret copies (requires shared_auth.providers to "
+            "include xai-oauth; run `hermes auth xai enable-shared` first)"
         ),
     )
     auth_xai_migrate.add_argument(
@@ -122,10 +123,16 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
     # durable local RT. Keeping legacy copies directly forks the grant.
     auth_xai_sub.add_parser(
         "enable-shared",
-        help="Re-enable this profile's use of the shared xAI grant",
+        help=(
+            "Enable shared xAI OAuth via config.yaml "
+            "(shared_auth.providers: [xai-oauth]) and re-enable this profile"
+        ),
     )
     auth_xai_sub.add_parser(
         "disable-shared",
-        help="Per-profile disable of shared xAI (does not delete the grant)",
+        help=(
+            "Disable shared xAI OAuth in config.yaml (remove xai-oauth from "
+            "shared_auth.providers); does not delete the canonical grant"
+        ),
     )
     auth_parser.set_defaults(func=cmd_auth)

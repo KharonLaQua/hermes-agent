@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import sys
 import time
 from types import SimpleNamespace
@@ -353,7 +354,7 @@ def auth_add_command(args) -> None:
                 "refresh-token family.\n"
                 "Use `hermes model` / device-code login (writes the canonical "
                 "shared store) or `hermes auth xai migrate-shared`.\n"
-                "Disable shared mode (unset HERMES_XAI_SHARED_AUTH) only if you "
+                "Disable shared mode (`hermes auth xai disable-shared`) only if you "
                 "intentionally want independent per-entry grants."
             )
         try:
@@ -805,8 +806,10 @@ def auth_xai_command(args) -> None:
         if not auth_mod._xai_shared_auth_enabled():
             raise SystemExit(
                 "Shared xAI OAuth is not enabled.\n"
-                "Set HERMES_XAI_SHARED_AUTH=1 (or HERMES_SHARED_AUTH_PROVIDERS=xai-oauth) "
-                "in the environment seen by every gateway/cron/desktop process, then retry."
+                "Enable it with `hermes auth xai enable-shared` (writes "
+                "shared_auth.providers: [xai-oauth] to config.yaml), then retry.\n"
+                "Every gateway/cron/desktop process must load that config so the "
+                "internal env bridge activates fleet-wide."
             )
         try:
             written = auth_mod.migrate_xai_oauth_to_shared_store(
@@ -826,30 +829,82 @@ def auth_xai_command(args) -> None:
         )
         return
     if action == "enable-shared":
-        if not auth_mod._xai_shared_auth_enabled():
-            raise SystemExit(
-                "Shared xAI OAuth is not enabled. Set HERMES_XAI_SHARED_AUTH=1 first."
-            )
+        # User-facing activation: write config.yaml (not HERMES_* env vars).
+        # Bridges into the internal env vars for this process so the engine
+        # gate flips on immediately (AGENTS.md env-var-for-config policy).
+        from hermes_cli.config import enable_shared_auth_provider
+
+        providers = enable_shared_auth_provider("xai-oauth")
+        print(
+            "Enabled shared xAI OAuth in config.yaml "
+            f"(shared_auth.providers: {providers})."
+        )
+        print(
+            "  Internal bridge set HERMES_XAI_SHARED_AUTH for this process; "
+            "restart gateway/cron/desktop workers so they reload config."
+        )
+        # If a usable canonical grant already exists, also re-enable this
+        # profile's marker and strip residual local RTs (prior behavior).
         try:
-            auth_mod.enable_profile_xai_shared_auth()
+            if auth_mod._xai_shared_state_has_usable_tokens(
+                auth_mod._read_shared_xai_state()
+            ):
+                auth_mod.enable_profile_xai_shared_auth()
+                print("  Profile re-enabled against the existing shared grant.")
+            else:
+                print(
+                    "  Shared store is empty — run `hermes auth xai migrate-shared` "
+                    "or log in via `hermes model` / device-code to seed it."
+                )
         except auth_mod.AuthError as exc:
             raise SystemExit(str(exc)) from exc
-        print("Enabled shared xAI OAuth for this profile.")
         return
     if action == "disable-shared":
-        # F4b: gate must be on; never strip local tokens when shared mode is off.
-        if not auth_mod._xai_shared_auth_enabled():
-            raise SystemExit(
-                "Shared xAI OAuth is not enabled. Set HERMES_XAI_SHARED_AUTH=1 first."
+        # Turn off the user-facing config switch (removes xai-oauth from
+        # shared_auth.providers). Also write the per-profile disable marker
+        # when the gate was on so mid-session consumers stop using the grant.
+        from hermes_cli.config import disable_shared_auth_provider
+
+        was_enabled = auth_mod._xai_shared_auth_enabled()
+        if was_enabled:
+            try:
+                auth_mod.disable_profile_xai_shared_auth()
+            except auth_mod.AuthError as exc:
+                # Gate might race; still proceed to clear config.
+                print(f"Note: per-profile disable marker: {exc}")
+        remaining = disable_shared_auth_provider("xai-oauth")
+        # Explicit user intent: ensure this process's internal gate is off even
+        # if the gate was env-only (no config key yet) or a stale .env export.
+        os.environ.pop("HERMES_XAI_SHARED_AUTH", None)
+        raw_providers = os.environ.get("HERMES_SHARED_AUTH_PROVIDERS", "")
+        if raw_providers.strip():
+            _xai_aliases = {"xai-oauth", "xai", "grok-oauth", "x-ai-oauth"}
+            left = [
+                p.strip()
+                for p in raw_providers.split(",")
+                if p.strip() and p.strip().lower() not in _xai_aliases
+            ]
+            if left:
+                os.environ["HERMES_SHARED_AUTH_PROVIDERS"] = ",".join(left)
+            else:
+                os.environ.pop("HERMES_SHARED_AUTH_PROVIDERS", None)
+        if remaining:
+            print(
+                "Removed xai-oauth from shared_auth.providers in config.yaml "
+                f"(remaining providers: {remaining})."
             )
-        try:
-            auth_mod.disable_profile_xai_shared_auth()
-        except auth_mod.AuthError as exc:
-            raise SystemExit(str(exc)) from exc
+        else:
+            print(
+                "Disabled shared xAI OAuth in config.yaml "
+                "(shared_auth.providers no longer lists xai-oauth)."
+            )
         print(
-            "Disabled shared xAI OAuth for this profile only. "
-            "Canonical grant is unchanged. Use `hermes logout --provider xai-oauth --global` "
-            "to delete it for all profiles."
+            "  Canonical grant is unchanged. Use "
+            "`hermes logout --provider xai-oauth --global` to delete it for "
+            "all profiles."
+        )
+        print(
+            "  Restart gateway/cron/desktop workers so they reload config."
         )
         return
     raise SystemExit(

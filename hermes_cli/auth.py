@@ -4457,9 +4457,14 @@ def _pool_codex_access_token() -> str:
 # instead of POSTing a stale single-use refresh token again.
 #
 # Explicit opt-in only (G7): HERMES_SHARED_AUTH_DIR may already be set for
-# Nous. Shared xAI ownership is gated by:
+# Nous. Shared xAI ownership is gated by the INTERNAL env vars:
 #   - HERMES_XAI_SHARED_AUTH=1 (truthy), or
 #   - HERMES_SHARED_AUTH_PROVIDERS containing ``xai-oauth`` (comma list)
+# User-facing activation is config.yaml ``shared_auth.providers: [xai-oauth]``
+# (or `hermes auth xai enable-shared`), bridged to those env vars at process
+# startup — AGENTS.md env-var-for-config / terminal.cwd→TERMINAL_CWD pattern.
+# This function deliberately still reads only the env vars so the engine stays
+# env-driven and tests/power-user overrides keep working.
 #
 # When active, this OVERRIDES the legacy profile→root fallback + write-through
 # machinery. Profile auth.json / credential_pool rows keep non-secret metadata
@@ -6115,8 +6120,8 @@ def migrate_xai_oauth_to_shared_store(
     """
     if not _xai_shared_auth_enabled():
         raise AuthError(
-            "Shared xAI OAuth is not enabled. Set HERMES_XAI_SHARED_AUTH=1 "
-            "(or HERMES_SHARED_AUTH_PROVIDERS=xai-oauth) before migrating.",
+            "Shared xAI OAuth is not enabled. Run `hermes auth xai enable-shared` "
+            "(writes shared_auth.providers: [xai-oauth] to config.yaml) before migrating.",
             provider="xai-oauth",
             code="xai_shared_not_enabled",
         )
@@ -6573,8 +6578,8 @@ def disable_profile_xai_shared_auth() -> bool:
     """
     if not _xai_shared_auth_enabled():
         raise AuthError(
-            "Shared xAI OAuth is not enabled. Set HERMES_XAI_SHARED_AUTH=1 "
-            "(or HERMES_SHARED_AUTH_PROVIDERS=xai-oauth) before disabling.",
+            "Shared xAI OAuth is not enabled. Run `hermes auth xai enable-shared` "
+            "(or set shared_auth.providers: [xai-oauth] in config.yaml) before disabling.",
             provider="xai-oauth",
             code="xai_shared_not_enabled",
         )
@@ -6602,8 +6607,8 @@ def enable_profile_xai_shared_auth() -> bool:
     """
     if not _xai_shared_auth_enabled():
         raise AuthError(
-            "Shared xAI OAuth is not enabled. Set HERMES_XAI_SHARED_AUTH=1 "
-            "(or HERMES_SHARED_AUTH_PROVIDERS=xai-oauth) before enabling.",
+            "Shared xAI OAuth is not enabled. Run `hermes auth xai enable-shared` "
+            "(or set shared_auth.providers: [xai-oauth] in config.yaml) before enabling.",
             provider="xai-oauth",
             code="xai_shared_not_enabled",
         )
