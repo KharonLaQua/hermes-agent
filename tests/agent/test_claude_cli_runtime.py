@@ -529,6 +529,106 @@ def test_resolve_runtime_from_pool_entry_applies_claude_cli(monkeypatch):
     assert resolved4["api_mode"] == "anthropic_messages"
 
 
+def test_resolve_runtime_provider_override_model_default_on(monkeypatch):
+    """Per-call anthropic + Claude override → claude_cli even when config is non-Claude.
+
+    Reproduces the og gap: profile has openai-codex/gpt default and NO
+    anthropic_runtime, but ``--provider anthropic --model claude-opus-4-8``
+    (or an equivalent desktop runtime override) must still hit default-on.
+    """
+    monkeypatch.delenv("HERMES_ANTHROPIC_RUNTIME", raising=False)
+
+    # og-style config: non-anthropic default, no anthropic_runtime.
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "default": "gpt-5.6-sol",
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+        },
+    )
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+    # Force the env/credential path (not pool) so we exercise the
+    # target_model-aware anthropic branch that previously only read config.default.
+    monkeypatch.setattr(rp, "load_pool", lambda provider: None)
+
+    seen_models = []
+
+    def _eligible(*, model=None):
+        seen_models.append(model)
+        return bool(model and "claude" in str(model).lower())
+
+    monkeypatch.setattr(rp, "_claude_cli_auto_eligible", _eligible)
+
+    # Avoid real Anthropic token resolution / network.
+    import agent.anthropic_adapter as anth
+
+    monkeypatch.setattr(anth, "resolve_anthropic_token", lambda: "sk-ant-oat01-TEST")
+
+    resolved = rp.resolve_runtime_provider(
+        requested="anthropic",
+        target_model="claude-opus-4-8",
+    )
+    assert resolved["provider"] == "anthropic"
+    assert resolved["api_mode"] == "claude_cli"
+    # Default-on must evaluate the *override* model, not config.default (gpt).
+    assert any(m and "claude" in str(m).lower() for m in seen_models)
+
+    # Without target_model, config.default is gpt → auto ineligible → HTTP.
+    seen_models.clear()
+    resolved_no_override = rp.resolve_runtime_provider(requested="anthropic")
+    assert resolved_no_override["api_mode"] == "anthropic_messages"
+
+    # Explicit opt-out still wins even with Claude override + eligible auto.
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "default": "gpt-5.6-sol",
+            "provider": "openai-codex",
+            "anthropic_runtime": "anthropic_messages",
+        },
+    )
+    resolved_opt_out = rp.resolve_runtime_provider(
+        requested="anthropic",
+        target_model="claude-opus-4-8",
+    )
+    assert resolved_opt_out["api_mode"] == "anthropic_messages"
+
+
+def test_resolve_explicit_runtime_override_model_default_on(monkeypatch):
+    """Explicit api_key/base_url path also honors target_model for default-on."""
+    monkeypatch.delenv("HERMES_ANTHROPIC_RUNTIME", raising=False)
+    monkeypatch.setattr(
+        rp,
+        "_claude_cli_auto_eligible",
+        lambda *, model=None: bool(model and "claude" in str(model).lower()),
+    )
+    # Config default is non-Claude; only the override is Claude.
+    model_cfg = {"default": "gpt-5.6-sol", "provider": "openai-codex"}
+    resolved = rp._resolve_explicit_runtime(
+        provider="anthropic",
+        requested_provider="anthropic",
+        model_cfg=model_cfg,
+        explicit_api_key="sk-ant-oat01-TEST",
+        explicit_base_url="https://api.anthropic.com",
+        target_model="claude-opus-4-8",
+    )
+    assert resolved is not None
+    assert resolved["api_mode"] == "claude_cli"
+
+    # Same path without target_model → HTTP (config default not Claude).
+    resolved2 = rp._resolve_explicit_runtime(
+        provider="anthropic",
+        requested_provider="anthropic",
+        model_cfg=model_cfg,
+        explicit_api_key="sk-ant-oat01-TEST",
+        explicit_base_url="https://api.anthropic.com",
+    )
+    assert resolved2["api_mode"] == "anthropic_messages"
+
+
 def test_agent_init_accepts_claude_cli_api_mode():
     """AIAgent / agent_init allowlist includes claude_cli."""
     # Read the source of the allowlist check via a minimal object that

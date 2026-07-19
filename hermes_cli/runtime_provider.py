@@ -1518,6 +1518,26 @@ def _resolve_azure_foundry_runtime(
     }
 
 
+def _effective_model_for_claude_cli(
+    *,
+    target_model: Optional[str] = None,
+    model_cfg: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Prefer per-call/override model over config default for claude_cli gating.
+
+    CLI ``--model``, oneshot, desktop/runtime model overrides, and mid-session
+    switches pass ``target_model``. Config-only paths leave it unset and fall
+    back to ``model.default`` / ``model.model``.
+    """
+    if target_model and str(target_model).strip():
+        return str(target_model).strip()
+    if model_cfg:
+        cfg_model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
+        if cfg_model:
+            return cfg_model
+    return None
+
+
 def _resolve_explicit_runtime(
     *,
     provider: str,
@@ -1550,13 +1570,15 @@ def _resolve_explicit_runtime(
                     "No Anthropic credentials found. Set ANTHROPIC_TOKEN or ANTHROPIC_API_KEY, "
                     "run 'claude setup-token', or authenticate with 'claude /login'."
                 )
+        # Honor per-call model override (CLI --model / desktop runtime) so
+        # default-on claude_cli fires even when config.default is non-Claude.
         api_mode = _maybe_apply_claude_cli_runtime(
             provider="anthropic",
             api_mode="anthropic_messages",
             model_cfg=model_cfg,
-            model=str(
-                model_cfg.get("default") or model_cfg.get("model") or ""
-            ) or None,
+            model=_effective_model_for_claude_cli(
+                target_model=target_model, model_cfg=model_cfg
+            ),
         )
         return {
             "provider": "anthropic",
@@ -2153,13 +2175,16 @@ def resolve_runtime_provider(
                     "No Anthropic credentials found. Set ANTHROPIC_TOKEN or ANTHROPIC_API_KEY, "
                     "run 'claude setup-token', or authenticate with 'claude /login'."
                 )
+        # Prefer target_model (CLI --provider/--model, oneshot, desktop override)
+        # over config.default so profiles without anthropic_runtime still get
+        # default-on claude_cli when the *override* is an Anthropic Claude model.
         api_mode = _maybe_apply_claude_cli_runtime(
             provider="anthropic",
             api_mode="anthropic_messages",
             model_cfg=model_cfg,
-            model=str(
-                model_cfg.get("default") or model_cfg.get("model") or ""
-            ) or None,
+            model=_effective_model_for_claude_cli(
+                target_model=target_model, model_cfg=model_cfg
+            ),
         )
         return {
             "provider": "anthropic",
