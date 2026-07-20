@@ -207,7 +207,7 @@ def test_provider_not_in_registry_but_in_models_dev(tmp_path, monkeypatch):
     set in .env.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-key-12345678")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "«redacted:sk-…»")
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
     (tmp_path / "hermes").mkdir(parents=True, exist_ok=True)
 
@@ -229,3 +229,47 @@ def test_returns_true_when_moa_aggregator_uses_provider(tmp_path, monkeypatch):
 
     from hermes_cli.auth import is_provider_explicitly_configured
     assert is_provider_explicitly_configured("anthropic") is True
+
+
+def test_shared_pool_source_counts_as_explicit(tmp_path, monkeypatch):
+    """Fleet shared OAuth (shared:xai-oauth) is operator-chosen, not ambient."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {
+        "version": 1,
+        "providers": {},
+        "active_provider": None,
+        "credential_pool": {
+            "xai-oauth": [{
+                "id": "shared1",
+                "source": "shared:xai-oauth",
+                "auth_type": "oauth",
+            }],
+        },
+    })
+
+    from hermes_cli.auth import is_provider_explicitly_configured
+    assert is_provider_explicitly_configured("xai-oauth") is True
+
+
+def test_fallback_providers_count_as_explicit(tmp_path, monkeypatch):
+    """Providers listed in fallback_providers should appear in desktop pickers."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_config(tmp_path, {
+        "model": {"provider": "openai-codex", "default": "gpt-5.6-sol"},
+        "fallback_providers": [
+            {"provider": "xai-oauth", "model": "grok-4.5"},
+            {"provider": "anthropic", "model": "claude-opus-4-8"},
+        ],
+    })
+    _write_auth_store(tmp_path, {
+        "version": 1,
+        "providers": {},
+        "active_provider": None,
+        "credential_pool": {},
+    })
+
+    from hermes_cli.auth import is_provider_explicitly_configured
+    assert is_provider_explicitly_configured("openai-codex") is True
+    assert is_provider_explicitly_configured("xai-oauth") is True
+    assert is_provider_explicitly_configured("anthropic") is True
+    assert is_provider_explicitly_configured("copilot") is False

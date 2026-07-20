@@ -1774,12 +1774,20 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     Checks:
       1. active_provider in auth.json matches
       2. model.provider in config.yaml matches
+      2b. fallback_providers[].provider in config.yaml matches
       3. Provider-specific env vars are set (e.g. ANTHROPIC_API_KEY)
+      4. Persisted credential-pool entries from explicit Hermes flows
+         (manual / device-code / PKCE / env-backed / shared fleet auth)
 
     This is used to gate auto-discovery of external credentials (e.g.
     Claude Code's ~/.claude/.credentials.json) so they are never used
     without the user's explicit choice.  See PR #4210 for the same
     pattern applied to the setup wizard gate.
+
+    Desktop model pickers use ``explicit_only=True`` and rely on this gate.
+    Fleet profiles that inherit Don's shared xAI OAuth or root Claude setup
+    token must still surface those providers in the picker — otherwise every
+    specialist profile stuck on openai-codex only shows GPT models.
     """
     normalized = (provider_id or "").strip().lower()
 
@@ -1832,12 +1840,25 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
                             return True
                     if _slot_matches_provider(preset.get("aggregator")):
                         return True
+        # 2b. Fallback chain providers are explicit user routing choices —
+        # desktop pickers should list them so users can switch to a fallback
+        # provider without re-running setup on every profile.
+        fallbacks = cfg.get("fallback_providers")
+        if isinstance(fallbacks, list):
+            for entry in fallbacks:
+                if not isinstance(entry, dict):
+                    continue
+                fb = (entry.get("provider") or "").strip().lower()
+                if fb and fb == normalized:
+                    return True
     except Exception:
         pass
 
     # 3. Check provider-specific env vars
     # Exclude CLAUDE_CODE_OAUTH_TOKEN — it's set by Claude Code itself,
     # not by the user explicitly configuring anthropic in Hermes.
+    # (Pool entries sourced as env:CLAUDE_CODE_OAUTH_TOKEN still count in
+    # step 4 when the var resolves — that is an explicit Hermes pool seed.)
     _IMPLICIT_ENV_VARS = {"CLAUDE_CODE_OAUTH_TOKEN"}
     pconfig = PROVIDER_REGISTRY.get(normalized)
     # Fallback to ProviderDef from models.dev catalog when the provider
@@ -1855,8 +1876,8 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
 
     # 4. Check persisted credential-pool entries that came from EXPLICIT flows
     # the user initiated inside Hermes (manual add / device-code / PKCE), plus
-    # env-backed pool entries. This intentionally excludes ambient borrowed
-    # sources like gh_cli / claude_code / qwen-cli.
+    # env-backed pool entries and fleet shared-auth entries. This intentionally
+    # excludes ambient borrowed sources like gh_cli / claude_code / qwen-cli.
     try:
         for entry in read_credential_pool(normalized):
             if not isinstance(entry, dict):
@@ -1872,6 +1893,12 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
                 if env_var and has_usable_secret(os.getenv(env_var, "")):
                     return True
                 continue
+            if source.startswith("shared:"):
+                # Fleet shared OAuth (e.g. shared:xai-oauth via
+                # HERMES_XAI_SHARED_AUTH) is an operator-chosen auth path,
+                # not ambient CLI borrow. Count it so every profile picker
+                # can surface Grok/etc. without re-login per profile.
+                return True
             if (
                 source in {"device_code", "loopback_pkce", "hermes_pkce", "manual"}
                 or source.startswith("manual:")

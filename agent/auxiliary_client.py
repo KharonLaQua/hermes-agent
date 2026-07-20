@@ -1475,6 +1475,219 @@ class AsyncAnthropicAuxiliaryClient:
         self._real_client = sync_wrapper._real_client
 
 
+def _flatten_messages_for_claude_cli(messages: list) -> tuple[str, str]:
+    """Split OpenAI-style messages into (system_prompt, user_prompt) for claude -p.
+
+    Pure-text MoA / aux one-shots: system parts become ``--append-system-prompt``,
+    user/assistant turns become the positional prompt. Multimodal list content is
+    reduced to text parts only (images are not supported on this path).
+    """
+    systems: list[str] = []
+    body: list[str] = []
+
+    def _text_of(content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get("type") in {None, "text"} and part.get("text"):
+                        parts.append(str(part.get("text") or ""))
+                elif isinstance(part, str):
+                    parts.append(part)
+            return "\n".join(p for p in parts if p)
+        return str(content)
+
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "").strip().lower()
+        text = _text_of(msg.get("content")).strip()
+        if not text:
+            continue
+        if role == "system":
+            systems.append(text)
+        elif role == "user":
+            body.append(text if not body else f"User: {text}")
+        elif role == "assistant":
+            body.append(f"Assistant: {text}")
+        else:
+            body.append(f"{role or 'message'}: {text}")
+
+    return "\n\n".join(systems).strip(), "\n\n".join(body).strip()
+
+
+class _ClaudeCliCompletionsAdapter:
+    """Translate ``chat.completions.create`` into a pure-text ``claude -p`` turn.
+
+    Used when ``anthropic_runtime: claude_cli`` is active so explicit Anthropic
+    side-channels (MoA reference slots, etc.) stay on base Max via the CLI
+    instead of billing HTTP ``api.anthropic.com`` extra-usage.
+    """
+
+    def __init__(self, model: str, oauth_token: str):
+        self._model = model
+        self._oauth_token = oauth_token
+
+    def create(self, **kwargs) -> Any:
+        from agent.transports.claude_cli import ClaudeCliError
+        from agent.transports.claude_cli_session import ClaudeCliSession
+
+        messages = kwargs.get("messages") or []
+        model = str(kwargs.get("model") or self._model or "").strip() or self._model
+        timeout = kwargs.get("timeout")
+        try:
+            turn_timeout = float(timeout) if timeout is not None else 600.0
+        except (TypeError, ValueError):
+            turn_timeout = 600.0
+
+        system_prompt, user_prompt = _flatten_messages_for_claude_cli(messages)
+        if not user_prompt:
+            # Fall back to system-only payloads so callers still get a turn.
+            user_prompt = system_prompt or "(empty)"
+            system_prompt = ""
+
+        session = ClaudeCliSession(
+            oauth_token=self._oauth_token,
+            model=model,
+            enable_hermes_mcp=False,  # MoA/aux advisors: text only, no tool loop
+            max_turns=1,
+            turn_timeout=turn_timeout,
+        )
+        try:
+            turn = session.run_turn(
+                user_prompt,
+                system_prompt=system_prompt or None,
+                model=model,
+                turn_timeout=turn_timeout,
+            )
+        except ClaudeCliError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"claude_cli aux turn failed: {exc}") from exc
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+        content = (getattr(turn, "final_text", None) or "").strip() or None
+        usage_raw = getattr(turn, "usage", None) or {}
+        if isinstance(usage_raw, dict):
+            usage = SimpleNamespace(
+                prompt_tokens=int(usage_raw.get("input_tokens") or 0),
+                completion_tokens=int(usage_raw.get("output_tokens") or 0),
+                total_tokens=int(
+                    usage_raw.get("total_tokens")
+                    or (
+                        (usage_raw.get("input_tokens") or 0)
+                        + (usage_raw.get("output_tokens") or 0)
+                    )
+                ),
+            )
+        else:
+            usage = SimpleNamespace(
+                prompt_tokens=int(getattr(usage_raw, "input_tokens", 0) or 0),
+                completion_tokens=int(getattr(usage_raw, "output_tokens", 0) or 0),
+                total_tokens=int(getattr(usage_raw, "total_tokens", 0) or 0),
+            )
+
+        message = SimpleNamespace(role="assistant", content=content, tool_calls=None)
+        choice = SimpleNamespace(index=0, message=message, finish_reason="stop")
+        return SimpleNamespace(
+            choices=[choice],
+            model=model,
+            usage=usage,
+            # Marker so diagnostics can tell HTTP vs CLI path apart.
+            _hermes_transport="claude_cli",
+        )
+
+
+class _ClaudeCliChatShim:
+    def __init__(self, adapter: _ClaudeCliCompletionsAdapter):
+        self.completions = adapter
+
+
+class ClaudeCliAuxiliaryClient:
+    """OpenAI-client-compatible wrapper over ``claude -p`` (base Max / setup token).
+
+    Explicit ``provider=anthropic`` auxiliary calls under ``claude_cli`` runtime
+    use this instead of HTTP Anthropic. Auto-detection still skips Anthropic so
+    cheap title/compression tasks don't spawn Claude CLI by accident.
+    """
+
+    def __init__(self, model: str, oauth_token: str):
+        self._model = model
+        self.api_key = oauth_token
+        self.base_url = "claude-cli://local"
+        self.chat = _ClaudeCliChatShim(
+            _ClaudeCliCompletionsAdapter(model=model, oauth_token=oauth_token)
+        )
+        # No underlying HTTP client; present for cache-eviction duck-typing.
+        self._real_client = None
+
+    def close(self):
+        return None
+
+
+class _AsyncClaudeCliCompletionsAdapter:
+    def __init__(self, sync_adapter: _ClaudeCliCompletionsAdapter):
+        self._sync = sync_adapter
+
+    async def create(self, **kwargs) -> Any:
+        import asyncio
+
+        return await asyncio.to_thread(self._sync.create, **kwargs)
+
+
+class _AsyncClaudeCliChatShim:
+    def __init__(self, adapter: _AsyncClaudeCliCompletionsAdapter):
+        self.completions = adapter
+
+
+class AsyncClaudeCliAuxiliaryClient:
+    def __init__(self, sync_wrapper: "ClaudeCliAuxiliaryClient"):
+        sync_adapter = sync_wrapper.chat.completions
+        self.chat = _AsyncClaudeCliChatShim(
+            _AsyncClaudeCliCompletionsAdapter(sync_adapter)
+        )
+        self.api_key = sync_wrapper.api_key
+        self.base_url = sync_wrapper.base_url
+        self._real_client = None
+
+
+def _try_claude_cli_aux_client(
+    model: Optional[str] = None,
+) -> Tuple[Optional[Any], Optional[str]]:
+    """Build a Claude CLI aux client when binary + setup token are available."""
+    try:
+        from agent.transports.claude_cli import resolve_claude_bin
+        from agent.transports.claude_cli_session import resolve_claude_cli_oauth_token
+    except ImportError:
+        return None, None
+
+    try:
+        resolve_claude_bin(None)
+    except Exception as exc:
+        logger.info("claude_cli aux unavailable (binary): %s", exc)
+        return None, None
+
+    try:
+        token = resolve_claude_cli_oauth_token()
+    except Exception as exc:
+        logger.info("claude_cli aux unavailable (token): %s", exc)
+        return None, None
+
+    if not token:
+        return None, None
+
+    final_model = (model or "").strip() or "claude-opus-4-8"
+    return ClaudeCliAuxiliaryClient(model=final_model, oauth_token=token), final_model
+
+
 class _BedrockCompletionsAdapter:
     """Translates ``chat.completions.create(**kwargs)`` into Bedrock Converse."""
 
@@ -3170,6 +3383,18 @@ def _is_payment_error(exc: Exception) -> bool:
     if status == 402:
         return True
     err_lower = str(exc).lower()
+    # Model-scoped Claude product caps (e.g. "You've reached your Fable 5
+    # limit. Run /usage-credits to continue or switch models with /model.")
+    # contain the substring "credits" but are NOT provider-wide billing
+    # failures — other Claude models on the same account still work. Treat
+    # them as model-unavailable so MoA/aux does not mark all of anthropic
+    # unhealthy for 10 minutes after one capped model fails.
+    if (
+        "reached your" in err_lower
+        and "limit" in err_lower
+        and ("switch models" in err_lower or "usage-credits" in err_lower or "/model" in err_lower)
+    ):
+        return False
     # OpenRouter and other providers include "credits" or "afford" in 402 bodies,
     # but sometimes wrap them in 429 or other codes.
     # Daily quota exhaustion from Bedrock, Vertex AI, and similar providers
@@ -4842,6 +5067,8 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         return AsyncCodexAuxiliaryClient(sync_client), model
     if isinstance(sync_client, AnthropicAuxiliaryClient):
         return AsyncAnthropicAuxiliaryClient(sync_client), model
+    if isinstance(sync_client, ClaudeCliAuxiliaryClient):
+        return AsyncClaudeCliAuxiliaryClient(sync_client), model
     if isinstance(sync_client, BedrockAuxiliaryClient):
         return AsyncBedrockAuxiliaryClient(sync_client), model
     try:
@@ -5430,6 +5657,40 @@ def resolve_provider_client(
 
     if pconfig.auth_type == "api_key":
         if provider == "anthropic":
+            # Under claude_cli runtime, never open HTTP api.anthropic.com
+            # (extra-usage on Max setup tokens). Explicit provider=anthropic
+            # side-channels (MoA reference slots, pinned aux tasks) route
+            # through claude -p instead. Auto-detect still skips Anthropic
+            # entirely so title/compression don't spawn CLI by accident.
+            if _is_claude_cli_runtime_active(main_runtime):
+                client, default_model = _try_claude_cli_aux_client(model=model)
+                if client is None:
+                    logger.info(
+                        "resolve_provider_client: anthropic requested under "
+                        "claude_cli but Claude CLI aux is unavailable "
+                        "(binary/token). Refusing HTTP Anthropic."
+                    )
+                    return None, None
+                final_model = _normalize_resolved_model(
+                    model or default_model, provider
+                ) or (default_model or model or "claude-opus-4-8")
+                # Rebind model on the adapter if normalize changed it.
+                if final_model and final_model != getattr(client, "_model", None):
+                    try:
+                        client._model = final_model
+                        client.chat.completions._model = final_model
+                    except Exception:
+                        pass
+                logger.info(
+                    "resolve_provider_client: anthropic → claude_cli aux (%s)",
+                    final_model,
+                )
+                return (
+                    _to_async_client(client, final_model, is_vision=is_vision)
+                    if async_mode
+                    else (client, final_model)
+                )
+
             # Refuse HTTP Anthropic when main is claude_cli (or profile opts
             # into anthropic_runtime=claude_cli). Without this, explicit
             # provider="anthropic" aux tasks still bill extra usage.
@@ -5438,16 +5699,10 @@ def resolve_provider_client(
                 main_runtime=main_runtime,
             )
             if client is None:
-                if _is_claude_cli_runtime_active(main_runtime):
-                    logger.info(
-                        "resolve_provider_client: anthropic requested but "
-                        "claude_cli runtime forbids HTTP Anthropic aux"
-                    )
-                else:
-                    logger.warning(
-                        "resolve_provider_client: anthropic requested but no "
-                        "Anthropic credentials found"
-                    )
+                logger.warning(
+                    "resolve_provider_client: anthropic requested but no "
+                    "Anthropic credentials found"
+                )
                 return None, None
             final_model = _normalize_resolved_model(model or default_model, provider)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode else (client, final_model))

@@ -1551,6 +1551,25 @@ class MoAChatCompletions:
         max_tokens: Any = agg_kwargs.get("max_tokens")
         tools: Any = agg_kwargs.get("tools")
         extra_body: Any = agg_kwargs.get("extra_body")
+        agg_kwargs["messages"] = agg_messages
+        # xAI multi-agent models reject client-side tools without beta access:
+        #   "Client-side tools for multi-agent models require beta access"
+        # When such a model is the MoA aggregator/acting slot, drop tools so the
+        # turn can still run (references already ran; multi-agent synthesizes
+        # text-only). Other aggregators keep tools unchanged.
+        _agg_model = str(aggregator.get("model") or "").lower()
+        if "multi-agent" in _agg_model or "multi_agent" in _agg_model:
+            agg_kwargs.pop("tools", None)
+            agg_kwargs.pop("tool_choice", None)
+            if isinstance(agg_kwargs.get("extra_body"), dict):
+                extra = dict(agg_kwargs["extra_body"])
+                extra.pop("tools", None)
+                extra.pop("tool_choice", None)
+                agg_kwargs["extra_body"] = extra
+            logger.info(
+                "MoA aggregator %s: stripping client-side tools (multi-agent)",
+                _slot_label(aggregator),
+            )
         # Record the exact aggregator INPUT (incl. the injected reference
         # context) into the pending trace so a trace captures what the
         # aggregator actually saw, not a reconstruction. Traces are a

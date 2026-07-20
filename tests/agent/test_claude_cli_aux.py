@@ -315,8 +315,8 @@ def test_try_anthropic_refuses_http_when_claude_cli_main_runtime(monkeypatch):
     assert built["n"] == 0
 
 
-def test_resolve_provider_client_anthropic_refuses_claude_cli(monkeypatch):
-    """Explicit provider=anthropic still refuses HTTP under claude_cli."""
+def test_resolve_provider_client_anthropic_uses_claude_cli_aux(monkeypatch):
+    """Explicit provider=anthropic under claude_cli routes to Claude CLI aux, not HTTP."""
     built = {"n": 0}
 
     def _boom_build(*_a, **_k):
@@ -324,6 +324,16 @@ def test_resolve_provider_client_anthropic_refuses_claude_cli(monkeypatch):
         raise AssertionError("must not build HTTP anthropic")
 
     monkeypatch.setenv("HERMES_ANTHROPIC_RUNTIME", "claude_cli")
+
+    fake = aux.ClaudeCliAuxiliaryClient(
+        model="claude-haiku-4-5-20251001", oauth_token="fake-token"
+    )
+
+    monkeypatch.setattr(
+        aux,
+        "_try_claude_cli_aux_client",
+        lambda model=None: (fake, model or "claude-haiku-4-5-20251001"),
+    )
 
     with patch(
         "agent.anthropic_adapter.build_anthropic_client",
@@ -338,9 +348,20 @@ def test_resolve_provider_client_anthropic_refuses_claude_cli(monkeypatch):
                 "model": "claude-opus-4-8",
             },
         )
-    assert client is None
-    assert model is None
+    assert client is fake
+    assert model == "claude-haiku-4-5-20251001"
     assert built["n"] == 0
+
+
+def test_flatten_messages_for_claude_cli_splits_system_and_user():
+    system, user = aux._flatten_messages_for_claude_cli(
+        [
+            {"role": "system", "content": "You are an advisor."},
+            {"role": "user", "content": "Diagnose the bug."},
+        ]
+    )
+    assert system == "You are an advisor."
+    assert user == "Diagnose the bug."
 
 
 def test_resolve_auto_skips_http_anthropic_for_claude_cli(monkeypatch, caplog):
