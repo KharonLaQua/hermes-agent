@@ -3436,6 +3436,25 @@ def _is_remote_session() -> bool:
     return False
 
 
+def _stdio_is_tty() -> bool:
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def require_xai_oauth_interactive_terminal() -> None:
+    """Refuse to start xAI's browser/device authorization without a real TTY."""
+    if _stdio_is_tty():
+        return
+    raise AuthError(
+        "xAI OAuth login requires an interactive terminal; run `hermes model` from a terminal.",
+        provider="xai-oauth",
+        code="xai_oauth_requires_tty",
+        relogin_required=True,
+    )
+
+
 # Console/text-mode browsers that ``webbrowser`` will happily launch INSIDE
 # the terminal.  Opening one of these is worse than not opening anything —
 # it hijacks the user's TTY with an unusable text browser (the xAI OAuth
@@ -10501,6 +10520,8 @@ def _login_xai_oauth(
             if getattr(exc, "code", None) == "xai_shared_profile_disabled":
                 profile_disabled = True
             # Other AuthErrors (missing shared grant, etc.) fall through to login.
+
+    require_xai_oauth_interactive_terminal()
 
     # B2: any fresh device-code login writes the canonical store. When a
     # usable fleet grant already exists, require explicit confirmation so a

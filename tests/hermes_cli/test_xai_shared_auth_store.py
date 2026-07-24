@@ -748,7 +748,8 @@ def test_login_refuses_silent_replace_when_disabled(shared_env, monkeypatch):
     _write_shared(shared_env, access="fleet-at", refresh="fleet-rt", generation=3)
     auth.disable_profile_xai_shared_auth()
 
-    # Non-interactive decline
+    # Exercise the confirmation path under the interactive-terminal precondition.
+    monkeypatch.setattr(auth, "_stdio_is_tty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda *_a, **_k: "n")
     login_called = {"n": 0}
 

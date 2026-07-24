@@ -356,6 +356,11 @@ def auth_add_command(args) -> None:
                 "Disable shared mode (unset HERMES_XAI_SHARED_AUTH) only if you "
                 "intentionally want independent per-entry grants."
             )
+        try:
+            auth_mod.require_xai_oauth_interactive_terminal()
+        except auth_mod.AuthError as exc:
+            print(str(exc), file=sys.stderr)
+            raise SystemExit(1) from None
         creds = auth_mod._xai_oauth_device_code_login(
             timeout_seconds=getattr(args, "timeout", None) or 20.0,
             open_browser=not getattr(args, "no_browser", False),
