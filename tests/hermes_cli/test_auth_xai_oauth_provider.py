@@ -1177,6 +1177,9 @@ def test_login_xai_oauth_relogin_clears_suppression_and_reseeds(tmp_path, monkey
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.delenv("HERMES_XAI_BASE_URL", raising=False)
     monkeypatch.delenv("XAI_BASE_URL", raising=False)
+    # The production login path correctly requires a real interactive terminal;
+    # this unit test mocks the device-code exchange, so simulate that precondition.
+    monkeypatch.setattr("hermes_cli.auth._stdio_is_tty", lambda: True)
 
     # Post-remove state: singleton gone + device_code suppressed, so the
     # seed is gated off and the pool is empty.
