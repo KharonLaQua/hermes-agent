@@ -2036,24 +2036,40 @@ def _resolve_nous_runtime_api(*, force_refresh: bool = False) -> Optional[tuple[
 
 
 def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
-    """Resolve a fresh xAI OAuth (api_key, base_url) for auxiliary clients.
+    """Resolve fresh xAI OAuth credentials for auxiliary clients.
 
-    Prefer the credential pool, matching the main runtime/provider status
-    path.  Some xAI OAuth logins live only as pool entries; falling straight
-    to the singleton auth-store resolver would make auxiliary tasks such as
-    compression report "no provider configured" even though ``hermes auth
-    status`` shows xAI OAuth as logged in.
-
-    Falls back to ``hermes_cli.auth``'s singleton runtime resolver for older
-    auth-store-only logins. Returns ``None`` if the user is not authenticated
-    with xAI Grok OAuth.
+    Shared mode is fail-closed: the canonical resolver is the only allowed
+    source, so a disabled profile or missing/corrupt shared store can never
+    fall through to a stale legacy pool entry. Legacy mode retains the pool-
+    first behavior for older pool-only and auth-store-only logins.
     """
     try:
         from hermes_cli.auth import (
             DEFAULT_XAI_OAUTH_BASE_URL,
+            _xai_shared_auth_enabled,
             _xai_validate_inference_base_url,
+            resolve_xai_oauth_runtime_credentials,
         )
+    except Exception as exc:
+        logger.debug("Auxiliary xAI OAuth auth helper import failed: %s", exc)
+        return None
 
+    if _xai_shared_auth_enabled():
+        try:
+            creds = resolve_xai_oauth_runtime_credentials()
+        except Exception as exc:
+            logger.debug(
+                "Auxiliary shared xAI OAuth credential resolution failed closed: %s",
+                exc,
+            )
+            return None
+        api_key = str(creds.get("api_key") or "").strip()
+        base_url = str(creds.get("base_url") or "").strip().rstrip("/")
+        if not api_key or not base_url:
+            return None
+        return api_key, base_url
+
+    try:
         pool = load_pool("xai-oauth")
         if pool and pool.has_credentials():
             entry = pool.select()
@@ -2076,8 +2092,6 @@ def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
         logger.debug("Auxiliary xAI OAuth pool credential resolution failed: %s", exc)
 
     try:
-        from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
-
         creds = resolve_xai_oauth_runtime_credentials()
     except Exception as exc:
         logger.debug("Auxiliary xAI OAuth runtime credential resolution failed: %s", exc)

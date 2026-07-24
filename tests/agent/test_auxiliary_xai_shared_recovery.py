@@ -67,6 +67,57 @@ def test_auth_refresh_provider_detects_api_x_ai():
     )
 
 
+def test_aux_shared_mode_prefers_canonical_over_legacy_pool(monkeypatch):
+    """Shared mode must never let a stale pool entry outrank the canonical grant."""
+    from agent import auxiliary_client as aux
+
+    legacy_pool = MagicMock()
+    legacy_pool.has_credentials.return_value = True
+    legacy_pool.select.return_value = SimpleNamespace(
+        runtime_api_key="legacy-at",
+        runtime_base_url="https://api.x.ai/v1",
+    )
+    monkeypatch.setattr(aux, "load_pool", lambda _provider: legacy_pool)
+    monkeypatch.setattr(auth, "_xai_shared_auth_enabled", lambda: True)
+    monkeypatch.setattr(
+        auth,
+        "resolve_xai_oauth_runtime_credentials",
+        lambda: {"api_key": "canonical-at", "base_url": "https://api.x.ai/v1"},
+    )
+
+    assert aux._resolve_xai_oauth_for_aux() == (
+        "canonical-at",
+        "https://api.x.ai/v1",
+    )
+    legacy_pool.select.assert_not_called()
+
+
+def test_aux_shared_mode_canonical_failure_does_not_fallback_pool(monkeypatch):
+    """Profile disable/corrupt shared state must fail closed, not use legacy pool."""
+    from agent import auxiliary_client as aux
+
+    legacy_pool = MagicMock()
+    legacy_pool.has_credentials.return_value = True
+    legacy_pool.select.return_value = SimpleNamespace(
+        runtime_api_key="legacy-at",
+        runtime_base_url="https://api.x.ai/v1",
+    )
+    monkeypatch.setattr(aux, "load_pool", lambda _provider: legacy_pool)
+    monkeypatch.setattr(auth, "_xai_shared_auth_enabled", lambda: True)
+
+    def fail_closed():
+        raise auth.AuthError(
+            "Shared xAI OAuth is disabled for this profile.",
+            provider="xai-oauth",
+            code="profile_disabled",
+        )
+
+    monkeypatch.setattr(auth, "resolve_xai_oauth_runtime_credentials", fail_closed)
+
+    assert aux._resolve_xai_oauth_for_aux() is None
+    legacy_pool.select.assert_not_called()
+
+
 def test_refresh_provider_credentials_passes_rejected_bearer(shared_env, monkeypatch):
     """D1: shared recovery force-refreshes with the rejected bearer (no double POST)."""
     from agent.auxiliary_client import _refresh_provider_credentials
