@@ -436,6 +436,37 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
         agent._cached_system_prompt = stored_prompt
+        # Reconstruct the cross-session-stable prefix for the early cache
+        # breakpoint. The static prefix is not persisted (only the full
+        # prompt is), so gateway surfaces that build a fresh AIAgent per
+        # turn would otherwise lose the two-block system layout after the
+        # first turn — flip-flopping the wire shape mid-conversation and
+        # silently degrading to the legacy single-breakpoint layout.
+        #
+        # Safety: the rebuilt stable tier is used ONLY when the restored
+        # prompt literally starts with it (checked here AND re-checked by
+        # ``_apply_system_cache_markers``'s ``startswith`` gate). If any
+        # stable-tier input changed since the prompt was persisted (skills
+        # edited, identity changed), the prefix mismatches, ``_static``
+        # stays None, and the request falls back to the legacy layout with
+        # the restored prompt bytes untouched — never a rewritten prompt.
+        #
+        # Gated on ``_use_prompt_caching`` so non-Anthropic routes skip the
+        # rebuild entirely (the static prefix is only consumed by
+        # ``apply_anthropic_cache_control``).
+        if getattr(agent, "_use_prompt_caching", False):
+            try:
+                from agent.system_prompt import build_system_prompt_parts as _build_parts
+
+                _static = _build_parts(agent, system_message=system_message)["stable"]
+                if _static and stored_prompt.startswith(_static):
+                    agent._cached_system_prompt_static = _static
+            except Exception:
+                # Fail-open: restore continues with the legacy cache layout.
+                logger.debug(
+                    "static system-prefix reconstruction failed on restore",
+                    exc_info=True,
+                )
         return
     if stored_prompt:
         stored_state = "stale_runtime"
@@ -716,6 +747,136 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
+def _apply_context_engine_selection(
+    agent: Any,
+    api_messages: List[Dict[str, Any]],
+    conversation_messages: List[Dict[str, Any]],
+    incoming_message: Optional[Dict[str, Any]],
+    *,
+    logger: Any,
+) -> List[Dict[str, Any]]:
+    """Run the optional per-turn ``ContextEngine.select_context()`` hook.
+
+    Returns the (possibly replaced) request message list. The hook is for
+    context *selection / routing* (retrieval, topic routing, role switching),
+    which is distinct from compression and fires every turn independent of
+    ``should_compress()``.
+
+    Fail-open by design: a missing hook, any exception, or an invalid return
+    value yields the unmodified ``api_messages``. The result is request-only —
+    persisted conversation history is never mutated here.
+    """
+    engine = getattr(agent, "context_compressor", None)
+    if engine is None or not hasattr(engine, "select_context"):
+        return api_messages
+
+    # Skip the no-op base implementation so non-implementing engines —
+    # including the built-in ContextCompressor — pay nothing per request:
+    # no history copies below, no call. ``hasattr`` alone is not enough,
+    # because the ABC defines a default ``select_context`` that every engine
+    # inherits. Mirrors the base-method short-circuit in
+    # ``_notify_context_engine_turn_complete``. Lazy import avoids any import
+    # cycle with agent.context_engine.
+    try:
+        from agent.context_engine import ContextEngine as _CE
+        if getattr(engine.select_context, "__func__", None) is _CE.select_context:
+            return api_messages
+    except Exception:
+        pass
+
+    session_label = getattr(agent, "session_id", None) or "-"
+    # Pass shallow copies of the reference-only inputs so an engine that
+    # mutates them in place cannot alter persisted transcript state. Only
+    # ``request_messages`` (the per-call request list) is meant to be acted on,
+    # and it may be replaced wholesale via the return value — never mutated in
+    # place either. ``conversation_messages`` / ``incoming_message`` are
+    # read-only context; copying enforces the request-only contract rather than
+    # merely documenting it.
+    _conv_copy = [dict(m) if isinstance(m, dict) else m for m in conversation_messages] \
+        if conversation_messages is not None else None
+    _incoming_copy = dict(incoming_message) if isinstance(incoming_message, dict) else incoming_message
+    try:
+        selected = engine.select_context(
+            api_messages,
+            conversation_messages=_conv_copy,
+            incoming_message=_incoming_copy,
+            budget_tokens=getattr(engine, "context_length", 0) or 0,
+        )
+    except Exception:
+        logger.warning(
+            "Context engine select_context hook failed; using unmodified "
+            "request messages (session=%s)",
+            session_label,
+            exc_info=True,
+        )
+        return api_messages
+
+    if selected is None:
+        return api_messages
+    # Require a NON-EMPTY list of dicts. An empty list must fall open to the
+    # original request: ``all([])`` is ``True``, so without the emptiness check
+    # a ``[]`` returned by a buggy/failing engine would replace a valid request
+    # with an empty message list that the downstream sanitizers cannot restore,
+    # reaching the provider as an invalid request instead of failing open.
+    if isinstance(selected, list) and selected and all(isinstance(m, dict) for m in selected):
+        return selected
+
+    logger.warning(
+        "Context engine select_context returned an invalid value "
+        "(not a non-empty list of dicts); ignoring (session=%s)",
+        session_label,
+    )
+    return api_messages
+
+
+def _notify_context_engine_turn_complete(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    *,
+    usage: Optional[Dict[str, Any]] = None,
+    logger: Any,
+    **meta: Any,
+) -> None:
+    """Notify the active context engine that a user turn has finished.
+
+    Calls the optional ``ContextEngine.on_turn_complete()`` observation hook
+    once per turn, after the assistant/tool loop has produced the finalized
+    transcript. The complement to ``select_context()`` (pre-request selection):
+    this lets an engine ingest / index / summarize the completed turn.
+
+    Fail-open: a missing or no-op hook, or any exception, is swallowed.
+    ``messages`` is passed as a shallow copy so the engine cannot mutate the
+    persisted transcript.
+    """
+    engine = getattr(agent, "context_compressor", None)
+    hook = getattr(engine, "on_turn_complete", None)
+    if engine is None or not callable(hook):
+        return
+
+    # Skip the no-op base implementation so non-implementing engines (incl.
+    # the built-in compressor) pay nothing per turn. Lazy import avoids any
+    # import cycle with agent.context_engine.
+    try:
+        from agent.context_engine import ContextEngine as _CE
+        if getattr(hook, "__func__", None) is _CE.on_turn_complete:
+            return
+    except Exception:
+        pass
+
+    try:
+        hook(
+            [dict(m) if isinstance(m, dict) else m for m in messages],
+            usage=usage,
+            **meta,
+        )
+    except Exception:
+        logger.warning(
+            "Context engine on_turn_complete hook failed (session=%s)",
+            getattr(agent, "session_id", None) or "-",
+            exc_info=True,
+        )
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -854,6 +1015,13 @@ def run_conversation(
     # so this tally caps same-entry refreshes and lets the fallback chain take
     # over instead of spinning. Reset here so each turn starts fresh. See #26080.
     agent._auth_pool_refresh_counts = {}
+
+    # Reset the per-turn usage holder forwarded to the context engine's
+    # on_turn_complete() observation hook. Set after each successful provider
+    # response (see below); left as None on turns that never reach a response
+    # (early failure / interrupt) so the hook receives None rather than a
+    # stale prior turn's usage.
+    agent._last_turn_usage = None
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -1191,9 +1359,9 @@ def run_conversation(
         #
         # Hermes invariant: the system prompt is built ONCE per session
         # (cached on ``_cached_system_prompt``) and replayed verbatim on
-        # every turn.  We send it as a single content string so the
-        # bytes are byte-stable across turns and upstream prompt caches
-        # stay warm.
+        # every turn. ``apply_anthropic_cache_control`` may split its stable
+        # prefix into content blocks on the wire, but the stored string and
+        # its byte-stability remain unchanged.
         effective_system = active_system_prompt or ""
         if agent.ephemeral_system_prompt:
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
@@ -1258,18 +1426,25 @@ def run_conversation(
             for idx, pfm in enumerate(agent.prefill_messages):
                 api_messages.insert(sys_offset + idx, pfm.copy())
 
-        # Apply Anthropic prompt caching for Claude models on native
-        # Anthropic, OpenRouter, and third-party Anthropic-compatible
-        # gateways. Auto-detected: if ``_use_prompt_caching`` is set,
-        # inject cache_control breakpoints (system + last 3 messages)
-        # to reduce input token costs by ~75% on multi-turn
-        # conversations.
-        if agent._use_prompt_caching:
-            api_messages = apply_anthropic_cache_control(
-                api_messages,
-                cache_ttl=agent._cache_ttl,
-                native_anthropic=agent._use_native_cache_layout,
-            )
+        # Per-turn context selection hook (additive, no-op by default).
+        # Lets a context engine select/replace which context enters the
+        # prompt for THIS call only — retrieval, topic routing, role/branch
+        # switching — distinct from compression and independent of
+        # should_compress(). Request-only: persisted history is untouched, so
+        # caching/sanitization below operate on whatever the engine selected.
+        # Fail-open (see _apply_context_engine_selection).
+        _sel_incoming = (
+            messages[current_turn_user_idx]
+            if 0 <= current_turn_user_idx < len(messages)
+            else None
+        )
+        api_messages = _apply_context_engine_selection(
+            agent,
+            api_messages,
+            messages,
+            _sel_incoming,
+            logger=request_logger,
+        )
 
         # Safety net: strip orphaned tool results / add stubs for missing
         # results before sending to the API.  Runs unconditionally — not
@@ -1328,6 +1503,39 @@ def run_conversation(
         # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
+
+        # Apply Anthropic prompt caching for Claude models on native
+        # Anthropic, OpenRouter, and third-party Anthropic-compatible
+        # gateways. Auto-detected: if ``_use_prompt_caching`` is set, inject
+        # cache_control breakpoints for the static system prefix, full system
+        # prompt, and last two messages (or the legacy system-and-3 layout
+        # when no static prefix is available).
+        #
+        # Runs LAST, after every message mutation above. Marking earlier
+        # defeats the prefix stability the mutations exist to create:
+        # ``_apply_cache_marker`` rewrites ``content`` from a plain string
+        # into a ``[{"type": "text", ...}]`` block, so the marked messages
+        # no longer match the ``isinstance(content, str)`` test in the
+        # whitespace-normalization pass and silently keep their raw
+        # leading/trailing whitespace. A tool result ending in "\n" is
+        # therefore sent unstripped while it sits in the last-3 window and
+        # stripped once it rolls out of it — the same message, different
+        # bytes on consecutive turns, which breaks the prefix match at
+        # exactly the point the breakpoints were meant to protect. Marking
+        # last also keeps breakpoints off messages that the orphan sweep or
+        # the thinking-only drop is about to remove or merge away.
+        if agent._use_prompt_caching:
+            _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
+            api_messages = apply_anthropic_cache_control(
+                api_messages,
+                cache_ttl=agent._cache_ttl,
+                native_anthropic=agent._use_native_cache_layout,
+                static_system_prefix=(
+                    _static_system_prefix
+                    if isinstance(_static_system_prefix, str)
+                    else None
+                ),
+            )
 
         # Build a persistent-MoA request before measuring compression pressure.
         # MoA reference output is injected into the aggregator prompt, but it
@@ -2670,6 +2878,14 @@ def run_conversation(
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
                     agent.context_compressor.update_from_response(usage_dict)
+
+                    # Stash this response's canonical usage so the post-turn
+                    # on_turn_complete() observation hook can forward it (the
+                    # same dict shape passed to update_from_response). A turn
+                    # may make several API calls; the engine's per-turn signal
+                    # of interest is the cost/size of the latest assembled
+                    # request, so we keep the most recent call's usage.
+                    agent._last_turn_usage = dict(usage_dict)
                 elif getattr(
                     agent.context_compressor,
                     "awaiting_real_usage_after_compression",
@@ -5502,6 +5718,10 @@ def run_conversation(
                 # flag so it can fire again if the model goes empty on
                 # a LATER tool round.
                 agent._post_tool_empty_retried = False
+                # A landed tool call means any earlier dropped-tool-call stall
+                # was recovered — refresh that budget too so it guards each
+                # stall independently rather than capping the whole run.
+                agent._dropped_toolcall_retries = 0
 
                 previous_msg = messages[-1] if messages else None
                 current_interim_visible = agent._interim_assistant_visible_text(assistant_msg)
@@ -5750,11 +5970,26 @@ def run_conversation(
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages
                 
+                # Touch activity before continuing so the gateway's
+                # inactivity monitor never sees a stale timestamp
+                # between tool completion and the start of the next
+                # API call.  Without this, a tool-call result (which
+                # takes ~0s to process) followed by slow post-tool
+                # processing (compression, persist) and a slow
+                # follow-up API call can exceed the gateway inactivity
+                # timeout (HERMES_AGENT_TIMEOUT, default 1800s) and the
+                # gateway kills the session before the next activity
+                # touch fires (#69559, #69131).
+                agent._touch_activity(f"tool results posted, continuing iteration #{api_call_count}")
                 # Continue loop for next response
                 continue
             
             else:
-                # No tool calls - this is the final response
+                # No tool calls - this is the final response.
+                # (Dropped tool-call recovery — finish_reason=="tool_calls" with
+                # an empty tool_calls array — is handled at the finalization
+                # chokepoint below, after final_msg is built, so it catches
+                # every path that reaches turn finalization, not just this one.)
                 final_response = assistant_message.content or ""
                 
                 # Fix: unmute output when entering the no-tool-call branch
@@ -6086,6 +6321,64 @@ def run_conversation(
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
+                # ── Dropped tool-call recovery (copilot/Claude) ────────
+                # Some providers (observed: claude-opus-4.8 / claude-sonnet-4.5
+                # on GitHub Copilot, ~2026-07) return finish_reason="tool_calls"
+                # while the parsed tool_calls array is empty — the model
+                # signalled it wanted to act but the payload shipped no call.
+                # Reaching finalization with that mismatch means the turn is
+                # about to end with the task unstarted (the narration, which may
+                # be in content or only in the reasoning field, gets treated as
+                # the final answer). Re-prompt (bounded to 3 CONSECUTIVE stalls;
+                # the budget resets after any successful tool round) to make the
+                # model emit the call instead of exiting. finish_reason="stop"
+                # text finishes never enter this guard.
+                if (
+                    finish_reason == "tool_calls"
+                    and not assistant_message.tool_calls
+                    and getattr(agent, "_dropped_toolcall_retries", 0) < 3
+                ):
+                    agent._dropped_toolcall_retries = getattr(agent, "_dropped_toolcall_retries", 0) + 1
+                    logger.warning(
+                        "finish_reason=tool_calls with empty tool_calls array "
+                        "(narration only) — re-prompting to emit the call "
+                        "(retry %d/3, model=%s provider=%s)",
+                        agent._dropped_toolcall_retries, agent.model, agent.provider,
+                    )
+                    agent._emit_status(
+                        "↻ Model signaled a tool call but sent none — "
+                        f"re-prompting ({agent._dropped_toolcall_retries}/3)"
+                    )
+                    # Both halves of the re-prompt pair are ephemeral recovery
+                    # scaffolding (mirrors the empty-response nudge pattern):
+                    # the interim narration-only assistant turn exists solely to
+                    # keep role alternation valid for the nudge, and the nudge
+                    # exists solely to drive the retry. Flag both so the
+                    # persistence layer never writes them to the durable
+                    # transcript and the finalization pop below can strip an
+                    # unanswered tail pair. A recovered (answered) pair stays
+                    # buried mid-list in live memory but is skipped by the
+                    # flush regardless of position.
+                    final_msg["_dropped_toolcall_nudge"] = True
+                    messages.append(final_msg)
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Your previous turn indicated a tool call but none was "
+                            "included. Do not narrate a plan or restate intent — issue "
+                            "the actual tool call now to continue the task."
+                        ),
+                        "_dropped_toolcall_nudge": True,
+                    })
+                    agent._session_messages = messages
+                    final_response = None
+                    continue
+
+                # Reached finalization without the dropped-tool-call mismatch —
+                # a genuine turn end. Clear the consecutive-stall budget so the
+                # next turn starts fresh.
+                agent._dropped_toolcall_retries = 0
+
                 # Pop thinking-only prefill and empty-response retry
                 # scaffolding before appending either a final response or a
                 # verification-stop follow-up. These internal turns are only
@@ -6098,6 +6391,7 @@ def run_conversation(
                         messages[-1].get("_thinking_prefill")
                         or messages[-1].get("_empty_recovery_synthetic")
                         or messages[-1].get("_empty_terminal_sentinel")
+                        or messages[-1].get("_dropped_toolcall_nudge")
                     )
                 ):
                     messages.pop()
