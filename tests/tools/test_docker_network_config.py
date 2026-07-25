@@ -130,10 +130,7 @@ def _reuse_guard_harness(monkeypatch, *, existing_mode: str, network: bool):
             stdout = ""
 
         if len(cmd) > 1 and cmd[1] == "ps":
-            # Matches the egress-aware reuse probe: with egress off the
-            # format string is ID\tState\tEgressLabel and docker renders a
-            # missing label as "<no value>".
-            Result.stdout = "existing-container-id\trunning\t<no value>\n"
+            Result.stdout = "existing-container-id\trunning\n"
         elif len(cmd) > 1 and cmd[1] == "inspect":
             Result.stdout = f"{existing_mode}\n"
         elif len(cmd) > 1 and cmd[1] == "run":

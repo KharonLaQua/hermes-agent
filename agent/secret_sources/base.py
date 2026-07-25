@@ -295,7 +295,7 @@ def run_secret_cli(
             list(argv),
             env=env,
             capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
+            text=True,
             timeout=timeout,
             stdin=subprocess.DEVNULL,
         )

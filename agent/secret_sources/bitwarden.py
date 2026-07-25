@@ -200,7 +200,7 @@ def _platform_asset_name() -> str:
             res = subprocess.run(
                 ["ldd", "--version"],
                 capture_output=True,
-                text=True, encoding='utf-8', errors='replace',
+                text=True,
                 timeout=2,
                 stdin=subprocess.DEVNULL,
             )
@@ -684,7 +684,7 @@ def _run_bws_list(
             cmd,
             env=env,
             capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
+            text=True,
             timeout=_BWS_RUN_TIMEOUT,
             stdin=subprocess.DEVNULL,
         )

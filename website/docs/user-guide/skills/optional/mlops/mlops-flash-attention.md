@@ -1,14 +1,14 @@
 ---
-title: "Optimizing Attention Flash — Speed up long-sequence transformer training and inference"
+title: "Optimizing Attention Flash"
 sidebar_label: "Optimizing Attention Flash"
-description: "Speed up long-sequence transformer training and inference"
+description: "Optimizes transformer attention with Flash Attention for 2-4x speedup and 10-20x memory reduction"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Optimizing Attention Flash
 
-Speed up long-sequence transformer training and inference.
+Optimizes transformer attention with Flash Attention for 2-4x speedup and 10-20x memory reduction. Use when training/running transformers with long sequences (>512 tokens), encountering GPU memory issues with attention, or need faster inference. Supports PyTorch native SDPA, flash-attn library, H100 FP8, and sliding window attention.
 
 ## Skill metadata
 

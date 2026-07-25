@@ -78,7 +78,6 @@ def test_gated_status_is_public(gated_app):
 
 
 @pytest.mark.parametrize("path", [
-    "/api/health",
     "/api/config/defaults",
     "/api/config/schema",
     "/api/model/info",

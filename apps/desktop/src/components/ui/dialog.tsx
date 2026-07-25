@@ -2,7 +2,6 @@ import { Dialog as DialogPrimitive } from 'radix-ui'
 import * as React from 'react'
 
 import { Button } from '@/components/ui/button'
-import { DialogPortalContainerContext } from '@/components/ui/dialog-portal-context'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { X } from '@/lib/icons'
@@ -86,15 +85,6 @@ function DialogContent({
 
   const widthClass = fitContent ? 'w-auto max-w-[92vw]' : 'w-full max-w-lg'
 
-  // Publish the dialog's content node so popovers (Select / Popover /
-  // DropdownMenu) opened inside it portal INTO the dialog instead of
-  // document.body. That keeps them as DOM descendants — focus never leaves the
-  // dialog, so dismissing a dropdown (or clicking another field) no longer
-  // trips the Dialog's outside-interaction/focus-out close. See
-  // dialog-portal-context.ts. State (not just a ref) so consumers re-render once
-  // the node mounts.
-  const [contentNode, setContentNode] = React.useState<HTMLElement | null>(null)
-
   // No default here — Radix's normal autofocus (first focusable element, often
   // an input) is what most dialogs want. Dialogs with no input should pass
   // `onOpenAutoFocus={preventCloseButtonAutoFocus}` explicitly instead.
@@ -139,28 +129,25 @@ function DialogContent({
           )}
           data-slot="dialog-content"
           onOpenAutoFocus={onOpenAutoFocus}
-          ref={setContentNode}
           {...props}
         >
-          <DialogPortalContainerContext.Provider value={contentNode}>
-            {/* Scroll lives on an inner box so this shell keeps a painted bottom radius. */}
-            <div className="relative z-10 overflow-hidden rounded-xl border border-b-0 border-(--stroke-nous) bg-(--ui-chat-bubble-background)">
-              <div className="grid max-h-[calc(85vh-5rem)] min-h-0 gap-3 overflow-y-auto p-4">{children}</div>
-            </div>
-            <div
-              className={cn(
-                // Overlap by one corner radius so the white bottom lobes read clearly
-                // over the tint instead of meeting it on a straight seam.
-                'relative z-0 -mt-[var(--radius-xl)] px-4 pb-2.5 pt-[calc(var(--radius-xl)+0.625rem)] text-center text-[length:var(--conversation-tool-font-size)] leading-relaxed shadow-[inset_0_7px_7px_-4px_rgb(0_0_0/0.28)]',
-                DIALOG_BANNER_TONES[bannerTone]
-              )}
-              data-slot="dialog-banner"
-              role={bannerTone === 'error' ? 'alert' : 'status'}
-            >
-              {banner}
-            </div>
-            {closeButton}
-          </DialogPortalContainerContext.Provider>
+          {/* Scroll lives on an inner box so this shell keeps a painted bottom radius. */}
+          <div className="relative z-10 overflow-hidden rounded-xl border border-b-0 border-(--stroke-nous) bg-(--ui-chat-bubble-background)">
+            <div className="grid max-h-[calc(85vh-5rem)] min-h-0 gap-3 overflow-y-auto p-4">{children}</div>
+          </div>
+          <div
+            className={cn(
+              // Overlap by one corner radius so the white bottom lobes read clearly
+              // over the tint instead of meeting it on a straight seam.
+              'relative z-0 -mt-[var(--radius-xl)] px-4 pb-2.5 pt-[calc(var(--radius-xl)+0.625rem)] text-center text-[length:var(--conversation-tool-font-size)] leading-relaxed shadow-[inset_0_7px_7px_-4px_rgb(0_0_0/0.28)]',
+              DIALOG_BANNER_TONES[bannerTone]
+            )}
+            data-slot="dialog-banner"
+            role={bannerTone === 'error' ? 'alert' : 'status'}
+          >
+            {banner}
+          </div>
+          {closeButton}
         </DialogPrimitive.Content>
       </DialogPortal>
     )
@@ -180,13 +167,10 @@ function DialogContent({
         )}
         data-slot="dialog-content"
         onOpenAutoFocus={onOpenAutoFocus}
-        ref={setContentNode}
         {...props}
       >
-        <DialogPortalContainerContext.Provider value={contentNode}>
-          {children}
-          {closeButton}
-        </DialogPortalContainerContext.Provider>
+        {children}
+        {closeButton}
       </DialogPrimitive.Content>
     </DialogPortal>
   )

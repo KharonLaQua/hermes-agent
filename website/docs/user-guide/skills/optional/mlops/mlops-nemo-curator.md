@@ -1,14 +1,14 @@
 ---
-title: "Nemo Curator — Curate LLM training data: dedupe, filter, PII redaction"
+title: "Nemo Curator — GPU-accelerated data curation for LLM training"
 sidebar_label: "Nemo Curator"
-description: "Curate LLM training data: dedupe, filter, PII redaction"
+description: "GPU-accelerated data curation for LLM training"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Nemo Curator
 
-Curate LLM training data: dedupe, filter, PII redaction.
+GPU-accelerated data curation for LLM training. Supports text/image/video/audio. Features fuzzy deduplication (16× faster), quality filtering (30+ heuristics), semantic deduplication, PII redaction, NSFW detection. Scales across GPUs with RAPIDS. Use for preparing high-quality training datasets, cleaning web data, or deduplicating large corpora.
 
 ## Skill metadata
 

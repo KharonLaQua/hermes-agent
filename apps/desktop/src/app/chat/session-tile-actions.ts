@@ -38,8 +38,7 @@ import {
   planEdit,
   planReload,
   planRestore,
-  runRewindSubmit,
-  truncateSubmitParams
+  runRewindSubmit
 } from '../session/hooks/use-prompt-actions/rewind'
 import { useSubmitPrompt } from '../session/hooks/use-prompt-actions/submit'
 import { type SubmitTextOptions } from '../session/hooks/use-prompt-actions/utils'
@@ -275,11 +274,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
       try {
         await requestGateway(
           'prompt.submit',
-          {
-            session_id: runtimeIdRef.current,
-            text: plan.text,
-            ...truncateSubmitParams(plan.truncateOrdinal)
-          },
+          { session_id: runtimeIdRef.current, text: plan.text, truncate_before_user_ordinal: plan.truncateOrdinal },
           PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
         )
       } catch (err) {

@@ -938,13 +938,16 @@ class TestSaveConfigAtomicity:
 
 
 class TestSanitizeEnvLines:
-    """Tests for semantics-preserving .env line normalization."""
+    """Tests for .env file corruption repair."""
 
-    def test_preserves_known_key_spelling_inside_value(self):
-        """Known KEY= text in a value is data, not a second assignment."""
+    def test_splits_concatenated_keys(self):
+        """Two KEY=VALUE pairs jammed on one line get split."""
         lines = ["ANTHROPIC_API_KEY=sk-ant-xxxOPENAI_BASE_URL=https://api.openai.com/v1\n"]
         result = _sanitize_env_lines(lines)
-        assert result == lines
+        assert result == [
+            "ANTHROPIC_API_KEY=sk-ant-xxx\n",
+            "OPENAI_BASE_URL=https://api.openai.com/v1\n",
+        ]
 
     def test_preserves_clean_file(self):
         """A well-formed .env file passes through unchanged (modulo trailing newlines)."""
@@ -968,30 +971,15 @@ class TestSanitizeEnvLines:
         result = _sanitize_env_lines(lines)
         assert result == ["FOO_BAR=baz\n"]
 
-    def test_migrate_reports_normalized_line_formatting(self, capsys):
-        latest_version = DEFAULT_CONFIG["_config_version"]
-        with (
-            patch("hermes_cli.config.sanitize_env_file", return_value=2),
-            patch(
-                "hermes_cli.config.check_config_version",
-                return_value=(latest_version, latest_version),
-            ),
-            patch("hermes_cli.config.read_raw_config", return_value={}),
-            patch("hermes_cli.config.get_missing_env_vars", return_value=[]),
-            patch("hermes_cli.config.get_missing_config_fields", return_value=[]),
-            patch("hermes_cli.config.get_missing_skill_config_vars", return_value=[]),
-        ):
-            migrate_config(interactive=False)
-
-        assert capsys.readouterr().out == (
-            "  ✓ Normalized .env line formatting (2 line(s) changed)\n"
-        )
-
-    def test_multiple_known_key_spellings_inside_value_remain_opaque(self):
-        """Repeated known KEY= text cannot synthesize assignments."""
+    def test_three_concatenated_keys(self):
+        """Three known keys on one line all get separated."""
         lines = ["FAL_KEY=111FIRECRAWL_API_KEY=222GITHUB_TOKEN=333\n"]
         result = _sanitize_env_lines(lines)
-        assert result == lines
+        assert result == [
+            "FAL_KEY=111\n",
+            "FIRECRAWL_API_KEY=222\n",
+            "GITHUB_TOKEN=333\n",
+        ]
 
     def test_value_with_equals_sign_not_split(self):
         """A value containing '=' shouldn't be falsely split (lowercase in value)."""
@@ -1000,15 +988,19 @@ class TestSanitizeEnvLines:
         assert result == lines
 
     def test_unknown_keys_not_split(self):
-        """Unknown key names on one line remain opaque value data."""
+        """Unknown key names on one line are NOT split (avoids false positives)."""
         lines = ["CUSTOM_VAR=value123OTHER_THING=value456\n"]
         result = _sanitize_env_lines(lines)
-        assert result == lines
+        # Unknown keys stay on one line — no false split
+        assert len(result) == 1
 
-    def test_value_ending_with_digits_remains_opaque(self):
+    def test_value_ending_with_digits_still_splits(self):
+        """Concatenation is detected even when value ends with digits."""
         lines = ["OPENROUTER_API_KEY=sk-or-v1-abc123OPENAI_BASE_URL=https://api.openai.com/v1\n"]
         result = _sanitize_env_lines(lines)
-        assert result == lines
+        assert len(result) == 2
+        assert result[0].startswith("OPENROUTER_API_KEY=")
+        assert result[1].startswith("OPENAI_BASE_URL=")
 
     def test_glm_suffix_collision_not_split(self):
         """GLM_API_KEY / GLM_BASE_URL must not be mangled by LM_API_KEY / LM_BASE_URL suffixes (#17138)."""
@@ -1019,10 +1011,13 @@ class TestSanitizeEnvLines:
         result = _sanitize_env_lines(lines)
         assert result == lines, f"GLM_* lines were corrupted by suffix collision: {result}"
 
-    def test_suffix_superset_value_remains_opaque(self):
+    def test_suffix_collision_does_not_break_real_concatenation(self):
+        """A genuine concatenation that happens to start with a suffix-superset key still splits."""
         lines = ["GLM_API_KEY=glmLM_API_KEY=lm-key\n"]
         result = _sanitize_env_lines(lines)
-        assert result == lines
+        assert len(result) == 2
+        assert result[0].startswith("GLM_API_KEY=")
+        assert result[1].startswith("LM_API_KEY=")
 
     def test_value_embedding_known_key_not_split(self):
         """A single valid line whose value embeds a known KEY= (e.g. a URL with
@@ -1041,18 +1036,8 @@ class TestSanitizeEnvLines:
         result = _sanitize_env_lines(lines)
         assert result == lines, f"leading text was dropped: {result}"
 
-    def test_load_env_does_not_synthesize_variable_from_value(self, tmp_path):
-        """The loader must preserve assignment boundaries from the file."""
-        env_file = tmp_path / ".env"
-        env_file.write_text("OPENAI_API_KEY=fixtureGITHUB_TOKEN=inert\n")
-
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            env = load_env()
-
-        assert env == {"OPENAI_API_KEY": "fixtureGITHUB_TOKEN=inert"}
-
-    def test_save_env_value_preserves_existing_value_semantics(self, tmp_path):
-        """Writing another key must not reinterpret an existing value."""
+    def test_save_env_value_fixes_corruption_on_write(self, tmp_path):
+        """save_env_value sanitizes corrupted lines when writing a new key."""
         env_file = tmp_path / ".env"
         env_file.write_text(
             "ANTHROPIC_API_KEY=sk-antOPENAI_BASE_URL=https://api.openai.com/v1\n"
@@ -1064,11 +1049,13 @@ class TestSanitizeEnvLines:
             content = env_file.read_text()
             lines = content.strip().split("\n")
 
-            assert "ANTHROPIC_API_KEY=sk-antOPENAI_BASE_URL=https://api.openai.com/v1" in lines
-            assert "OPENAI_BASE_URL=https://api.openai.com/v1" not in lines
+            # Corrupted line should be split, new key added
+            assert "ANTHROPIC_API_KEY=sk-ant" in lines
+            assert "OPENAI_BASE_URL=https://api.openai.com/v1" in lines
             assert "MESSAGING_CWD=/tmp" in lines
 
-    def test_sanitize_env_file_does_not_rewrite_value_semantics(self, tmp_path):
+    def test_sanitize_env_file_returns_fix_count(self, tmp_path):
+        """sanitize_env_file reports how many entries were fixed."""
         env_file = tmp_path / ".env"
         env_file.write_text(
             "FAL_KEY=good\n"
@@ -1076,13 +1063,12 @@ class TestSanitizeEnvLines:
         )
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             fixes = sanitize_env_file()
-            assert fixes == 0
+            assert fixes > 0
 
+            # Verify file is now clean
             content = env_file.read_text()
-            assert content == (
-                "FAL_KEY=good\n"
-                "OPENROUTER_API_KEY=valFIRECRAWL_API_KEY=val2\n"
-            )
+            assert "OPENROUTER_API_KEY=val\n" in content
+            assert "FIRECRAWL_API_KEY=val2\n" in content
 
     def test_sanitize_env_file_noop_on_clean_file(self, tmp_path):
         """No changes when file is already clean."""

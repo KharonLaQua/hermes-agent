@@ -32,7 +32,6 @@ else:
 import argparse
 import asyncio
 import logging
-import os
 import sys
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -252,13 +251,11 @@ def main(argv: list[str] | None = None) -> None:
     # MCP servers dynamically via asyncio.to_thread inside the event
     # loop; that path is unaffected.)  Moved from model_tools.py module
     # scope to avoid freezing the gateway's loop on lazy import (#16856).
-    # Metadata-only hosts can opt out of unrelated global MCP startup.
-    if os.environ.get("HERMES_ACP_SKIP_CONFIGURED_MCP", "").strip() != "1":
-        try:
-            from tools.mcp_tool import discover_mcp_tools
-            discover_mcp_tools()
-        except Exception:
-            logger.debug("MCP tool discovery failed at ACP startup", exc_info=True)
+    try:
+        from tools.mcp_tool import discover_mcp_tools
+        discover_mcp_tools()
+    except Exception:
+        logger.debug("MCP tool discovery failed at ACP startup", exc_info=True)
 
     agent = HermesACPAgent()
     try:

@@ -672,14 +672,8 @@ def test_slot_max_tokens_absent_by_default():
 # --- fanout cadence normalization (every_n) ---
 
 
-def test_fanout_defaults_to_user_turn():
-    # Default is the cheapest cadence (#67199): advisors once per user turn.
+def test_fanout_defaults_to_per_iteration():
     cfg = normalize_moa_config({})
-    assert cfg["fanout"] == "user_turn"
-
-
-def test_fanout_per_iteration_still_selectable():
-    cfg = normalize_moa_config({"fanout": "per_iteration"})
     assert cfg["fanout"] == "per_iteration"
 
 
@@ -695,15 +689,14 @@ def test_fanout_every_n_mapping_form_normalized_to_string():
 
 
 def test_fanout_every_n_degenerate_n_falls_back():
-    # n=1 means "every iteration" — that semantically IS per_iteration;
-    # n=0 / negative / garbage is unparseable and falls to the default
-    # cadence (user_turn, the cheapest — #67199).
+    # n=1 means "every iteration" — that IS per_iteration; n=0 / negative /
+    # garbage must never produce a broken cadence string.
     assert normalize_moa_config({"fanout": "every_n:1"})["fanout"] == "per_iteration"
-    assert normalize_moa_config({"fanout": "every_n:0"})["fanout"] == "user_turn"
-    assert normalize_moa_config({"fanout": "every_n:-2"})["fanout"] == "user_turn"
-    assert normalize_moa_config({"fanout": "every_n:x"})["fanout"] == "user_turn"
-    assert normalize_moa_config({"fanout": "every_n"})["fanout"] == "user_turn"
-    assert normalize_moa_config({"fanout": {"mode": "every_n"}})["fanout"] == "user_turn"
+    assert normalize_moa_config({"fanout": "every_n:0"})["fanout"] == "per_iteration"
+    assert normalize_moa_config({"fanout": "every_n:-2"})["fanout"] == "per_iteration"
+    assert normalize_moa_config({"fanout": "every_n:x"})["fanout"] == "per_iteration"
+    assert normalize_moa_config({"fanout": "every_n"})["fanout"] == "per_iteration"
+    assert normalize_moa_config({"fanout": {"mode": "every_n"}})["fanout"] == "per_iteration"
 
 
 def test_fanout_every_n_round_trips_through_normalize():

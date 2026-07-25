@@ -423,90 +423,21 @@ def _check_s6_supervision(issues: list[str]) -> None:
     )
 
 
-def check_certificates(should_fix: bool = False, issues: "list | None" = None) -> None:
+def check_certificates() -> None:
     """Verify the certifi CA bundle is loadable.
 
     Surfaces the SSLConfigurationError user-friendly path before they hit
     a wall of tracebacks on the first outbound HTTPS call.
-
-    With ``--fix``, a broken bundle (missing/corrupt ``cacert.pem`` — e.g.
-    after a brew Python upgrade rebuilt the venv, #29866) is repaired by
-    force-reinstalling certifi into THIS interpreter's environment and
-    re-verifying.
     """
     try:
         from agent.ssl_guard import verify_ca_bundle_with_fallback
         from agent.errors import SSLConfigurationError
-    except Exception as e:
-        check_warn("SSL certificate check skipped", str(e))
-        return
-
-    try:
         verify_ca_bundle_with_fallback()
         check_ok("SSL CA certificate bundle is valid")
-        return
     except SSLConfigurationError as e:
-        first_error = str(e)
+        check_fail("SSL CA certificate bundle is broken", str(e))
     except Exception as e:
         check_warn("SSL certificate check skipped", str(e))
-        return
-
-    if not should_fix:
-        check_fail("SSL CA certificate bundle is broken", first_error)
-        if issues is not None:
-            issues.append(
-                "Repair the CA bundle: run `hermes doctor --fix`, or "
-                f"`{sys.executable} -m pip install --force-reinstall certifi`"
-            )
-        return
-
-    # --fix: force-reinstall certifi into the running interpreter's env and
-    # re-verify. importlib caches are invalidated so certifi.where() resolves
-    # the fresh install without a process restart.
-    check_fail("SSL CA certificate bundle is broken", first_error)
-    print("    → Repairing: force-reinstalling certifi...")
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--force-reinstall", "certifi"],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-    except Exception as exc:
-        check_fail("certifi repair could not run pip", str(exc))
-        if issues is not None:
-            issues.append(
-                f"Reinstall certifi manually: {sys.executable} -m pip install "
-                "--force-reinstall certifi"
-            )
-        return
-    if result.returncode != 0:
-        tail = (result.stderr or result.stdout or "")[-500:]
-        check_fail("certifi reinstall failed", tail)
-        if issues is not None:
-            issues.append(
-                f"Reinstall certifi manually: {sys.executable} -m pip install "
-                "--force-reinstall certifi"
-            )
-        return
-
-    # Drop any cached certifi module so where() re-resolves the new bundle.
-    import importlib
-    for mod_name in [m for m in sys.modules if m == "certifi" or m.startswith("certifi.")]:
-        sys.modules.pop(mod_name, None)
-    importlib.invalidate_caches()
-
-    try:
-        verify_ca_bundle_with_fallback()
-        check_ok("SSL CA certificate bundle repaired (certifi reinstalled)")
-    except SSLConfigurationError as e:
-        check_fail("SSL CA certificate bundle still broken after reinstall", str(e))
-        if issues is not None:
-            issues.append(
-                "certifi reinstall did not restore the CA bundle — check for a "
-                "custom CA env var (SSL_CERT_FILE/REQUESTS_CA_BUNDLE) pointing "
-                "at a missing file, or recreate the venv."
-            )
 
 
 def _check_gateway_service_linger(issues: list[str]) -> None:
@@ -823,12 +754,12 @@ def run_doctor(args):
         )
         if is_sqlite_wal_reset_vulnerable():
             # Warn-only: Hermes already refuses to enable WAL on fresh DBs.
-            # Do not append to ``issues`` because runtime repair remains
-            # best-effort and unsupported installs may need manual action.
+            # Do not append to ``issues`` — users often cannot change the
+            # SQLite embedded in python-build-standalone via `hermes update`.
             check_warn(
                 f"SQLite {_sqlite_ver} (WAL-reset bug)",
-                "(run `hermes update`; fixed versions: 3.51.3+ / 3.50.7 / "
-                "3.44.6 — see https://sqlite.org/wal.html#walresetbug)",
+                "(new shared DBs use DELETE; prefer 3.51.3+ / 3.50.7 / 3.44.6 — "
+                "see https://sqlite.org/wal.html#walresetbug)",
             )
         else:
             check_ok(f"SQLite {_sqlite_ver}")
@@ -848,7 +779,7 @@ def run_doctor(args):
     _check_version_consistency(issues)
 
     _section("SSL / CA Certificates")
-    check_certificates(should_fix=should_fix, issues=manual_issues)
+    check_certificates()
 
     _section("Required Packages")
     required_packages = [
@@ -887,13 +818,11 @@ def run_doctor(args):
     if env_path.exists():
         check_ok(f"{_DHH}/.env file exists")
         
-        # Prefer UTF-8 (.env is written as UTF-8 elsewhere). Fall back to
-        # latin-1 for Windows Notepad/cp1252 files that are not valid UTF-8 —
-        # matches hermes_cli.env_loader._load_dotenv_with_fallback.
-        try:
-            content = env_path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            content = env_path.read_text(encoding="latin-1")
+        # Check for common issues. Pin encoding to UTF-8 because .env files are
+        # written as UTF-8 everywhere in the codebase, while Path.read_text()
+        # defaults to the system locale — which crashes on non-UTF-8 Windows
+        # locales (e.g. GBK) as soon as the file contains any non-ASCII byte.
+        content = env_path.read_text(encoding="utf-8")
         if _has_provider_env_config(content):
             check_ok("API key or custom endpoint configured")
         else:
@@ -1743,7 +1672,7 @@ def run_doctor(args):
                 result = subprocess.run(
                     cmd,
                     capture_output=True,
-                    text=True, encoding='utf-8', errors='replace',
+                    text=True,
                     timeout=15
                 )
             except subprocess.TimeoutExpired:
@@ -1907,7 +1836,7 @@ def run_doctor(args):
                 audit_result = subprocess.run(
                     [_npm_bin, "audit", "--json", *audit_extra],
                     cwd=str(npm_dir),
-                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30,
+                    capture_output=True, text=True, timeout=30,
                 )
                 import json as _json
                 audit_data = _json.loads(audit_result.stdout) if audit_result.stdout.strip() else {}
@@ -2443,7 +2372,7 @@ def run_doctor(args):
         if lock_file.exists():
             try:
                 import json
-                lock_data = json.loads(lock_file.read_text(encoding="utf-8"))
+                lock_data = json.loads(lock_file.read_text())
                 count = len(lock_data.get("installed", {}))
                 check_ok(f"Lock file OK ({count} hub-installed skill(s))")
             except Exception:
@@ -2609,7 +2538,7 @@ def run_doctor(args):
                     if not wrapper.is_file():
                         continue
                     try:
-                        content = wrapper.read_text(encoding="utf-8")
+                        content = wrapper.read_text()
                         if "hermes -p" in content:
                             _m = _re.search(r"hermes -p (\S+)", content)
                             if _m and not profile_exists(_m.group(1)):

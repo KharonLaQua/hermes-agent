@@ -1259,7 +1259,7 @@ class WebhookAdapter(BasePlatformAdapter):
                     content,
                 ],
                 capture_output=True,
-                text=True, encoding='utf-8', errors='replace',
+                text=True,
                 timeout=30,
             )
             if result.returncode == 0:

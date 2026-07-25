@@ -14,8 +14,7 @@ export type Locale =
   | "ga"
   | "pt"
   | "ru"
-  | "hu"
-  | "ar";
+  | "hu";
 
 export interface Translations {
   // ── Common ──

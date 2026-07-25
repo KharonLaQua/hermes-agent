@@ -1,14 +1,14 @@
 ---
-title: "Blackbox — Delegate coding tasks to the Blackbox AI multi-model CLI"
+title: "Blackbox — Delegate coding tasks to Blackbox AI CLI agent"
 sidebar_label: "Blackbox"
-description: "Delegate coding tasks to the Blackbox AI multi-model CLI"
+description: "Delegate coding tasks to Blackbox AI CLI agent"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Blackbox
 
-Delegate coding tasks to the Blackbox AI multi-model CLI.
+Delegate coding tasks to Blackbox AI CLI agent. Multi-model agent with built-in judge that runs tasks through multiple LLMs and picks the best result. Requires the blackbox CLI and a Blackbox AI API key.
 
 ## Skill metadata
 

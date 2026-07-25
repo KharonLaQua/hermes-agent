@@ -120,16 +120,14 @@ class TestCompressionBoundaryHook:
                 )
             )
             agent.context_compressor = compressor
-            original_publish = db.publish_compression_child
+            original_update = db.update_system_prompt
 
-            def _record_publish(*args, **kwargs):
-                result = original_publish(*args, **kwargs)
+            def _record_update(*args, **kwargs):
+                result = original_update(*args, **kwargs)
                 events.append("persist")
                 return result
 
-            with patch.object(
-                db, "publish_compression_child", side_effect=_record_publish
-            ):
+            with patch.object(db, "update_system_prompt", side_effect=_record_update):
                 agent._compress_context(
                     [{"role": "user", "content": "request"}],
                     "sys",
@@ -176,7 +174,7 @@ class TestCompressionBoundaryHook:
 
             with patch.object(
                 db,
-                "publish_compression_child",
+                "update_system_prompt",
                 side_effect=RuntimeError("synthetic commit failure"),
             ):
                 agent._compress_context(

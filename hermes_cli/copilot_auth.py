@@ -147,7 +147,7 @@ def _try_gh_cli_token() -> Optional[str]:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True, encoding='utf-8', errors='replace',
+                text=True,
                 timeout=5,
                 env=clean_env,
                 **_popen_kwargs,

@@ -1,7 +1,7 @@
 import { getSession } from '@/hermes'
 import { assistantTextPart, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
-import { embeddedImageUrls, textWithoutEmbeddedImages, textWithoutImageRefs } from '@/lib/embedded-images'
+import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
@@ -211,10 +211,6 @@ export function reconcileResumeMessages(nextMessages: ChatMessage[], previousMes
 
     if (nextText === previousVisibleText || nextText === previousText.trim()) {
       preserved = preserveReasoningParts(preserved, previous)
-
-      if (message.role === 'user' && preserved.attachmentRefs === undefined && previous.attachmentRefs?.length) {
-        preserved = { ...preserved, attachmentRefs: [...previous.attachmentRefs] }
-      }
     }
 
     const previousImages = embeddedImageUrls(previousText)
@@ -310,7 +306,7 @@ export function preserveLocalPendingTurnMessages(
     if (
       isOptimisticUser &&
       latestAuthoritativeUser &&
-      textWithoutImageRefs(chatMessageText(latestAuthoritativeUser)) === textWithoutImageRefs(chatMessageText(message))
+      chatMessageText(latestAuthoritativeUser).trim() === chatMessageText(message).trim()
     ) {
       continue
     }
@@ -322,7 +318,7 @@ export function preserveLocalPendingTurnMessages(
         continue
       }
 
-      if (textWithoutImageRefs(chatMessageText(authoritative)) === textWithoutImageRefs(chatMessageText(message))) {
+      if (chatMessageText(authoritative).trim() === chatMessageText(message).trim()) {
         continue
       }
     }
@@ -349,13 +345,9 @@ export function appendLiveSessionProjection(
   const inflightUser = projection.inflight?.user?.trim() ?? ''
   const inflightAssistant = projection.inflight?.assistant ?? ''
   const inflightStreaming = Boolean(projection.inflight?.streaming)
-  // A retained failed turn (the gateway keeps error snapshots replayable when
-  // the terminal frame may have been lost to a disconnect) — surface the
-  // failure on the projected row instead of rendering the partial as healthy.
-  const inflightError = projection.inflight?.error?.trim() ?? ''
   const queuedUser = projection.queued?.user?.trim() ?? ''
 
-  if (!inflightUser && !inflightAssistant && !inflightStreaming && !inflightError && !queuedUser) {
+  if (!inflightUser && !inflightAssistant && !inflightStreaming && !queuedUser) {
     return messages
   }
 
@@ -367,9 +359,7 @@ export function appendLiveSessionProjection(
   // Only suppress the projection when the latest authoritative user row is the
   // same turn — older identical prompts must not hide a newly accepted repeat.
   const latestUser = [...messages].reverse().find(message => message.role === 'user')
-
-  const inflightUserAlreadyPersisted =
-    latestUser && textWithoutImageRefs(chatMessageText(latestUser)) === textWithoutImageRefs(inflightUser)
+  const inflightUserAlreadyPersisted = latestUser && chatMessageText(latestUser).trim() === inflightUser
 
   if (inflightUser && !inflightUserAlreadyPersisted) {
     projected.push({
@@ -381,13 +371,12 @@ export function appendLiveSessionProjection(
 
   // Keep a pending assistant boundary even before the first delta when a
   // queued user turn follows it. This preserves the two distinct turns.
-  if (inflightAssistant || inflightStreaming || inflightError || (inflightUser && queuedUser)) {
+  if (inflightAssistant || inflightStreaming || (inflightUser && queuedUser)) {
     projected.push({
       id: `assistant-stream-${sessionId}`,
       role: 'assistant',
       parts: inflightAssistant ? [assistantTextPart(inflightAssistant)] : [],
-      pending: inflightStreaming,
-      ...(inflightError ? { error: inflightError } : {})
+      pending: inflightStreaming
     })
   }
 

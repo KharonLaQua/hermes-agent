@@ -23,7 +23,6 @@ from __future__ import annotations
 import argparse
 import os
 import subprocess
-import urllib.parse
 
 from hermes_cli.config import clear_model_endpoint_credentials
 
@@ -839,13 +838,7 @@ def _model_flow_custom(config):
     """
     from hermes_cli.main import _auto_provider_name, _prompt_custom_api_mode_selection, _save_custom_provider
     from hermes_cli.auth import _save_model_choice, deactivate_provider
-    from hermes_cli.config import (
-        custom_endpoint_key_env,
-        get_env_value,
-        load_config,
-        save_config,
-        save_env_value,
-    )
+    from hermes_cli.config import get_env_value, load_config, save_config
     from hermes_cli.secret_prompt import masked_secret_prompt
 
     current_url = get_env_value("OPENAI_BASE_URL") or ""
@@ -1000,18 +993,6 @@ def _model_flow_custom(config):
             print(f"Invalid context length: {context_length_str} — will auto-detect.")
             context_length = None
 
-    # The key goes to .env and config.yaml only references it (#69449). Keyed
-    # on host:port so two servers on one machine keep separate credentials.
-    custom_key_env = ""
-    if effective_key:
-        _parsed = urllib.parse.urlparse(effective_url)
-        _identity = _parsed.hostname or ""
-        if _parsed.port:
-            _identity = f"{_identity}_{_parsed.port}"
-        custom_key_env = custom_endpoint_key_env(_identity)
-        save_env_value(custom_key_env, effective_key)
-        print(f"  API key saved to .env as {custom_key_env}")
-
     if model_name:
         _save_model_choice(model_name)
 
@@ -1023,8 +1004,8 @@ def _model_flow_custom(config):
             cfg["model"] = model
         model["provider"] = "custom"
         model["base_url"] = effective_url
-        if custom_key_env:
-            model["api_key"] = f"${{{custom_key_env}}}"
+        if effective_key:
+            model["api_key"] = effective_key
         if api_mode:
             model["api_mode"] = api_mode
         else:
@@ -1049,8 +1030,8 @@ def _model_flow_custom(config):
             _caller_model = {"default": _caller_model} if _caller_model else {}
         _caller_model["provider"] = "custom"
         _caller_model["base_url"] = effective_url
-        if custom_key_env:
-            _caller_model["api_key"] = f"${{{custom_key_env}}}"
+        if effective_key:
+            _caller_model["api_key"] = effective_key
         if api_mode:
             _caller_model["api_mode"] = api_mode
         else:
@@ -1066,7 +1047,6 @@ def _model_flow_custom(config):
         context_length=context_length,
         name=display_name,
         api_mode=api_mode,
-        key_env=custom_key_env,
     )
     _prune_replaced_custom_model_config_credentials(
         effective_url,

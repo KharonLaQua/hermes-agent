@@ -1,14 +1,14 @@
 ---
-title: "Qdrant Vector Search — Vector search engine for production RAG systems"
+title: "Qdrant Vector Search — High-performance vector similarity search engine for RAG and semantic search"
 sidebar_label: "Qdrant Vector Search"
-description: "Vector search engine for production RAG systems"
+description: "High-performance vector similarity search engine for RAG and semantic search"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Qdrant Vector Search
 
-Vector search engine for production RAG systems.
+High-performance vector similarity search engine for RAG and semantic search. Use when building production RAG systems requiring fast nearest neighbor search, hybrid search with filtering, or scalable vector storage with Rust-powered performance.
 
 ## Skill metadata
 

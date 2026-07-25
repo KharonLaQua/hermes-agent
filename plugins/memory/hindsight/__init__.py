@@ -496,9 +496,7 @@ def _load_simple_env(path) -> dict[str, str]:
         return {}
 
     values: dict[str, str] = {}
-    # utf-8-sig, not plain utf-8: this is also used on the Hermes .env during
-    # post_setup, and a Notepad BOM would otherwise stick to the first key.
-    for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
@@ -748,7 +746,7 @@ class HindsightMemoryProvider(MemoryProvider):
         existing = {}
         if config_path.exists():
             try:
-                existing = json.loads(config_path.read_text(encoding="utf-8"))
+                existing = json.loads(config_path.read_text())
             except Exception:
                 pass
         existing.update(values)
@@ -897,8 +895,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 env_path = Path(hermes_home) / ".env"
                 existing_llm_key = ""
                 if env_path.exists():
-                    # utf-8-sig: a Notepad BOM must not hide the first key.
-                    for line in env_path.read_text(encoding="utf-8-sig").splitlines():
+                    for line in env_path.read_text().splitlines():
                         if line.startswith("HINDSIGHT_LLM_API_KEY="):
                             existing_llm_key = line.split("=", 1)[1]
                             break
@@ -928,10 +925,7 @@ class HindsightMemoryProvider(MemoryProvider):
             env_path.parent.mkdir(parents=True, exist_ok=True)
             existing_lines = []
             if env_path.exists():
-                # utf-8-sig: a Notepad BOM would glue U+FEFF onto the first
-                # key, defeating the in-place update below and appending a
-                # duplicate line instead.
-                existing_lines = env_path.read_text(encoding="utf-8-sig").splitlines()
+                existing_lines = env_path.read_text().splitlines()
             updated_keys = set()
             new_lines = []
             for line in existing_lines:
@@ -944,7 +938,7 @@ class HindsightMemoryProvider(MemoryProvider):
             for k, v in env_writes.items():
                 if k not in updated_keys:
                     new_lines.append(f"{k}={v}")
-            env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+            env_path.write_text("\n".join(new_lines) + "\n")
 
         if mode == "local_embedded":
             materialized_config = dict(provider_config)

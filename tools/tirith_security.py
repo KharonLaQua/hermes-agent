@@ -315,7 +315,7 @@ def _verify_cosign(checksums_path: str, sig_path: str, cert_path: str) -> bool |
              "--certificate-oidc-issuer", _COSIGN_ISSUER,
              checksums_path],
             capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
+            text=True,
             timeout=15,
             stdin=subprocess.DEVNULL,
         )
@@ -776,7 +776,7 @@ def check_command_security(command: str) -> dict:
             [tirith_path, "check", "--json", "--non-interactive",
              "--shell", "posix", "--", command],
             capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
+            text=True,
             timeout=timeout,
             stdin=subprocess.DEVNULL,
         )

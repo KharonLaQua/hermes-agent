@@ -437,7 +437,7 @@ export function useMessageStream({
   )
 
   const completeAssistantMessage = useCallback(
-    (sessionId: string, text: string, responsePreviewed?: boolean, failure?: { error: string; partial: boolean }) => {
+    (sessionId: string, text: string, responsePreviewed?: boolean) => {
       let shouldHydrate = false
 
       const completedState = updateSessionState(sessionId, state => {
@@ -459,13 +459,7 @@ export function useMessageStream({
 
         const streamId = state.streamId
         const finalText = renderMediaTags(text).trim()
-        // Structured failure from the terminal frame wins over the legacy text
-        // heuristic ("Error: <provider detail>" texts don't match the regexes).
-        const completionError = failure?.error ?? completionErrorText(finalText)
-        // A partial failure's `text` is streamed output the user should keep,
-        // not the error string — settle it like a normal reply AND mark the
-        // bubble failed, instead of stripping the text.
-        const keepFailedPartialText = Boolean(failure?.partial && finalText)
+        const completionError = completionErrorText(finalText)
         const interimBoundaryPending = state.interimBoundaryPending
 
         const replaceTextPart = (parts: ChatMessagePart[]) => {
@@ -479,21 +473,15 @@ export function useMessageStream({
         const completeMessage = (message: ChatMessage): ChatMessage => {
           const settled = { ...message, pending: false, interim: false }
 
-          if (completionError && !keepFailedPartialText) {
-            return { ...settled, error: completionError, parts: message.parts.filter(part => part.type !== 'text') }
-          }
-
-          return {
-            ...settled,
-            parts: replaceTextPart(message.parts),
-            ...(completionError ? { error: completionError } : {})
-          }
+          return completionError
+            ? { ...settled, error: completionError, parts: message.parts.filter(part => part.type !== 'text') }
+            : { ...settled, parts: replaceTextPart(message.parts) }
         }
 
         const newAssistantFromCompletion = (): ChatMessage => ({
           id: `assistant-${Date.now()}`,
           role: 'assistant',
-          parts: completionError && !keepFailedPartialText ? [] : [assistantTextPart(finalText)],
+          parts: completionError ? [] : [assistantTextPart(finalText)],
           branchGroupId: state.pendingBranchGroup ?? undefined,
           ...(completionError && { error: completionError })
         })

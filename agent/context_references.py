@@ -19,7 +19,6 @@ REFERENCE_PATTERN = re.compile(
     rf"(?<![\w/])@(?:(?P<simple>diff|staged)\b|(?P<kind>file|folder|git|url):(?P<value>{_QUOTED_REFERENCE_VALUE}(?::\d+(?:-\d+)?)?|\S+))"
 )
 TRAILING_PUNCTUATION = ",.;!?"
-_NEEDS_QUOTING = re.compile(r"""[\s()\[\]{}<>"'`]""")
 _SENSITIVE_HOME_DIRS = (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".config/gh")
 _SENSITIVE_HERMES_DIRS = (Path("skills") / ".hub",)
 _SENSITIVE_HOME_FILES = (
@@ -59,21 +58,6 @@ class ContextReferenceResult:
     injected_tokens: int = 0
     expanded: bool = False
     blocked: bool = False
-
-
-def format_reference_value(value: str) -> str:
-    """Quote a reference value so ``REFERENCE_PATTERN`` reads it back whole.
-
-    The unquoted alternative in the pattern is ``\\S+``, so a path containing a
-    space parses as a truncated ref with the tail left behind as loose text.
-    Mirrors ``formatRefValue`` in the desktop's directive-text.tsx.
-    """
-    if not _NEEDS_QUOTING.search(value):
-        return value
-    for quote in ("`", '"', "'"):
-        if quote not in value:
-            return f"{quote}{value}{quote}"
-    return value
 
 
 def parse_context_references(message: str) -> list[ContextReference]:
@@ -324,7 +308,7 @@ def _expand_git_reference(
             ["git", *args],
             cwd=cwd,
             capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
+            text=True,
             timeout=30,
             stdin=subprocess.DEVNULL,
             **_popen_kwargs,
@@ -550,7 +534,7 @@ def _rg_files(path: Path, cwd: Path, limit: int) -> list[Path] | None:
             ["rg", "--files", str(path.relative_to(cwd))],
             cwd=cwd,
             capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
+            text=True,
             timeout=10,
             stdin=subprocess.DEVNULL,
             **_popen_kwargs,

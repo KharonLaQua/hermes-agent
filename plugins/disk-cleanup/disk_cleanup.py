@@ -110,12 +110,12 @@ def load_tracked() -> List[Dict[str, Any]]:
         return []
 
     try:
-        return json.loads(tf.read_text(encoding="utf-8"))
+        return json.loads(tf.read_text())
     except (json.JSONDecodeError, ValueError):
         bak = tf.with_suffix(".json.bak")
         if bak.exists():
             try:
-                data = json.loads(bak.read_text(encoding="utf-8"))
+                data = json.loads(bak.read_text())
                 _log("WARN: tracked.json corrupted — restored from .bak")
                 return data
             except Exception:
@@ -129,7 +129,7 @@ def save_tracked(tracked: List[Dict[str, Any]]) -> None:
     tf = get_tracked_file()
     tf.parent.mkdir(parents=True, exist_ok=True)
     tmp = tf.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(tracked, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(tracked, indent=2))
     if tf.exists():
         shutil.copy2(tf, tf.with_suffix(".json.bak"))
     tmp.replace(tf)

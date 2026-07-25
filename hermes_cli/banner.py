@@ -160,11 +160,6 @@ def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str
             ["git", *args],
             capture_output=True,
             text=True,
-            # git output is UTF-8; on Windows text=True defaults to the ANSI
-            # code page and bytes like 0x90 (3rd byte of 🐛 in a commit
-            # subject) crash the stdlib reader thread (#52649).
-            encoding="utf-8",
-            errors="replace",
             timeout=timeout,
             cwd=str(cwd),
         )
@@ -184,8 +179,7 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     try:
         result = subprocess.run(
             ["git", "ls-remote", _UPSTREAM_REPO_URL, "refs/heads/main"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=10,
+            capture_output=True, text=True, timeout=10,
         )
     except Exception:
         return None
@@ -247,8 +241,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     try:
         result = subprocess.run(
             ["git", "rev-list", "--count", "HEAD..origin/main"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=5,
+            capture_output=True, text=True, timeout=5,
             cwd=str(repo_dir),
         )
         if result.returncode == 0:
@@ -292,7 +285,7 @@ def check_for_updates() -> Optional[int]:
     now = time.time()
     try:
         if cache_file.exists():
-            cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            cached = json.loads(cache_file.read_text())
             if (
                 now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
                 and cached.get("rev") == embedded_rev
@@ -321,8 +314,7 @@ def check_for_updates() -> Optional[int]:
 
     try:
         cache_file.write_text(
-            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION}),
-            encoding="utf-8",
+            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION})
         )
     except Exception:
         pass
@@ -351,8 +343,6 @@ def _git_short_hash(repo_dir: Path, rev: str) -> Optional[str]:
             ["git", "rev-parse", "--short=8", rev],
             capture_output=True,
             text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=5,
             cwd=str(repo_dir),
         )
@@ -409,8 +399,6 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
             ["git", "rev-list", "--count", "origin/main..HEAD"],
             capture_output=True,
             text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=5,
             cwd=str(repo_dir),
         )
@@ -447,8 +435,6 @@ def get_latest_release_tag(repo_dir: Optional[Path] = None) -> Optional[tuple]:
             ["git", "describe", "--tags", "--abbrev=0"],
             capture_output=True,
             text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=3,
             cwd=str(repo_dir),
         )
