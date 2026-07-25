@@ -407,6 +407,18 @@ compression:
   # Enable automatic context compression (default: true)
   # Set to false if you prefer to manage context manually or want errors on overflow
   enabled: true
+
+  # Opt-in compression progress notices on chat platforms (default: false).
+  # By design, routine automatic compression is SILENT on human-facing chat
+  # gateways (Telegram, Discord, Slack, ...) — it happens in the background
+  # with server-side logging only. Set true to also deliver the routine
+  # progress statuses (compacting started, preflight/pre-API compression,
+  # idle compaction, retry progress, and the compaction-complete notice) to
+  # chat platforms. Unrelated operational noise (auxiliary model failures,
+  # provider retry chatter) stays suppressed either way, and compression
+  # FAILURE notices + manual /compress feedback are always visible
+  # regardless of this setting. (#52995)
+  progress_notices: false
   
   # Trigger compression at this % of model's context limit (default: 0.50 = 50%)
   # Lower values = more aggressive compression, higher values = compress later
@@ -786,6 +798,14 @@ agent:
   # cleans up, and exits. Set a positive value only if you want a grace
   # window on /restart, and keep it well under systemd's TimeoutStopSec.
   # restart_drain_timeout: 0
+
+  # Upper bound (seconds) a submitted prompt waits for the deferred agent
+  # build (MCP discovery, model metadata, skills scan) before failing with a
+  # visible error. The wait is patient — the message is delivered as soon as
+  # the build completes, and a progress notice is shown past 30s — so this cap
+  # only fires on a genuinely hung build. Raise it for deployments with many
+  # slow or unreachable MCP servers. Default 600.
+  # build_wait_timeout: 600
 
   # Max app-level retry attempts for API errors (connection drops, provider
   # timeouts, 5xx, etc.) before the agent surfaces the failure. Lower this
