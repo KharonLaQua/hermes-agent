@@ -665,6 +665,26 @@ class TelegramAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.TELEGRAM)
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
+        self._ops_commands = None
+        ops_config = self.config.extra.get("ops_commands", {})
+        if isinstance(ops_config, dict) and bool(ops_config.get("enabled", False)):
+            try:
+                from gateway.telegram_ops_commands import (
+                    TelegramOpsCommandSurface,
+                    allowed_user_ids_from_env,
+                )
+
+                self._ops_commands = TelegramOpsCommandSurface(
+                    allowed_user_ids=allowed_user_ids_from_env(),
+                    gateway_state_provider=self._telegram_ops_gateway_state,
+                )
+                logger.info("[%s] Direct Telegram ops command surface enabled", self.name)
+            except Exception:
+                logger.error(
+                    "[%s] Telegram ops command surface refused startup; feature remains disabled",
+                    self.name,
+                    exc_info=True,
+                )
         self._webhook_mode: bool = False
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
@@ -833,6 +853,16 @@ class TelegramAdapter(BasePlatformAdapter):
         # API call (e.g. a set_my_commands stall for certain tokens) cannot
         # blow the gateway's connect timeout (#46298).
         self._post_connect_task: Optional[asyncio.Task] = None
+
+    def _telegram_ops_gateway_state(self) -> Dict[str, Any]:
+        """Return local poller state without entering the gateway dispatch path."""
+        updater = getattr(getattr(self, "_app", None), "updater", None)
+        return {
+            "polling_running": bool(getattr(updater, "running", False)),
+            "progress_accepting": bool(getattr(self, "_polling_progress_accepting", False)),
+            "send_degraded": bool(getattr(self, "_send_path_degraded", True)),
+            "pid": os.getpid(),
+        }
 
     def _mark_connected(self) -> None:
         self._drop_delayed_deliveries = False
@@ -3348,6 +3378,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 # platforms.telegram.extra.command_menu.
                 max_commands = telegram_menu_max_commands()
                 menu_commands, hidden_count = telegram_menu_commands(max_commands=max_commands)
+                if getattr(self, "_ops_commands", None) is not None:
+                    from gateway.telegram_ops_commands import merge_menu_commands
+
+                    menu_commands = merge_menu_commands(
+                        menu_commands, max_commands=max_commands
+                    )
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 # Register for all scopes independently — Telegram picks the
                 # narrowest matching scope per chat type (forum topics fall
@@ -5918,6 +5954,13 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
+        # Direct ops callbacks are consumed before any generic gateway callback
+        # path. Their backend allowlist and confirmation state live entirely in
+        # gateway.telegram_ops_commands.
+        if getattr(self, "_ops_commands", None) is not None:
+            if await self._ops_commands.handle_callback_query(query, self._bot):
+                return
+
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
@@ -8142,7 +8185,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
                 from telegram import BotCommand, BotCommandScopeChat
                 from hermes_cli.commands import telegram_menu_commands, telegram_menu_max_commands
-                menu_commands, _ = telegram_menu_commands(max_commands=telegram_menu_max_commands())
+                max_commands = telegram_menu_max_commands()
+                menu_commands, _ = telegram_menu_commands(max_commands=max_commands)
+                if getattr(self, "_ops_commands", None) is not None:
+                    from gateway.telegram_ops_commands import merge_menu_commands
+
+                    menu_commands = merge_menu_commands(
+                        menu_commands, max_commands=max_commands
+                    )
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 await self._bot.set_my_commands(bot_commands, scope=BotCommandScopeChat(chat_id=chat_id))
                 self._forum_command_registered.add(chat_id)
@@ -8198,6 +8248,11 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
+        # Recognized ops commands reply directly and never become a MessageEvent,
+        # so they cannot enter the model/reasoner/executor/Discord route.
+        if getattr(self, "_ops_commands", None) is not None:
+            if await self._ops_commands.handle_command_message(msg, self._bot):
+                return
         if not self._should_process_message(msg, is_command=True):
             return
         if not self._is_user_authorized_from_message(msg):
