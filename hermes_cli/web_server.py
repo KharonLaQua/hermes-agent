@@ -966,6 +966,9 @@ _CATEGORY_MERGE: Dict[str, str] = {
     # field — fold it into the agent tab rather than spawning a one-field
     # orphan category.
     "computer_use": "agent",
+    # `shared_auth.providers` is the only schema-surfaced shared_auth field;
+    # keep the opt-in beside other credential/security controls.
+    "shared_auth": "security",
 }
 
 # Display order for tabs — unlisted categories sort alphabetically after these.

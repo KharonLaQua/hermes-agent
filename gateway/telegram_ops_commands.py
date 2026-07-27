@@ -21,10 +21,36 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
+def _fallback_load_dotenv_value(path: Path, key: str) -> Optional[str]:
+    """Read one dotenv value when the profile-owned alert helper is absent."""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    prefix = f"{key}="
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or not line.startswith(prefix):
+            continue
+        value = line[len(prefix) :].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        return value.strip() or None
+    return None
+
+
+def _fallback_truncate_with_evidence_pointer(text: str, limit: int, evidence_path: Path) -> str:
+    """Bound a Telegram message while preserving the full-evidence pointer."""
+    if len(text) <= limit:
+        return text
+    tail = f"\n[truncated, full text at {evidence_path}]"
+    if len(tail) >= limit:
+        return tail[-limit:]
+    return text[: limit - len(tail)] + tail
 
 
 def _load_alert_utilities():
-    """Load the repository-owned alert helper without depending on cwd."""
+    """Load profile alert helpers, with a portable repository fallback."""
     try:
         from bin import hermes_ops_alert as helper
 
@@ -38,15 +64,21 @@ def _load_alert_utilities():
         pass
 
     helper_path = Path(__file__).resolve().parents[2] / "bin/hermes_ops_alert.py"
-    spec = importlib.util.spec_from_file_location("_hermes_ops_alert_shared", helper_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load alert truncation utility at {helper_path}")
-    helper = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(helper)
+    if helper_path.is_file():
+        spec = importlib.util.spec_from_file_location("_hermes_ops_alert_shared", helper_path)
+        if spec is not None and spec.loader is not None:
+            helper = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(helper)
+            return (
+                helper.TELEGRAM_MESSAGE_MAX,
+                helper._truncate_with_evidence_pointer,
+                helper._load_dotenv_value,
+            )
+
     return (
-        helper.TELEGRAM_MESSAGE_MAX,
-        helper._truncate_with_evidence_pointer,
-        helper._load_dotenv_value,
+        4096,
+        _fallback_truncate_with_evidence_pointer,
+        _fallback_load_dotenv_value,
     )
 
 

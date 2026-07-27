@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from gateway.telegram_ops_commands import (
     CALLBACK_PREFIX,
@@ -114,6 +115,24 @@ class TelegramOpsCommandFixtureTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(parse_command("status telegram-ops-commands"))
         self.assertIsNone(parse_command("/unknown"))
+
+    def test_alert_utilities_fall_back_without_profile_helper(self):
+        import gateway.telegram_ops_commands as commands
+
+        root = Path(self.temp_dir.name)
+        dotenv = root / ".env"
+        dotenv.write_text('TOKEN="secret"\n', encoding="utf-8")
+        with (
+            mock.patch.object(commands.Path, "home", return_value=root),
+            mock.patch.object(commands.Path, "is_file", return_value=False),
+        ):
+            limit, truncate, load_dotenv = commands._load_alert_utilities()
+
+        self.assertEqual(limit, 4096)
+        self.assertEqual(load_dotenv(dotenv, "TOKEN"), "secret")
+        rendered = truncate("abcdefghij", 8, root / "full.txt")
+        self.assertEqual(len(rendered), 8)
+        self.assertTrue(rendered.endswith("txt]"))
 
     def test_menu_registration_puts_ops_commands_first_and_deduplicates(self):
         menu = merge_menu_commands(
