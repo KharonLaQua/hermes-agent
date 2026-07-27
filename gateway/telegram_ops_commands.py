@@ -530,7 +530,7 @@ class TelegramOpsCommandSurface:
         return "\n".join(lines)
 
     def _launchd_job(self, label: str) -> tuple[str, Optional[int], str]:
-        domain = f"gui/{os.getuid()}"
+        domain = f"gui/{os.getuid()}"  # windows-footgun: ok -- launchctl-only path
         result = self.command_runner(("/bin/launchctl", "print", f"{domain}/{label}"))
         if result.returncode != 0:
             reason = (result.stderr or result.stdout or f"exit {result.returncode}").strip().splitlines()[0]
@@ -596,7 +596,7 @@ class TelegramOpsCommandSurface:
     def _execute_confirmation(self, confirmation: Confirmation) -> str:
         if confirmation.action != "watcher_restart":
             return "WATCHER RESTART REFUSED: unknown confirmation action"
-        domain = f"gui/{os.getuid()}"
+        domain = f"gui/{os.getuid()}"  # windows-footgun: ok -- launchctl-only path
         service = f"{domain}/{WATCHER_LABEL}"
         plist = self.launch_agents_dir / f"{WATCHER_LABEL}.plist"
         bootout = self.command_runner(("/bin/launchctl", "bootout", service))
