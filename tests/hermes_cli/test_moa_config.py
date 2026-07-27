@@ -108,6 +108,54 @@ def test_normalize_moa_config_preserves_disabled_reference():
     ]
 
 
+def test_normalize_moa_config_preserves_reference_role_prompt():
+    cfg = normalize_moa_config(
+        {
+            "presets": {
+                "review": {
+                    "reference_models": [
+                        {
+                            "provider": "openrouter",
+                            "model": "deepseek/deepseek-v4-pro",
+                            "role_prompt": "  Focus on architecture and edge cases.  ",
+                        }
+                    ],
+                    "aggregator": {
+                        "provider": "openrouter",
+                        "model": "anthropic/claude-opus-4.8",
+                        "role_prompt": "This must not specialize the acting model.",
+                    },
+                }
+            }
+        }
+    )
+
+    assert cfg["presets"]["review"]["reference_models"][0]["role_prompt"] == (
+        "Focus on architecture and edge cases."
+    )
+    assert resolve_moa_preset(cfg, "review")["reference_models"][0]["role_prompt"] == (
+        "Focus on architecture and edge cases."
+    )
+    assert "role_prompt" not in cfg["presets"]["review"]["aggregator"]
+
+
+@pytest.mark.parametrize("role_prompt", ["", "   \n\t", None, 123, True, ["security"], {"focus": "security"}])
+def test_normalize_moa_config_omits_invalid_reference_role_prompt(role_prompt):
+    cfg = normalize_moa_config(
+        {
+            "reference_models": [
+                {
+                    "provider": "openrouter",
+                    "model": "deepseek/deepseek-v4-pro",
+                    "role_prompt": role_prompt,
+                }
+            ]
+        }
+    )
+
+    assert "role_prompt" not in cfg["reference_models"][0]
+
+
 def test_legacy_flat_config_becomes_default_preset():
     cfg = normalize_moa_config(
         {
@@ -228,7 +276,13 @@ def test_normalize_moa_config_round_trips_reasoning_effort_and_enabled():
                 "p": {
                     "reference_models": [
                         {"provider": "openai-codex", "model": "gpt-5.5", "reasoning_effort": "high", "enabled": False},
-                        {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro", "enabled": True},
+                        {
+                            "provider": "openrouter",
+                            "model": "deepseek/deepseek-v4-pro",
+                            "role_prompt": "Review security boundaries.",
+                            "max_tokens": 700,
+                            "enabled": True,
+                        },
                     ],
                     "aggregator": {
                         "provider": "openrouter",
@@ -249,7 +303,13 @@ def test_normalize_moa_config_round_trips_reasoning_effort_and_enabled():
         "reasoning_effort": "high",
         "enabled": False,
     }
-    assert refs[1] == {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro", "enabled": True}
+    assert refs[1] == {
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4-pro",
+        "role_prompt": "Review security boundaries.",
+        "max_tokens": 700,
+        "enabled": True,
+    }
     assert round_tripped["presets"]["p"]["aggregator"]["reasoning_effort"] == "xhigh"
 
 

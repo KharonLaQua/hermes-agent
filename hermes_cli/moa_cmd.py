@@ -49,7 +49,7 @@ def _model_options() -> list[dict[str, Any]]:
     ]
 
 
-def _pick_slot(current: dict[str, str] | None = None) -> dict[str, str]:
+def _pick_slot(current: dict[str, Any] | None = None) -> dict[str, Any]:
     providers = _model_options()
     if not providers:
         raise RuntimeError("No configured model providers found. Run `hermes model` first.")
@@ -66,7 +66,16 @@ def _pick_slot(current: dict[str, str] | None = None) -> dict[str, str]:
     current_model = (current or {}).get("model", "")
     model_default = models.index(current_model) if current_model in models else 0
     model = models[_prompt_choice(f"Select model for {provider.get('slug')}", models, model_default)]
-    return {"provider": str(provider.get("slug") or ""), "model": str(model)}
+    preserved = {
+        key: current[key]
+        for key in ("reasoning_effort", "role_prompt", "max_tokens")
+        if current is not None and key in current
+    }
+    return {
+        **preserved,
+        "provider": str(provider.get("slug") or ""),
+        "model": str(model),
+    }
 
 
 def _format_slot(slot: dict[str, Any]) -> str:
@@ -106,7 +115,7 @@ def cmd_moa(args) -> None:
         current = moa["presets"].get(preset_name, moa["presets"][moa["default_preset"]])
         print(f"Configure MoA preset: {preset_name}")
         print("Pick at least one reference model; choose Done when finished.")
-        refs: list[dict[str, str]] = []
+        refs: list[dict[str, Any]] = []
         existing = list(current.get("reference_models") or [])
         idx = 0
         while True:

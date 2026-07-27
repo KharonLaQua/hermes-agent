@@ -203,6 +203,50 @@ def test_every_n_redundant_create_does_not_consume_cadence_slot(monkeypatch, tmp
     assert len(ref_runs) == 2
 
 
+def test_reference_cache_key_changes_when_role_prompt_changes(monkeypatch, tmp_path):
+    """A live config edit must not reuse advice generated for the old role."""
+    home = tmp_path / ".hermes"
+    _cadence_config(home, "user_turn")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    ref_roles = []
+    aggregator_messages = []
+
+    def fake_call_llm(**kwargs):
+        if kwargs["task"] == "moa_reference":
+            ref_roles.append(kwargs["messages"][0]["content"])
+            return _response(f"advice #{len(ref_roles)}")
+        aggregator_messages.append(kwargs["messages"])
+        return _response("acted")
+
+    monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
+
+    from agent.moa_loop import MoAChatCompletions
+
+    facade = MoAChatCompletions("review")
+    messages = [{"role": "user", "content": "review this"}]
+    facade.create(messages=messages, tools=[])
+
+    config_path = home / "config.yaml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "          model: gpt-5.5",
+            "          model: gpt-5.5\n          role_prompt: Review security boundaries.",
+        ),
+        encoding="utf-8",
+    )
+    facade.create(messages=messages, tools=[])
+
+    assert len(ref_roles) == 2
+    assert "Review security boundaries." not in ref_roles[0]
+    assert "Review security boundaries." in ref_roles[1]
+    assert len(aggregator_messages) == 2
+    assert all(
+        "Review security boundaries." not in str(messages)
+        for messages in aggregator_messages
+    )
+
+
 def test_per_iteration_default_unchanged_by_cadence_state(monkeypatch, tmp_path):
     """Default fanout still re-runs references on every state change."""
     home = tmp_path / ".hermes"

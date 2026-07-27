@@ -191,7 +191,12 @@ def _coerce_bool(value: Any, default: bool = True) -> bool:
     return bool(value)
 
 
-def _clean_slot(slot: Any, *, include_enabled: bool = False) -> dict[str, Any] | None:
+def _clean_slot(
+    slot: Any,
+    *,
+    include_enabled: bool = False,
+    include_role_prompt: bool = False,
+) -> dict[str, Any] | None:
     if not isinstance(slot, dict):
         return None
     provider = str(slot.get("provider") or "").strip()
@@ -209,6 +214,12 @@ def _clean_slot(slot: Any, *, include_enabled: bool = False) -> dict[str, Any] |
     effort = _clean_reasoning_effort(slot.get("reasoning_effort"))
     if effort:
         clean["reasoning_effort"] = effort
+    if include_role_prompt:
+        raw_role_prompt = slot.get("role_prompt")
+        if isinstance(raw_role_prompt, str):
+            role_prompt = raw_role_prompt.strip()
+            if role_prompt:
+                clean["role_prompt"] = role_prompt
     # Optional per-slot max_tokens: overrides the preset-level
     # reference_max_tokens for this specific reference model. None (the
     # default) = no cap, so existing slots are unaffected. Allows tuning
@@ -326,7 +337,10 @@ def _normalize_preset(raw: Any) -> dict[str, Any]:
         # defaults instead of crashing the iteration, mirroring the tolerance
         # for the scalar fields below (reference_temperature / max_tokens).
         raw_refs = [raw_refs] if isinstance(raw_refs, dict) else []
-    refs = [_clean_slot(item, include_enabled=True) for item in raw_refs]
+    refs = [
+        _clean_slot(item, include_enabled=True, include_role_prompt=True)
+        for item in raw_refs
+    ]
     refs = [item for item in refs if item is not None]
     if not refs:
         refs = _default_reference_models()
