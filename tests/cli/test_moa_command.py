@@ -84,6 +84,34 @@ def test_decode_legacy_encoded_moa_turn_still_works():
     ]
 
 
+def test_moa_slot_picker_preserves_reference_role_prompt_on_model_update():
+    from hermes_cli import moa_cmd
+
+    current = {
+        "provider": "openrouter",
+        "model": "old-model",
+        "role_prompt": "Review security boundaries.",
+        "reasoning_effort": "high",
+        "max_tokens": 700,
+        "unknown_extension": "drop me",
+    }
+    providers = [{"slug": "openrouter", "name": "OpenRouter", "models": ["new-model"]}]
+
+    with (
+        patch.object(moa_cmd, "_model_options", return_value=providers),
+        patch.object(moa_cmd, "_prompt_choice", return_value=0),
+    ):
+        picked = moa_cmd._pick_slot(current)
+
+    assert picked == {
+        "provider": "openrouter",
+        "model": "new-model",
+        "role_prompt": "Review security boundaries.",
+        "reasoning_effort": "high",
+        "max_tokens": 700,
+    }
+
+
 class TestNormalizeMoaModel:
     """#56828: `-Q -m moa:<preset>` must route through the MoA virtual provider.
 

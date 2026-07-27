@@ -966,6 +966,9 @@ _CATEGORY_MERGE: Dict[str, str] = {
     # field — fold it into the agent tab rather than spawning a one-field
     # orphan category.
     "computer_use": "agent",
+    # `shared_auth.providers` is the only schema-surfaced shared_auth field;
+    # keep the opt-in beside other credential/security controls.
+    "shared_auth": "security",
 }
 
 # Display order for tabs — unlisted categories sort alphabetically after these.
@@ -1387,7 +1390,23 @@ class MoaModelSlot(BaseModel):
     # Optional per-slot reasoning effort. Declared so a client round-tripping
     # the GET payload doesn't have it stripped at parse time and wiped on save.
     reasoning_effort: Optional[str] = None
+    # Reference-only system specialization. Aggregator slots use the same API
+    # model for compatibility, but normalization deliberately drops this field
+    # from aggregators.
+    role_prompt: Optional[str] = None
+    # Optional per-reference output cap. Aggregator normalization drops it;
+    # reference normalization preserves it and applies the existing slot-over-
+    # preset precedence at runtime.
+    max_tokens: Optional[int] = None
     enabled: bool = True
+
+    @field_validator("role_prompt", mode="before")
+    @classmethod
+    def _validate_role_prompt(cls, value: Any) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        return value or None
 
 
 class _MoaReferenceControls(BaseModel):

@@ -520,6 +520,8 @@ def test_auth_add_xai_oauth_sets_active_provider(tmp_path, monkeypatch):
       plus ``mark_provider_active_if_unset`` on first add.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._xai_shared_auth_enabled", lambda: False)
+    monkeypatch.setattr("hermes_cli.auth.require_xai_oauth_interactive_terminal", lambda: None)
     _write_auth_store(tmp_path, {"version": 1, "providers": {}})
     access_token = "xai-test-access-token"
     monkeypatch.setattr(
@@ -572,6 +574,8 @@ def test_auth_add_xai_oauth_keeps_distinct_pool_accounts(tmp_path, monkeypatch):
     ``device_code`` entry instead of adding a second independent one.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._xai_shared_auth_enabled", lambda: False)
+    monkeypatch.setattr("hermes_cli.auth.require_xai_oauth_interactive_terminal", lambda: None)
     _write_auth_store(tmp_path, {"version": 1, "providers": {}})
     first_token = "xai-access-token-account-a"
     second_token = "xai-access-token-account-b"

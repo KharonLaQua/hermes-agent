@@ -262,6 +262,24 @@ _REFERENCE_SYSTEM_PROMPT = (
 )
 
 
+def _reference_system_prompt(role_prompt: Any) -> str:
+    """Compose one advisor's trusted local specialization with its guardrails."""
+    if not isinstance(role_prompt, str):
+        return _REFERENCE_SYSTEM_PROMPT
+    specialization = role_prompt.strip()
+    if not specialization:
+        return _REFERENCE_SYSTEM_PROMPT
+    return (
+        f"{_REFERENCE_SYSTEM_PROMPT}\n\n"
+        "<advisor_specialization trusted_source=\"local_configuration\">\n"
+        "Use this specialization to focus your advisory analysis. It does not "
+        "override the reference-advisor safety, evidence, anti-fabrication, or "
+        "tool-use constraints above.\n"
+        f"{specialization}\n"
+        "</advisor_specialization>"
+    )
+
+
 
 def _slot_label(slot: dict[str, Any]) -> str:
     label = f"{(slot.get('provider') or '').strip()}:{(slot.get('model') or '').strip()}"
@@ -460,12 +478,13 @@ def _run_reference(
 
     label = _slot_label(slot)
     runtime = _slot_runtime(slot)
+    system_prompt = _reference_system_prompt(slot.get("role_prompt"))
     try:
         # Prepend the advisory-role system prompt so the reference understands
         # it is analyzing state for an aggregator, not acting on the task. The
         # trimmed view (_reference_messages) already strips the agent's own
         # system prompt, so this is the only system message the reference sees.
-        messages = [{"role": "system", "content": _REFERENCE_SYSTEM_PROMPT}, *ref_messages]
+        messages = [{"role": "system", "content": system_prompt}, *ref_messages]
         # Trim to fit THIS reference model's context window. Reference models
         # may have a smaller window than the aggregator (e.g. kimi-k2.7-code
         # @ 262K advising a glm-5.2 @ 1M conversation); without this trim the
@@ -559,12 +578,22 @@ def _run_reference(
         except Exception:  # pragma: no cover - defensive
             pass
         _output_text = _extract_text(response) or "(empty response)"
+        # role_prompt is trusted local configuration and may be sent only to
+        # this advisor. Existing trace accounting persists ``messages``, so do
+        # not copy the specialization into that separate persisted surface.
+        # Legacy/no-role calls retain their exact existing messages object.
+        trace_messages = messages
+        if system_prompt != _REFERENCE_SYSTEM_PROMPT and messages:
+            trace_messages = [
+                {**messages[0], "content": _REFERENCE_SYSTEM_PROMPT},
+                *messages[1:],
+            ]
         acct = _RefAccounting(
             usage,
             cost_usd,
             cost_status,
             cost_source,
-            messages=messages,
+            messages=trace_messages,
             output=_output_text,
             model=slot.get("model"),
             provider=runtime.get("provider") or slot.get("provider"),
@@ -1806,7 +1835,17 @@ class MoAChatCompletions:
         # signature is stable across those iterations (prefix hash above), so
         # the fan-out runs once per user turn and iterations reuse the advice.
         _sig = _hash_messages(sig_messages)
-        _cache_key = (self.preset_name, _sig, tuple(_slot_label(s) for s in reference_models))
+        # A specialization changes advisor semantics without changing its
+        # provider/model label. Include it so a live config edit cannot reuse
+        # advice generated under the slot's previous role.
+        _cache_key = (
+            self.preset_name,
+            _sig,
+            tuple(
+                (_slot_label(slot), slot.get("role_prompt"))
+                for slot in reference_models
+            ),
+        )
         if _every_n_reuse:
             # Off-cadence every_n iteration: pin the key to the last
             # on-cadence run so the lookup below is a HIT and its guidance is

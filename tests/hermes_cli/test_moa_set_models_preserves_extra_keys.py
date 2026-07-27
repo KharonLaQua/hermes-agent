@@ -144,3 +144,44 @@ class TestSetMoaModelsPreservesUndeclaredKeys:
 
         assert result["ok"] is True
         assert "default_preset" in saved_cfg["moa"]
+
+    def test_reference_role_prompt_survives_api_model_update(self):
+        """A supported per-reference specialization must survive GUI/API saves."""
+        saved_cfg = {}
+        payload = _base_payload(
+            presets={
+                "default": MoaPresetPayload(
+                    reference_models=[
+                        MoaModelSlot(
+                            provider="openai-codex",
+                            model="gpt-5.5",
+                            role_prompt="Review correctness and test coverage.",
+                            reasoning_effort="high",
+                            max_tokens=777,
+                        )
+                    ],
+                    aggregator=MoaModelSlot(
+                        provider="openrouter",
+                        model="anthropic/claude-opus-4.8",
+                    ),
+                )
+            }
+        )
+
+        with (
+            patch("hermes_cli.web_server.load_config", return_value={}),
+            patch(
+                "hermes_cli.web_server.save_config",
+                side_effect=lambda cfg: saved_cfg.update(cfg),
+            ),
+            patch("hermes_cli.web_server._profile_scope"),
+        ):
+            result = set_moa_models(payload)
+
+        saved_ref = saved_cfg["moa"]["presets"]["default"]["reference_models"][0]
+        assert saved_ref["role_prompt"] == "Review correctness and test coverage."
+        assert saved_ref["reasoning_effort"] == "high"
+        assert saved_ref["max_tokens"] == 777
+        assert result["presets"]["default"]["reference_models"][0]["role_prompt"] == (
+            "Review correctness and test coverage."
+        )

@@ -100,6 +100,34 @@ Default preset:
 - reference: `openrouter:deepseek/deepseek-v4-pro`
 - aggregator / acting model: `openrouter:anthropic/claude-opus-4.8`
 
+### Per-reference advisor specializations
+
+Each reference slot may set an optional `role_prompt` to give that advisor a
+distinct responsibility:
+
+```yaml
+moa:
+  presets:
+    specialist-review:
+      reference_models:
+        - provider: openrouter
+          model: vendor/architecture-model
+          role_prompt: >-
+            Review architecture, correctness, edge cases, and test coverage.
+        - provider: openrouter
+          model: vendor/security-model
+          role_prompt: >-
+            Focus on security boundaries, unsafe assumptions, and data exposure.
+      aggregator:
+        provider: openrouter
+        model: vendor/acting-model
+```
+
+Hermes sends `role_prompt` only in that reference advisor's system message as
+trusted local configuration. It does not become conversation content, does not
+apply to sibling references or the aggregator, and does not grant the advisor
+tools or permission to claim actions. Blank and non-string values are ignored.
+
 ### Tuning advisor speed with `reference_max_tokens`
 
 Each turn, MoA runs the reference models (advisors) in parallel and then the

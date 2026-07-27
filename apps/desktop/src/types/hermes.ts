@@ -1108,6 +1108,10 @@ export interface MoaModelSlot {
   model: string
   /** Optional per-slot reasoning effort — round-tripped, not edited here. */
   reasoning_effort?: string
+  /** Optional reference specialization — round-tripped, not edited here. */
+  role_prompt?: string
+  /** Optional per-reference output cap — round-tripped, not edited here. */
+  max_tokens?: number
   enabled?: boolean
 }
 

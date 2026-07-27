@@ -2695,7 +2695,7 @@ class TestStaleFallbackCandidateSkip:
             )
 
         assert result.choices[0].message.content == "fresh-fallback"
-        mock_refresh.assert_called_once_with("anthropic")
+        _assert_refresh_rejects_client_key(mock_refresh, "anthropic", stale_fb)
         assert stale_fb.chat.completions.create.call_count == 1
         assert fresh_fb.chat.completions.create.call_count == 1
 
@@ -4126,6 +4126,12 @@ class _DummyResponse:
         self.choices = [MagicMock(message=MagicMock(content=text))]
 
 
+def _assert_refresh_rejects_client_key(mock_refresh, provider, client):
+    """Credential refresh must know which bearer the backend rejected."""
+    rejected_api_key = str(getattr(client, "api_key", None) or "").strip() or None
+    mock_refresh.assert_called_once_with(provider, rejected_api_key=rejected_api_key)
+
+
 class _FailingThenSuccessCompletions:
     def __init__(self):
         self.calls = 0
@@ -4173,7 +4179,7 @@ class TestAuxiliaryAuthRefreshRetry:
             )
 
         assert resp.choices[0].message.content == "fresh-sync"
-        mock_refresh.assert_called_once_with("openai-codex")
+        _assert_refresh_rejects_client_key(mock_refresh, "openai-codex", failing_client)
 
     def test_call_llm_refreshes_codex_on_401_for_non_vision(self):
         stale_client = MagicMock()
@@ -4197,7 +4203,7 @@ class TestAuxiliaryAuthRefreshRetry:
             )
 
         assert resp.choices[0].message.content == "fresh-non-vision"
-        mock_refresh.assert_called_once_with("openai-codex")
+        _assert_refresh_rejects_client_key(mock_refresh, "openai-codex", stale_client)
         assert stale_client.chat.completions.create.call_count == 1
         assert fresh_client.chat.completions.create.call_count == 1
 
@@ -4225,7 +4231,7 @@ class TestAuxiliaryAuthRefreshRetry:
             )
 
         assert resp.choices[0].message.content == "fresh-auto-copilot"
-        mock_refresh.assert_called_once_with("copilot")
+        _assert_refresh_rejects_client_key(mock_refresh, "copilot", stale_client)
         mock_evict.assert_called_once_with("auto")
         assert mock_get_client.call_args_list[0].args[0] == "auto"
         assert mock_get_client.call_args_list[1].args[0] == "copilot"
@@ -4258,7 +4264,7 @@ class TestAuxiliaryAuthRefreshRetry:
             )
 
         assert resp.choices[0].message.content == "fresh-auto-codex"
-        mock_refresh.assert_called_once_with("openai-codex")
+        _assert_refresh_rejects_client_key(mock_refresh, "openai-codex", stale_client)
         mock_evict.assert_called_once_with("auto")
         assert mock_get_client.call_args_list[1].args[0] == "openai-codex"
         assert stale_client.chat.completions.create.call_count == 1
@@ -4286,7 +4292,7 @@ class TestAuxiliaryAuthRefreshRetry:
             )
 
         assert resp.choices[0].message.content == "fresh-anthropic"
-        mock_refresh.assert_called_once_with("anthropic")
+        _assert_refresh_rejects_client_key(mock_refresh, "anthropic", stale_client)
         assert stale_client.chat.completions.create.call_count == 1
         assert fresh_client.chat.completions.create.call_count == 1
 
@@ -4315,7 +4321,7 @@ class TestAuxiliaryAuthRefreshRetry:
             )
 
         assert resp.choices[0].message.content == "fresh-async"
-        mock_refresh.assert_called_once_with("openai-codex")
+        _assert_refresh_rejects_client_key(mock_refresh, "openai-codex", failing_client)
 
     def test_refresh_provider_credentials_force_refreshes_anthropic_oauth_and_evicts_cache(self, monkeypatch):
         stale_client = MagicMock()
@@ -4433,7 +4439,7 @@ class TestAuxiliaryAuthRefreshRetry:
             )
 
         assert resp.choices[0].message.content == "fresh-async-anthropic"
-        mock_refresh.assert_called_once_with("anthropic")
+        _assert_refresh_rejects_client_key(mock_refresh, "anthropic", stale_client)
         assert stale_client.chat.completions.create.await_count == 1
         assert fresh_client.chat.completions.create.await_count == 1
 
