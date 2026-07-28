@@ -58,6 +58,28 @@ def _resolve_turn_timeout() -> Optional[float]:
     return value
 
 
+# Per-turn agentic step cap for ``claude -p`` (``--max-turns``). The transport
+# default (40) is tight for tool-heavy work, and exhausting it ends the turn
+# with ``subtype=error_max_turns`` and no message text.
+_MAX_TURNS_ENV = "HERMES_CLAUDE_CLI_MAX_TURNS"
+
+
+def _resolve_max_turns() -> Optional[int]:
+    """Return the configured per-turn max turns, or None to keep the default."""
+    raw = (os.environ.get(_MAX_TURNS_ENV) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r is not an integer; ignoring", _MAX_TURNS_ENV, raw)
+        return None
+    if value <= 0:
+        logger.warning("%s=%r must be > 0; ignoring", _MAX_TURNS_ENV, raw)
+        return None
+    return value
+
+
 def _record_kanban_turn_timeout(error: str) -> None:
     """Record a claude_cli turn timeout against the worker's kanban task.
 
@@ -469,6 +491,9 @@ def run_claude_cli_turn(
         _turn_timeout = _resolve_turn_timeout()
         if _turn_timeout is not None:
             session_kwargs["turn_timeout"] = _turn_timeout
+        _max_turns = _resolve_max_turns()
+        if _max_turns is not None:
+            session_kwargs["max_turns"] = _max_turns
         agent._claude_cli_session = ClaudeCliSession(
             oauth_token=token,
             model=model,
@@ -493,7 +518,12 @@ def run_claude_cli_turn(
         raise
     except ClaudeCliError as exc:
         logger.exception("claude_cli turn failed")
-        _retire_claude_cli_session(agent, reason=str(exc)[:200])
+        # ``error_max_turns`` is turn-budget exhaustion, not a broken session:
+        # the Claude session is still on disk and resumable, so keep the
+        # mapping instead of dropping the whole conversation.
+        _subtype = str((getattr(exc, "result_event", None) or {}).get("subtype") or "")
+        if _subtype != "error_max_turns":
+            _retire_claude_cli_session(agent, reason=str(exc)[:200])
         # A turn timeout is a *timeout*, not a protocol violation. Tell the
         # board so before the worker exits rc=0 (see _record_kanban_turn_timeout).
         if "timed out" in str(exc).lower():

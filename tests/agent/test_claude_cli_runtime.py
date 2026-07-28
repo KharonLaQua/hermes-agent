@@ -702,6 +702,70 @@ def test_session_raises_on_is_error_result():
     session.close()
 
 
+def test_session_is_error_without_result_text_reports_subtype():
+    """error_max_turns carries no ``result`` string — surface the subtype."""
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            self._lines = [
+                json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "error_max_turns",
+                        "is_error": True,
+                        "num_turns": 40,
+                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                    }
+                )
+                + "\n"
+            ]
+
+        def spawn(self, cfg):
+            return None
+
+        def iter_stdout_lines(self, timeout=600.0):
+            yield from self._lines
+
+        def wait(self, timeout=5.0):
+            return 0
+
+        def stderr_tail(self, n=20):
+            return []
+
+        def close(self):
+            pass
+
+        def kill(self):
+            pass
+
+    session = ClaudeCliSession(
+        oauth_token="«redacted:sk-…»",
+        model="claude-opus-4-8",
+        client_factory=_FakeClient,
+    )
+    with pytest.raises(ClaudeCliError) as excinfo:
+        session.run_turn("hello")
+    text = str(excinfo.value)
+    assert "subtype=error_max_turns" in text
+    assert "num_turns=40" in text
+    session.close()
+
+
+def test_resolve_max_turns_env(monkeypatch):
+    import agent.claude_runtime as cr
+
+    monkeypatch.delenv("HERMES_CLAUDE_CLI_MAX_TURNS", raising=False)
+    assert cr._resolve_max_turns() is None
+
+    monkeypatch.setenv("HERMES_CLAUDE_CLI_MAX_TURNS", "120")
+    assert cr._resolve_max_turns() == 120
+
+    monkeypatch.setenv("HERMES_CLAUDE_CLI_MAX_TURNS", "lots")
+    assert cr._resolve_max_turns() is None
+    monkeypatch.setenv("HERMES_CLAUDE_CLI_MAX_TURNS", "0")
+    assert cr._resolve_max_turns() is None
+
+
 def test_session_success_returns_final_text():
     class _FakeClient:
         def __init__(self, *a, **k):

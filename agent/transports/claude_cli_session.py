@@ -756,13 +756,20 @@ class ClaudeCliSession:
 
         # Terminal result with is_error=true → raise so fallback can fire.
         if state.is_error:
-            err_msg = (
-                state.result_text
-                or (state.result_event or {}).get("error")
-                or "claude_cli result is_error=true"
-            )
+            result_event = state.result_event or {}
+            err_msg = state.result_text or result_event.get("error") or ""
             if not isinstance(err_msg, str):
                 err_msg = str(err_msg)
+            # ``error_max_turns`` / ``error_during_execution`` carry no ``result``
+            # string, so without the subtype the message is unclassifiable.
+            subtype = str(result_event.get("subtype") or "").strip()
+            err_msg = err_msg.strip() or "claude_cli result is_error=true"
+            details = [f"subtype={subtype}"] if subtype else []
+            num_turns = result_event.get("num_turns")
+            if isinstance(num_turns, int):
+                details.append(f"num_turns={num_turns}")
+            if details:
+                err_msg = f"{err_msg} ({', '.join(details)})"
             result.error = err_msg
             # Resume-missing errors: keep mapping for outer fallback path
             # (run_turn will clear + retry). Other hard errors retire.
@@ -774,7 +781,10 @@ class ClaudeCliSession:
                     stderr_tail=stderr_tail,
                     result_event=state.result_event,
                 )
-            result.should_retire = True
+            # Turn-budget exhaustion is not a broken session: Claude wrote the
+            # session to disk and it is still resumable. Retiring here would
+            # throw away the whole conversation for a recoverable stop.
+            result.should_retire = subtype != "error_max_turns"
             raise ClaudeCliError(
                 message=f"claude_cli turn error: {err_msg}",
                 is_error=True,
