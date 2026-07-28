@@ -29,9 +29,72 @@ Hermes histories.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# Per-turn wall-clock cap for ``claude -p``. The transport default (600s) is
+# tight for long synthesis work, and blowing it is expensive: the turn raises,
+# the wrapper still exits rc=0, and a kanban dispatcher reads that as a
+# protocol violation. Overridable so long-running workers can be given room
+# without patching the transport.
+_TURN_TIMEOUT_ENV = "HERMES_CLAUDE_CLI_TURN_TIMEOUT"
+
+
+def _resolve_turn_timeout() -> Optional[float]:
+    """Return the configured per-turn timeout, or None to keep the default."""
+    raw = (os.environ.get(_TURN_TIMEOUT_ENV) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r is not a number; ignoring", _TURN_TIMEOUT_ENV, raw)
+        return None
+    if value <= 0:
+        logger.warning("%s=%r must be > 0; ignoring", _TURN_TIMEOUT_ENV, raw)
+        return None
+    return value
+
+
+def _record_kanban_turn_timeout(error: str) -> None:
+    """Record a claude_cli turn timeout against the worker's kanban task.
+
+    Without this the turn raises, ``run_claude_cli_turn`` returns a partial
+    result, the worker process still exits rc=0, and the dispatcher classifies
+    a *timeout* as a ``protocol_violation`` — charging the violation-only
+    retry budget and skipping the real failure circuit. Mirrors the
+    budget-exhausted path in ``agent.turn_finalizer``.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not task_id:
+        return
+    try:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect()
+        try:
+            _kb._record_task_failure(
+                conn,
+                task_id,
+                error=error,
+                outcome="timed_out",
+                release_claim=True,
+                end_run=True,
+            )
+            logger.info("recorded claude_cli turn timeout for task %s", task_id)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        logger.warning(
+            "failed to record claude_cli turn timeout for task %s",
+            task_id,
+            exc_info=True,
+        )
 
 
 def _coerce_usage_int(value: Any) -> int:
@@ -402,12 +465,17 @@ def run_claude_cli_turn(
     # Spawned (mapped) on first turn, reused across turns via --resume,
     # closed on hard failure or agent.close (when wired).
     if not hasattr(agent, "_claude_cli_session") or agent._claude_cli_session is None:
+        session_kwargs: Dict[str, Any] = {}
+        _turn_timeout = _resolve_turn_timeout()
+        if _turn_timeout is not None:
+            session_kwargs["turn_timeout"] = _turn_timeout
         agent._claude_cli_session = ClaudeCliSession(
             oauth_token=token,
             model=model,
             cwd=cwd,
             on_event=make_claude_cli_event_bridge(agent),
             hermes_conversation_id=hermes_id,
+            **session_kwargs,
         )
     session = agent._claude_cli_session
 
@@ -426,6 +494,10 @@ def run_claude_cli_turn(
     except ClaudeCliError as exc:
         logger.exception("claude_cli turn failed")
         _retire_claude_cli_session(agent, reason=str(exc)[:200])
+        # A turn timeout is a *timeout*, not a protocol violation. Tell the
+        # board so before the worker exits rc=0 (see _record_kanban_turn_timeout).
+        if "timed out" in str(exc).lower():
+            _record_kanban_turn_timeout(f"claude_cli turn failed: {exc}")
         # Surface a classifiable error string so the gateway/CLI show it and
         # higher-level fallback (if any) can react. Re-raising would escape
         # the early-return contract of conversation_loop; we return the same
@@ -456,6 +528,66 @@ def run_claude_cli_turn(
             "agent_persisted": False,
         }
 
+    # ── Kanban worker terminal-tool stop guard ───────────────────────────
+    # Workers must end with kanban_complete / kanban_block. The native guard
+    # lives in ``agent.conversation_loop``, which this transport bypasses
+    # entirely — Claude Code runs its own agentic loop and hands back one
+    # finished turn. Without a guard here a worker can do the whole job,
+    # write its deliverable, answer in prose, and still be recorded by the
+    # dispatcher as a protocol violation, which redoes the entire task.
+    # Re-prompt through the same session (context is preserved via --resume).
+    api_calls = 1
+    if not turn.interrupted and turn.error is None and not turn.is_error:
+        _seen_tool_calls = list(turn.tool_calls or [])
+        _nudges = 0
+        while True:
+            try:
+                from agent.kanban_stop import (
+                    build_kanban_stop_nudge_for_tool_records,
+                )
+
+                _nudge = build_kanban_stop_nudge_for_tool_records(
+                    tool_calls=_seen_tool_calls, attempts=_nudges,
+                )
+            except Exception:
+                logger.debug("kanban stop-loop check failed", exc_info=True)
+                break
+            if not _nudge:
+                break
+            _nudges += 1
+            logger.info(
+                "kanban stop-loop nudge issued (attempt %d) task=%s [claude_cli]",
+                _nudges, os.environ.get("HERMES_KANBAN_TASK", ""),
+            )
+            try:
+                agent._emit_status(
+                    "⚠️ Kanban worker tried to exit without "
+                    "kanban_complete/kanban_block — nudging to finish"
+                )
+            except Exception:
+                logger.debug("kanban stop-loop status emit failed", exc_info=True)
+            try:
+                _extra = session.run_turn(
+                    user_input=_nudge,
+                    system_prompt=system_prompt,
+                    model=model,
+                    messages=messages,
+                )
+            except Exception:
+                # A failed nudge must not mask the work the turn already did.
+                logger.warning("kanban stop-loop nudge turn failed", exc_info=True)
+                break
+            api_calls += 1
+            _seen_tool_calls.extend(_extra.tool_calls or [])
+            turn.tool_calls = _seen_tool_calls
+            turn.tool_iterations += _extra.tool_iterations
+            if _extra.projected_messages:
+                turn.projected_messages.extend(_extra.projected_messages)
+            if _extra.final_text:
+                turn.final_text = _extra.final_text
+            if _extra.interrupted or _extra.error is not None or _extra.is_error:
+                break
+
     # Retire only when the turn signals the mapping is unusable (hard error
     # path already retired above). Success keeps the session for --resume.
     if getattr(turn, "should_retire", False):
@@ -475,7 +607,6 @@ def run_claude_cli_turn(
                 )
 
     usage_result = _record_claude_cli_usage(agent, turn)
-    api_calls = 1
 
     # External memory provider sync (mirrors codex path).
     if not turn.interrupted and turn.error is None:
