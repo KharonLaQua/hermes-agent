@@ -225,6 +225,12 @@ DEFAULT_CONTEXT_LENGTHS = {
     "claude-sonnet-4-6": 1000000,
     "claude-opus-4.6": 1000000,
     "claude-sonnet-4.6": 1000000,
+    # Anthropic's current model table keeps Sonnet 4.5 at 200K. The
+    # community models.dev native-Anthropic row currently over-reports 1M
+    # (its Vertex row correctly reports 200K), so keep an authoritative
+    # family fallback and clamp that provider-specific registry mismatch.
+    "claude-sonnet-4-5": 200000,
+    "claude-sonnet-4.5": 200000,
     # Catch-all for older Claude models (must sort after specific entries)
     "claude": 200000,
     # OpenAI — GPT-5 family (most have 400k; specific overrides first)
@@ -315,7 +321,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     "grok-code-fast": 256000,   # grok-code-fast-1
     "grok-2-vision": 8192,      # grok-2-vision, -1212, -latest
     "grok-4-fast": 2000000,     # grok-4-fast-(non-)reasoning, also matches -reasoning
-    "grok-4.20": 2000000,       # grok-4.20-0309-(non-)reasoning, -multi-agent-0309
+    "grok-4.20": 1000000,       # grok-4.20-0309-(non-)reasoning, -multi-agent-0309
     "grok-4.5": 500000,         # grok-4.5, grok-4.5-latest — 500K context per docs.x.ai
     "grok-4.3": 1000000,        # grok-4.3, grok-4.3-latest — 1M context per docs.x.ai
     "grok-4": 256000,           # grok-4, grok-4-0709
@@ -1726,6 +1732,11 @@ def _model_name_suggests_grok_4_3(model: str) -> bool:
     return "grok-4.3" in model.lower()
 
 
+def _model_name_suggests_claude_sonnet_4_5(model: str) -> bool:
+    """Return True for Claude Sonnet 4.5 aliases and dated snapshots."""
+    return "claude-sonnet-4-5" in model.lower().replace(".", "-")
+
+
 def _query_local_context_length(model: str, base_url: str, api_key: str = "") -> Optional[int]:
     """Query a local server for the model's context length (short-TTL cached).
 
@@ -2610,6 +2621,25 @@ def get_model_context_length(
                         "Rejecting models.dev context=%s for %r "
                         "(MiniMax-M3 underreport); using hardcoded default %s",
                         ctx, model, f"{catalog:,}",
+                    )
+                    ctx = catalog
+            # Anthropic's authoritative table lists Sonnet 4.5 at 200K.
+            # models.dev currently reports 1M only on its native Anthropic
+            # row (the Vertex row remains 200K). Clamp that known upstream
+            # over-report for the native provider so Hermes compresses before
+            # the real limit instead of learning through a provider 400.
+            if (
+                effective_provider == "anthropic"
+                and _model_name_suggests_claude_sonnet_4_5(model)
+            ):
+                catalog = DEFAULT_CONTEXT_LENGTHS["claude-sonnet-4-5"]
+                if ctx > catalog:
+                    logger.info(
+                        "Rejecting models.dev context=%s for %r "
+                        "(Anthropic Sonnet 4.5 overreport); using authoritative %s",
+                        ctx,
+                        model,
+                        f"{catalog:,}",
                     )
                     ctx = catalog
             return ctx

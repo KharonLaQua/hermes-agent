@@ -234,9 +234,9 @@ class TestDefaultContextLengths:
         # to DEFAULT_CONTEXT_LENGTHS.
         with mock_patch("agent.model_metadata.fetch_model_metadata", return_value={}),              mock_patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}),              mock_patch("agent.model_metadata.get_cached_context_length", return_value=None):
             cases = [
-                ("grok-4.20-0309-reasoning", 2000000),
-                ("grok-4.20-0309-non-reasoning", 2000000),
-                ("grok-4.20-multi-agent-0309", 2000000),
+                ("grok-4.20-0309-reasoning", 1000000),
+                ("grok-4.20-0309-non-reasoning", 1000000),
+                ("grok-4.20-multi-agent-0309", 1000000),
                 ("grok-4-fast-reasoning", 2000000),
                 ("grok-4-fast-non-reasoning", 2000000),
                 ("grok-4", 256000),
@@ -257,6 +257,30 @@ class TestDefaultContextLengths:
                 assert actual == expected_ctx, (
                     f"{model_id}: expected {expected_ctx}, got {actual}"
                 )
+
+    def test_anthropic_sonnet_45_rejects_models_dev_1m_overreport(self):
+        """Anthropic documents Sonnet 4.5 at 200K, not 1M.
+
+        The community models.dev Anthropic row currently reports 1M while its
+        Vertex row and Anthropic's authoritative model table report 200K.
+        Provider-aware resolution must clamp that known over-report rather than
+        delaying compression until after the real window is exhausted.
+        """
+        assert DEFAULT_CONTEXT_LENGTHS["claude-sonnet-4-5"] == 200_000
+
+        with patch(
+            "agent.model_metadata.get_cached_context_length", return_value=None
+        ), patch(
+            "agent.model_metadata._query_anthropic_context_length", return_value=None
+        ), patch(
+            "agent.model_metadata._query_ollama_api_show", return_value=None
+        ), patch(
+            "agent.models_dev.lookup_models_dev_context", return_value=1_000_000
+        ):
+            assert get_model_context_length(
+                "claude-sonnet-4-5-20250929",
+                provider="anthropic",
+            ) == 200_000
 
     def test_xai_oauth_grok_build_uses_xai_models_dev_context(self):
         """xAI OAuth should share the xAI provider metadata path.
@@ -391,6 +415,9 @@ class TestDefaultContextLengths:
         live = {
             "anthropic/claude-fable-5": {"context_length": 1_000_000},
             "anthropic/claude-haiku-4.5": {"context_length": 200_000},
+            # Provider-specific OpenRouter metadata must not be clamped by the
+            # native-Anthropic Sonnet 4.5 correction below.
+            "anthropic/claude-sonnet-4-5": {"context_length": 1_000_000},
         }
         with mock_patch("agent.model_metadata.fetch_model_metadata", return_value=live), \
              mock_patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
@@ -405,6 +432,13 @@ class TestDefaultContextLengths:
             assert get_model_context_length(
                 "anthropic/claude-haiku-4.5", base_url=or_url, provider="openrouter"
             ) == 200_000
+            # The native-Anthropic Sonnet 4.5 clamp is provider-scoped; an
+            # OpenRouter route advertising a different window keeps that value.
+            assert get_model_context_length(
+                "anthropic/claude-sonnet-4-5",
+                base_url=or_url,
+                provider="openrouter",
+            ) == 1_000_000
 
     def test_openrouter_kimi_32k_underreport_still_guarded(self):
         """The live OR branch keeps the Kimi-family 32k underreport guard:
