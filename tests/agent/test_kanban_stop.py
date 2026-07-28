@@ -6,8 +6,10 @@ import pytest
 
 from agent.kanban_stop import (
     build_kanban_stop_nudge,
+    build_kanban_stop_nudge_for_tool_records,
     kanban_stop_nudge_enabled,
     session_called_kanban_terminal,
+    tool_records_called_kanban_terminal,
 )
 
 
@@ -131,3 +133,64 @@ def test_nudge_and_dispatcher_budgets_are_independent(clear_kanban_env):
     # Dispatcher-side streak is tracked in the DB, not in the nudge module —
     # the nudge module has no knowledge of the streak counter.
     assert not hasattr(build_kanban_stop_nudge, "_streak")
+
+
+# ── Transport tool-ledger variant (claude_cli) ────────────────────────────
+# claude_cli hands back a tool ledger instead of Hermes-shaped messages, and
+# reports MCP-qualified tool names. Regression cover for the swarm run where
+# a worker wrote its deliverable, answered in prose, and was recorded as a
+# protocol violation because no guard could see the missing terminal call.
+
+
+def test_tool_records_detects_mcp_qualified_name():
+    ledger = [{"name": "kanban_complete", "raw_name": "mcp__hermes-tools__kanban_complete"}]
+    assert tool_records_called_kanban_terminal(ledger) is True
+
+
+def test_tool_records_detects_raw_name_only():
+    ledger = [{"name": "", "raw_name": "mcp__hermes-tools__kanban_block"}]
+    assert tool_records_called_kanban_terminal(ledger) is True
+
+
+def test_tool_records_ignores_non_terminal_tools():
+    ledger = [
+        {"name": "write_file", "raw_name": "mcp__hermes-tools__write_file"},
+        {"name": "read_file", "raw_name": "mcp__hermes-tools__read_file"},
+    ]
+    assert tool_records_called_kanban_terminal(ledger) is False
+
+
+def test_tool_records_errored_terminal_call_does_not_count():
+    """A kanban_complete that failed left the task running — still nudge."""
+    ledger = [{"name": "kanban_complete", "is_error": True}]
+    assert tool_records_called_kanban_terminal(ledger) is False
+
+
+def test_tool_records_tolerates_junk_entries():
+    assert tool_records_called_kanban_terminal([None, "x", 3]) is False
+    assert tool_records_called_kanban_terminal(None) is False
+
+
+def test_ledger_nudge_fires_without_terminal_call(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_d7a91b9d")
+    ledger = [{"name": "write_file", "raw_name": "mcp__hermes-tools__write_file"}]
+    nudge = build_kanban_stop_nudge_for_tool_records(tool_calls=ledger)
+    assert nudge is not None
+    assert "t_d7a91b9d" in nudge
+    assert "kanban_complete" in nudge
+
+
+def test_ledger_nudge_silent_after_terminal_call(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_d7a91b9d")
+    ledger = [{"raw_name": "mcp__hermes-tools__kanban_complete"}]
+    assert build_kanban_stop_nudge_for_tool_records(tool_calls=ledger) is None
+
+
+def test_ledger_nudge_respects_attempt_budget(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_d7a91b9d")
+    assert build_kanban_stop_nudge_for_tool_records(tool_calls=[], attempts=0) is not None
+    assert build_kanban_stop_nudge_for_tool_records(tool_calls=[], attempts=2) is None
+
+
+def test_ledger_nudge_disabled_outside_kanban(clear_kanban_env):
+    assert build_kanban_stop_nudge_for_tool_records(tool_calls=[]) is None

@@ -1647,3 +1647,249 @@ def test_runtime_reuses_agent_session_across_turns(tmp_path, monkeypatch):
     assert _CapturingFakeClient.configs[0].session_id is not None
     assert _CapturingFakeClient.configs[1].resume == returned_id
     agent._claude_cli_session.close()
+
+
+# ── Kanban worker guards (regression: swarm task t_d7a91b9d) ──────────────
+# claude_cli bypasses agent.conversation_loop, so the native terminal-tool
+# stop guard could never fire on this transport. A worker would do the whole
+# job, answer in prose, exit rc=0, and the dispatcher would record a protocol
+# violation and redo the task. A turn timeout was mis-recorded the same way.
+
+
+def test_resolve_turn_timeout_env(monkeypatch):
+    from agent import claude_runtime as cr
+
+    monkeypatch.delenv("HERMES_CLAUDE_CLI_TURN_TIMEOUT", raising=False)
+    assert cr._resolve_turn_timeout() is None
+
+    monkeypatch.setenv("HERMES_CLAUDE_CLI_TURN_TIMEOUT", "1800")
+    assert cr._resolve_turn_timeout() == 1800.0
+
+    # Junk and non-positive values are ignored rather than crashing a turn.
+    monkeypatch.setenv("HERMES_CLAUDE_CLI_TURN_TIMEOUT", "soon")
+    assert cr._resolve_turn_timeout() is None
+    monkeypatch.setenv("HERMES_CLAUDE_CLI_TURN_TIMEOUT", "0")
+    assert cr._resolve_turn_timeout() is None
+
+
+def test_record_kanban_turn_timeout_noop_outside_worker(monkeypatch):
+    """No HERMES_KANBAN_TASK → never touch the board."""
+    from agent import claude_runtime as cr
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    def _boom(*a, **k):  # pragma: no cover - must not be reached
+        raise AssertionError("kanban_db must not be opened outside a worker")
+
+    monkeypatch.setattr("hermes_cli.kanban_db.connect", _boom)
+    cr._record_kanban_turn_timeout("claude_cli turn timed out after 600s")
+
+
+def test_record_kanban_turn_timeout_records_timed_out(monkeypatch):
+    """A turn timeout is recorded as timed_out, not left for the dispatcher
+    to misread as a protocol violation."""
+    from agent import claude_runtime as cr
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_d7a91b9d")
+    captured = {}
+
+    class _Conn:
+        def close(self):
+            captured["closed"] = True
+
+    def _fake_record(conn, task_id, *, error, outcome, **kw):
+        captured.update(task_id=task_id, error=error, outcome=outcome, **kw)
+        return False
+
+    monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda *a, **k: _Conn())
+    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", _fake_record)
+
+    cr._record_kanban_turn_timeout("claude_cli turn timed out after 600s")
+
+    assert captured["task_id"] == "t_d7a91b9d"
+    assert captured["outcome"] == "timed_out"
+    assert captured["release_claim"] is True
+    assert captured["end_run"] is True
+    assert "timed out" in captured["error"]
+    assert captured["closed"] is True
+
+
+def test_record_kanban_turn_timeout_swallows_db_errors(monkeypatch):
+    """Board bookkeeping must never take down the turn."""
+    from agent import claude_runtime as cr
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_d7a91b9d")
+
+    def _boom(*a, **k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr("hermes_cli.kanban_db.connect", _boom)
+    cr._record_kanban_turn_timeout("claude_cli turn timed out after 600s")
+
+
+class _StopGuardAgent:
+    """Minimal agent surface run_claude_cli_turn touches."""
+
+    api_key = "«redacted:sk-…»"
+    model = "claude-sonnet-5"
+    provider = "anthropic"
+    base_url = "https://api.anthropic.com"
+    session_id = "hermes-sess-guard"
+    show_commentary = False
+    tool_progress_callback = None
+    _session_db = None
+    _session_db_created = False
+    session_api_calls = 0
+    session_prompt_tokens = 0
+    session_completion_tokens = 0
+    session_total_tokens = 0
+    session_input_tokens = 0
+    session_output_tokens = 0
+    session_cache_read_tokens = 0
+    session_reasoning_tokens = 0
+    session_estimated_cost_usd = 0.0
+    session_cost_status = None
+    session_cost_source = None
+    context_compressor = None
+
+    def __init__(self, session, cwd):
+        self._claude_cli_session = session
+        self.session_cwd = cwd
+        self.statuses = []
+
+    def _emit_status(self, msg):
+        self.statuses.append(msg)
+
+    def _fire_stream_delta(self, *a, **k):
+        pass
+
+    def _emit_interim_assistant_message(self, *a, **k):
+        pass
+
+    def _sync_external_memory_for_turn(self, **k):
+        pass
+
+    def _spawn_background_review(self, **k):
+        pass
+
+    def _flush_messages_to_session_db(self, *a, **k):
+        pass
+
+    def _ensure_db_session(self):
+        pass
+
+
+class _ScriptedSession:
+    def __init__(self, turns):
+        self._turns = list(turns)
+        self.calls = []
+
+    def run_turn(self, *, user_input, system_prompt, model, messages):
+        self.calls.append(user_input)
+        return self._turns.pop(0)
+
+
+def _turn(tool_names, final_text):
+    from agent.transports.claude_cli_session import ClaudeCliTurnResult
+
+    return ClaudeCliTurnResult(
+        final_text=final_text,
+        projected_messages=[{"role": "assistant", "content": final_text}],
+        tool_calls=[
+            {"name": n, "raw_name": f"mcp__hermes-tools__{n}"} for n in tool_names
+        ],
+        session_id="sess-guard",
+    )
+
+
+def _run_guarded(agent, monkeypatch):
+    from agent import claude_runtime as cr
+
+    monkeypatch.setattr(
+        "agent.transports.claude_cli_session.resolve_claude_cli_oauth_token",
+        lambda **kw: "«redacted:sk-…»",
+    )
+    return cr.run_claude_cli_turn(
+        agent,
+        user_message="work kanban task t_d7a91b9d",
+        original_user_message="work kanban task t_d7a91b9d",
+        messages=[{"role": "user", "content": "work kanban task t_d7a91b9d"}],
+        effective_task_id="t_d7a91b9d",
+    )
+
+
+def test_stop_guard_nudges_worker_that_skipped_kanban_complete(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_d7a91b9d")
+    session = _ScriptedSession([
+        _turn(["write_file", "read_file"], "Task is done. Wrote the file."),
+        _turn(["kanban_complete"], "Completed on the board."),
+    ])
+    agent = _StopGuardAgent(session, str(tmp_path))
+
+    result = _run_guarded(agent, monkeypatch)
+
+    assert len(session.calls) == 2, "worker should have been re-prompted once"
+    assert "kanban_complete" in session.calls[1]
+    assert "t_d7a91b9d" in session.calls[1]
+    assert result["api_calls"] == 2
+    assert result["final_response"] == "Completed on the board."
+    assert result["completed"] is True
+    assert any("nudging to finish" in s for s in agent.statuses)
+
+
+def test_stop_guard_silent_when_worker_completed_properly(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_d7a91b9d")
+    session = _ScriptedSession([_turn(["write_file", "kanban_complete"], "All done.")])
+    agent = _StopGuardAgent(session, str(tmp_path))
+
+    result = _run_guarded(agent, monkeypatch)
+
+    assert len(session.calls) == 1, "no nudge expected"
+    assert result["api_calls"] == 1
+    assert result["final_response"] == "All done."
+
+
+def test_stop_guard_inert_outside_kanban_worker(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    session = _ScriptedSession([_turn(["write_file"], "Here you go.")])
+    agent = _StopGuardAgent(session, str(tmp_path))
+
+    result = _run_guarded(agent, monkeypatch)
+
+    assert len(session.calls) == 1
+    assert result["final_response"] == "Here you go."
+
+
+def test_stop_guard_gives_up_after_budget(tmp_path, monkeypatch):
+    """Two nudges max — never loop against a model that will not comply."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_d7a91b9d")
+    session = _ScriptedSession([
+        _turn(["write_file"], "Done-ish."),
+        _turn(["read_file"], "Still narrating."),
+        _turn([], "Nope."),
+    ])
+    agent = _StopGuardAgent(session, str(tmp_path))
+
+    result = _run_guarded(agent, monkeypatch)
+
+    assert len(session.calls) == 3, "1 real turn + 2 nudges, then stop"
+    assert result["api_calls"] == 3
+
+
+def test_stop_guard_nudge_failure_preserves_original_turn(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_d7a91b9d")
+
+    class _FailingSession(_ScriptedSession):
+        def run_turn(self, **kw):
+            self.calls.append(kw["user_input"])
+            if len(self.calls) > 1:
+                raise RuntimeError("claude gone")
+            return self._turns.pop(0)
+
+    session = _FailingSession([_turn(["write_file"], "Wrote the deliverable.")])
+    agent = _StopGuardAgent(session, str(tmp_path))
+
+    result = _run_guarded(agent, monkeypatch)
+
+    assert result["final_response"] == "Wrote the deliverable."
+    assert result["completed"] is True
