@@ -251,7 +251,15 @@ CLAUDE_NATIVE_FS_EXEC_TOOLS: tuple[str, ...] = (
 CLAUDE_CLI_PERMISSION_MODE = "bypassPermissions"
 
 # Default max agentic turns for a tool-using print-mode session.
-CLAUDE_CLI_DEFAULT_MAX_TURNS = 40
+#
+# 40 is tight for tool-heavy work: exhausting it ends the turn with
+# ``subtype=error_max_turns`` and no message text, which surfaces as an
+# unclassifiable failure. ``HERMES_CLAUDE_CLI_MAX_TURNS`` can raise it per
+# profile, but that env knob only resolves from ``<hermes_home>/.env`` and
+# does NOT cascade from the root ``~/.hermes/.env`` -- so a per-profile knob
+# silently misses every profile that lacks one, including newly created ones.
+# The default is the only setting that reaches all profiles by construction.
+CLAUDE_CLI_DEFAULT_MAX_TURNS = 200
 
 
 def _looks_like_test_tempdir(path: str) -> bool:
