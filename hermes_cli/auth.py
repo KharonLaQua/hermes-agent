@@ -4500,6 +4500,57 @@ _XAI_NON_PROMOTABLE_REASONS = frozenset(
 )
 _xai_shared_lock_holder = threading.local()
 
+# --- Env-immutable canonical-store protection (incident 2026-07-31) ----------
+# The original seat belt derived its forbidden path from ``Path.home()``, which
+# follows ``$HOME``. Any test fixture doing ``monkeypatch.setenv("HOME", ...)``
+# therefore moved the GUARD while ``get_default_hermes_root()`` kept resolving
+# the write TARGET from the real ``HERMES_HOME`` — so the guard could never
+# match and fixture-sized tokens landed in the live grant. Derive the protected
+# location from sources no test env mutation can reach.
+
+try:
+    # Snapshot at import, before any fixture can patch $HOME.
+    _XAI_IMPORT_TIME_HOME: Optional[Path] = Path(os.path.expanduser("~"))
+except Exception:  # pragma: no cover - expanduser is effectively total
+    _XAI_IMPORT_TIME_HOME = None
+
+
+def _xai_immutable_user_home() -> Optional[Path]:
+    """Real user home, immune to ``$HOME`` mutation.
+
+    POSIX: the passwd database (getpwuid) — env-independent by construction.
+    Falls back to the import-time ``$HOME`` snapshot taken before any test
+    fixture could run.
+    """
+    try:
+        import pwd
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except Exception:
+        return _XAI_IMPORT_TIME_HOME
+
+
+def _xai_protected_store_paths() -> set:
+    """Every filesystem location that must never be written during a test run."""
+    candidates = []
+    for home in (
+        _xai_immutable_user_home(),
+        _XAI_IMPORT_TIME_HOME,
+        Path.home(),
+    ):
+        if home:
+            candidates.append(Path(home) / ".hermes" / "shared" / XAI_SHARED_STORE_FILENAME)
+    explicit = os.getenv("HERMES_PROTECTED_XAI_STORE", "").strip()
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    protected = set()
+    for path in candidates:
+        try:
+            protected.add(path.resolve(strict=False))
+        except Exception:
+            protected.add(path)
+    return protected
+
 
 def _xai_shared_auth_enabled() -> bool:
     """True when the canonical shared xAI OAuth store is deliberately enabled.
@@ -4532,19 +4583,15 @@ def _xai_shared_auth_dir() -> Path:
 def _xai_shared_store_path() -> Path:
     path = _xai_shared_auth_dir() / XAI_SHARED_STORE_FILENAME
     if os.environ.get("PYTEST_CURRENT_TEST"):
-        # Compare against the *platform native* user home (not
-        # get_default_hermes_root(), which follows HERMES_HOME profile roots
-        # and would false-positive when a test uses tmp/profiles/<name> plus
-        # tmp/shared). Mirrors ``_auth_file_path`` seat belt intent.
-        from hermes_constants import _get_platform_default_hermes_home
-        real_home_shared = (
-            _get_platform_default_hermes_home() / "shared" / XAI_SHARED_STORE_FILENAME
-        ).resolve(strict=False)
+        # Compare against every env-immutable candidate for the real user's
+        # canonical store. Deriving this from $HOME alone (the pre-2026-07-31
+        # behaviour) let any fixture that monkeypatched HOME relocate the guard
+        # while the write target still resolved to the live store.
         try:
             resolved = path.resolve(strict=False)
         except Exception:
             resolved = path
-        if resolved == real_home_shared:
+        if resolved in _xai_protected_store_paths():
             raise RuntimeError(
                 f"Refusing to touch real user shared xAI auth store during test run: "
                 f"{path}. Set HERMES_SHARED_AUTH_DIR to a tmp_path in your test fixture."

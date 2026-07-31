@@ -420,6 +420,79 @@ def _isolate_hermes_home(_hermetic_environment):
     return None
 
 
+# ── Shared-auth isolation + live-store canary (incident 2026-07-31) ───────────
+#
+# ``HERMES_SHARED_AUTH_DIR`` is bridged from ``config.yaml``'s
+# ``shared_auth.dir`` into the environment of every Hermes-spawned process
+# (hermes_cli/config.py). ``HERMES_XAI_SHARED_AUTH`` comes from ~/.hermes/.env.
+# A pytest inheriting both routes ``_save_xai_oauth_tokens`` into the REAL
+# canonical grant — that is how generation 54 of ~/.hermes/shared/xai_oauth.json
+# was overwritten with one-character fixture tokens on 2026-07-30.
+#
+# HERMES_HOME isolation above does NOT help: the shared dir override is an
+# absolute path that bypasses hermes-root resolution entirely.
+
+@pytest.fixture(autouse=True)
+def _isolate_shared_auth_env(tmp_path_factory, monkeypatch):
+    """Never let a test inherit live shared-auth mode or the live shared dir."""
+    for var in ("HERMES_XAI_SHARED_AUTH", "HERMES_SHARED_AUTH_PROVIDERS"):
+        monkeypatch.delenv(var, raising=False)
+    # Point the shared dir at a per-test tmp location so that a test which
+    # deliberately re-enables shared mode still cannot reach the real store.
+    monkeypatch.setenv(
+        "HERMES_SHARED_AUTH_DIR",
+        str(tmp_path_factory.mktemp("shared_auth")),
+    )
+
+
+def _live_xai_store_fingerprint():
+    """(exists, size, mtime_ns, sha256) of the real canonical store, or None."""
+    try:
+        import hashlib
+        import pwd
+
+        # Override exists solely so the canary itself can be proven to fail
+        # (anti-vacuous self-test); production runs never set it.
+        override = os.environ.get("HERMES_CANARY_XAI_STORE", "").strip()
+        if override:
+            store = Path(override)
+        else:
+            home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+            store = home / ".hermes" / "shared" / "xai_oauth.json"
+        if not store.is_file():
+            return ("absent",)
+        raw = store.read_bytes()
+        st = store.stat()
+        return (st.st_size, st.st_mtime_ns, hashlib.sha256(raw).hexdigest())
+    except Exception:
+        return None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _live_xai_store_canary():
+    """Fail the session loudly if the run mutated the real xAI grant.
+
+    This is the backstop that did not exist during the 2026-07-30 incident:
+    the suite corrupted the live credential and reported only ordinary test
+    failures, so the corruption was invisible until platform sessions began
+    falling back off Grok.
+    """
+    before = _live_xai_store_fingerprint()
+    yield
+    after = _live_xai_store_fingerprint()
+    if before is None or after is None:
+        return
+    if before != after:
+        raise AssertionError(
+            "LIVE xAI SHARED AUTH STORE WAS MUTATED BY THIS TEST RUN.\n"
+            "  ~/.hermes/shared/xai_oauth.json changed during the suite.\n"
+            f"  before(size, mtime_ns, sha256)={before}\n"
+            f"  after (size, mtime_ns, sha256)={after}\n"
+            "A test wrote to the real canonical grant. Find the writer and "
+            "set HERMES_SHARED_AUTH_DIR to a tmp_path in its fixture."
+        )
+
+
 # ── Module-level state reset — replaced by per-file process isolation ──────
 #
 # Each test FILE runs in a freshly-spawned ``python -m pytest <file>``

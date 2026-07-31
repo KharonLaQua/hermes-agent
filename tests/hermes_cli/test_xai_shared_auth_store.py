@@ -99,6 +99,35 @@ def test_pytest_seat_belt_refuses_real_shared_path(monkeypatch, tmp_path):
         auth._xai_shared_store_path()
 
 
+def test_seat_belt_survives_monkeypatched_home(monkeypatch, tmp_path):
+    """The seat belt must not be relocatable by patching ``$HOME``.
+
+    Incident 2026-07-31: ``test_xai_oauth_writethrough.py``'s ``profile_and_root``
+    fixture did ``monkeypatch.setenv("HOME", ...)`` to dodge an unrelated
+    classic-mode guard. The shared-store seat belt derived its forbidden path
+    from ``Path.home()``, so patching HOME moved the GUARD while
+    ``HERMES_SHARED_AUTH_DIR`` (bridged from config.yaml into every Hermes
+    process) kept the write TARGET on the real store. Generation 54 of the
+    canonical grant was overwritten with one-character fixture tokens.
+
+    Note ``test_pytest_seat_belt_refuses_real_shared_path`` above cannot catch
+    this: it derives its "dangerous" path from the same $HOME-following helper
+    as the guard, so the two move together and it passes vacuously.
+    """
+    import pwd
+
+    immutable_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    real_shared = immutable_home / ".hermes" / "shared"
+
+    monkeypatch.setenv("HERMES_XAI_SHARED_AUTH", "1")
+    monkeypatch.setenv("HERMES_SHARED_AUTH_DIR", str(real_shared))
+    # The exact move that disarmed the guard during the incident.
+    monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
+
+    with pytest.raises(RuntimeError, match="Refusing to touch real user shared xAI"):
+        auth._xai_shared_store_path()
+
+
 def test_write_shared_creates_0600_file(shared_env):
     written = auth._write_shared_xai_state(
         {

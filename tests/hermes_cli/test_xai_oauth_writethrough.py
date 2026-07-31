@@ -45,6 +45,15 @@ def profile_and_root(tmp_path, monkeypatch):
     monkeypatch.setattr(auth, "_global_auth_file_path", lambda: root_path)
     # Keep the pytest write seat belt from matching our tmp root.
     monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
+    # These are CLASSIC-mode write-through tests. If the ambient environment
+    # has shared xAI auth enabled (as every live Hermes shell does via
+    # ~/.hermes/.env), ``_save_xai_oauth_tokens`` routes to the canonical
+    # SHARED store instead — and before 2026-07-31 the HOME patch above also
+    # disarmed the seat belt, so fixture tokens overwrote the live grant.
+    # Pin shared mode off AND point the shared dir at tmp: belt and braces.
+    monkeypatch.delenv("HERMES_XAI_SHARED_AUTH", raising=False)
+    monkeypatch.delenv("HERMES_SHARED_AUTH_PROVIDERS", raising=False)
+    monkeypatch.setenv("HERMES_SHARED_AUTH_DIR", str(tmp_path / "shared"))
     return profile_path, root_path
 
 
