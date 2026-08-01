@@ -8,11 +8,89 @@ Verifies:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
+
+
+def _arm_contract(tmp_path: Path, profile: str = "gateway") -> dict:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    source = workspace / "source.bin"
+    source.write_bytes(b"source")
+    operation = {
+        "index": 0,
+        "kind": "rclone_copy",
+        "argv": ["rclone", "copyto", str(source), "s3://bucket/object"],
+        "cwd": str(workspace),
+        "background": False,
+        "pty": False,
+        "source_ref": "source",
+        "destination_ref": "destination",
+        "manifest_ref": None,
+        "execution_context_digest": "0" * 64,
+    }
+    return {
+        "profile": profile,
+        "profile_home": str(tmp_path / "profile-home"),
+        "workspace": str(workspace),
+        "source": {
+            "kind": "file",
+            "canonical_path": str(source),
+            "expected_size_bytes": source.stat().st_size,
+            "content_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "manifest_path": None,
+            "manifest_sha256": None,
+        },
+        "destination": {"kind": "object", "canonical_uri": "s3://bucket/object"},
+        "operation_sequence": [operation],
+        "authorized_operation_index": 0,
+        "predecessor_receipt_digest": None,
+        "command_digest": "1" * 64,
+    }
+
+
+def _install_arm_issuer(monkeypatch, profile: str = "gateway"):
+    from hermes_cli.scoped_terminal_permits import (
+        ScopedTerminalPermitIssuer,
+        install_active_issuer,
+    )
+
+    issuer = ScopedTerminalPermitIssuer(
+        issuer_profile=profile,
+        lock_owner_check=lambda: True,
+    )
+    assert install_active_issuer(issuer)
+    return issuer
+
+
+def _cleanup_arm_issuer(issuer):
+    from hermes_cli.scoped_terminal_permits import uninstall_active_issuer
+
+    uninstall_active_issuer(issuer)
+    issuer.close()
+
+
+def _bind_gateway_session(profile: str = "gateway"):
+    from gateway.session_context import set_session_vars
+
+    return set_session_vars(
+        platform="telegram",
+        session_key="gateway-session",
+        session_id="gateway-session",
+        profile=profile,
+    )
+
+
+def _write_contract(tmp_path: Path, contract: dict) -> tuple[Path, str]:
+    path = tmp_path / "contract.json"
+    data = json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    path.write_text(data, encoding="utf-8")
+    return path, hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +139,130 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
+
+
+def test_arm_terminal_permit_tool_requires_active_dispatch_owner(monkeypatch):
+    from gateway.session_context import reset_session_vars
+    from tools import kanban_tools as kt
+
+    reset_session_vars()
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "gateway")
+    assert kt._check_arm_terminal_permit() is False
+
+    issuer = _install_arm_issuer(monkeypatch)
+    try:
+        # An environment-only profile/session spoof is never gateway authority.
+        assert kt._check_arm_terminal_permit() is False
+        _bind_gateway_session()
+        assert kt._check_arm_terminal_permit() is True
+
+        reset_session_vars()
+        assert kt._check_arm_terminal_permit() is False
+    finally:
+        _cleanup_arm_issuer(issuer)
+
+
+def test_arm_terminal_permit_handler_rejects_worker_and_delegated_child(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        target = kb.create_task(conn, title="target", assignee="gateway")
+    contract_path, contract_digest = _write_contract(tmp_path, _arm_contract(tmp_path))
+    issuer = _install_arm_issuer(monkeypatch)
+    tokens = _bind_gateway_session()
+    args = {
+        "task_id": target,
+        "contract_path": str(contract_path),
+        "contract_sha256": contract_digest,
+        "evidence_task_id": target,
+        "evidence_artifact_sha256": "2" * 64,
+    }
+    try:
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "worker-task")
+        assert json.loads(kt._handle_arm_terminal_permit(args)).get("error")
+        assert issuer._pending == {}
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.setattr(kt, "_is_delegated_child_context", lambda: True)
+        assert json.loads(kt._handle_arm_terminal_permit(args)).get("error")
+        assert issuer._pending == {}
+    finally:
+        from gateway.session_context import reset_session_vars
+
+        reset_session_vars()
+        _cleanup_arm_issuer(issuer)
+
+
+def test_arm_terminal_permit_requires_matching_contract_and_evidence_digests(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        target = kb.create_task(conn, title="target", assignee="gateway")
+        evidence = kb.create_task(conn, title="evidence", assignee="reviewer")
+        kb.claim_task(conn, evidence)
+        assert kb.complete_task(
+            conn,
+            evidence,
+            summary="evidence",
+            metadata={"artifact_sha256": "2" * 64},
+        )
+    contract_path, contract_digest = _write_contract(tmp_path, _arm_contract(tmp_path))
+    issuer = _install_arm_issuer(monkeypatch)
+    tokens = _bind_gateway_session()
+    base_args = {
+        "task_id": target,
+        "contract_path": str(contract_path),
+        "contract_sha256": contract_digest,
+        "evidence_task_id": evidence,
+        "evidence_artifact_sha256": "2" * 64,
+    }
+    try:
+        bad_contract = dict(base_args, contract_sha256="0" * 64)
+        assert json.loads(kt._handle_arm_terminal_permit(bad_contract)).get("error")
+        assert issuer._pending == {}
+
+        bad_evidence = dict(base_args, evidence_artifact_sha256="3" * 64)
+        assert json.loads(kt._handle_arm_terminal_permit(bad_evidence)).get("error")
+        assert issuer._pending == {}
+
+        result = json.loads(kt._handle_arm_terminal_permit(base_args))
+        assert result["ok"] is True
+        assert set(result) == {
+            "ok",
+            "arm_id_digest",
+            "task_id",
+            "contract_digest",
+            "issuer_profile",
+            "expires_at",
+        }
+        assert result["task_id"] == target
+        assert result["issuer_profile"] == "gateway"
+        assert "contract_path" not in result
+        assert "source" not in result
+    finally:
+        from gateway.session_context import reset_session_vars
+
+        reset_session_vars()
+        _cleanup_arm_issuer(issuer)
 
 
 def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_path):

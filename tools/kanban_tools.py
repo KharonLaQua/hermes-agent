@@ -28,9 +28,13 @@ through the board.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import os
+import re
+import stat
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -375,6 +379,173 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
             "kanban_comment for their assigned task."
         )
     return None
+
+
+# A reviewed contract is intentionally small: it contains only the immutable
+# typed operation description, not the operation's data. Keep the bound here
+# independent of the attachment cap and never read more than this many bytes.
+_ARM_CONTRACT_MAX_BYTES = 1024 * 1024
+_ARM_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _gateway_bound_profile() -> Optional[str]:
+    """Return only a profile bound by the gateway session ContextVar."""
+    try:
+        from gateway import session_context
+
+        value = session_context._SESSION_PROFILE.get()
+        if value is session_context._UNSET:
+            return None
+    except Exception:
+        return None
+    profile = _normalize_profile(value)
+    return profile.lower() if profile else None
+
+
+def _active_arm_issuer():
+    """Return a currently usable process-local issuer, or ``None``."""
+    try:
+        from hermes_cli.scoped_terminal_permits import get_active_issuer
+
+        issuer = get_active_issuer()
+        if issuer is None or issuer.closed:
+            return None
+        # Cached registry availability is only a schema hint. This direct
+        # check also proves the dispatcher lock is still held.
+        issuer._assert_available()
+        return issuer
+    except Exception:
+        return None
+
+
+def _check_arm_terminal_permit() -> bool:
+    """Expose the arm tool only to the authenticated dispatch owner."""
+    if os.environ.get("HERMES_KANBAN_TASK") or _is_delegated_child_context():
+        return False
+    issuer = _active_arm_issuer()
+    if issuer is None:
+        return False
+    profile = _gateway_bound_profile()
+    return profile is not None and profile == issuer.issuer_profile
+
+
+def _read_arm_contract_once(path_value: Any) -> bytes:
+    """Read one absolute, regular, non-symlink contract file under the cap."""
+    if not isinstance(path_value, str) or not os.path.isabs(path_value):
+        raise ValueError("contract_path must be an absolute file path")
+    if os.path.realpath(path_value) != path_value:
+        raise ValueError("contract_path must not contain symlink components")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path_value, flags)
+    except OSError as exc:
+        raise ValueError("contract_path is not readable") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("contract_path must be a regular file")
+        if info.st_size > _ARM_CONTRACT_MAX_BYTES:
+            raise ValueError("contract_path exceeds the size limit")
+        data = os.read(fd, _ARM_CONTRACT_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) != info.st_size or len(data) > _ARM_CONTRACT_MAX_BYTES:
+        raise ValueError("contract_path changed during read")
+    return data
+
+
+def _handle_arm_terminal_permit(args: dict, **kw) -> str:
+    """Arm one exact next-run terminal permit through the active issuer."""
+    if not isinstance(args, dict):
+        return tool_error("kanban_arm_terminal_permit: invalid arguments")
+    issuer = _active_arm_issuer()
+    profile = _gateway_bound_profile()
+    if (
+        issuer is None
+        or os.environ.get("HERMES_KANBAN_TASK")
+        or _is_delegated_child_context()
+        or profile is None
+        or profile != issuer.issuer_profile
+    ):
+        return tool_error("kanban_arm_terminal_permit: unavailable in this context")
+
+    task_id = args.get("task_id")
+    contract_path = args.get("contract_path")
+    contract_sha256 = args.get("contract_sha256")
+    evidence_task_id = args.get("evidence_task_id")
+    evidence_digest = args.get("evidence_artifact_sha256")
+    if not all(isinstance(value, str) and value.strip() for value in (
+        task_id, contract_path, contract_sha256, evidence_task_id, evidence_digest,
+    )):
+        return tool_error("kanban_arm_terminal_permit: required arguments are invalid")
+    contract_sha256 = contract_sha256.strip()
+    evidence_digest = evidence_digest.strip()
+    if not _ARM_DIGEST_RE.fullmatch(contract_sha256) or not _ARM_DIGEST_RE.fullmatch(evidence_digest):
+        return tool_error("kanban_arm_terminal_permit: digest arguments are invalid")
+    task_id = str(task_id)
+    contract_path = str(contract_path)
+    evidence_task_id = str(evidence_task_id)
+
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.scoped_terminal_permits import (
+            _normalize_contract,
+            _parse_canonical,
+        )
+
+        selected_board = kb._normalize_board_slug(args.get("board")) or kb.get_current_board()
+        if not kb.board_exists(selected_board):
+            return tool_error("kanban_arm_terminal_permit: board not found")
+        contract_bytes = _read_arm_contract_once(contract_path)
+        actual_contract_digest = hashlib.sha256(contract_bytes).hexdigest()
+        if not hmac.compare_digest(actual_contract_digest, contract_sha256):
+            return tool_error("kanban_arm_terminal_permit: contract digest mismatch")
+        contract = _normalize_contract(_parse_canonical(contract_bytes))
+        if contract["profile"] != profile:
+            return tool_error("kanban_arm_terminal_permit: contract profile mismatch")
+
+        _, conn = _connect(board=selected_board)
+        try:
+            target = kb.get_task(conn, task_id)
+            evidence = kb.get_task(conn, evidence_task_id)
+            if target is None or evidence is None:
+                return tool_error("kanban_arm_terminal_permit: task not found")
+            if target.status == "running":
+                return tool_error("kanban_arm_terminal_permit: target is already running")
+            target_profile = _normalize_profile(target.assignee)
+            if target_profile is None or target_profile.lower() != profile:
+                return tool_error("kanban_arm_terminal_permit: target assignee mismatch")
+            if evidence.status != "done":
+                return tool_error("kanban_arm_terminal_permit: evidence is not complete")
+            evidence_run = kb.latest_run(conn, evidence_task_id)
+            metadata = evidence_run.metadata if evidence_run else None
+            recorded_digest = metadata.get("artifact_sha256") if isinstance(metadata, dict) else None
+            if (
+                not isinstance(recorded_digest, str)
+                or not hmac.compare_digest(recorded_digest, evidence_digest)
+            ):
+                return tool_error("kanban_arm_terminal_permit: evidence digest mismatch")
+        finally:
+            conn.close()
+
+        receipt = issuer.arm_next_run(
+            board_slug=selected_board,
+            task_id=task_id,
+            contract=contract,
+            ttl_seconds=issuer.max_ttl_seconds,
+            evidence_task_id=evidence_task_id,
+            evidence_artifact_digest=evidence_digest,
+        )
+        return _ok(
+            arm_id_digest=receipt.arm_id_digest,
+            task_id=receipt.task_id,
+            contract_digest=receipt.contract_digest,
+            issuer_profile=receipt.issuer_profile,
+            expires_at=receipt.expires_at,
+        )
+    except Exception as exc:
+        failure = getattr(exc, "failure_class", None) or str(exc)
+        return tool_error(f"kanban_arm_terminal_permit: {failure}")
 
 
 def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
@@ -1451,6 +1622,46 @@ def _board_schema_prop() -> dict[str, str]:
     """
     return {"type": "string", "description": _DESC_BOARD}
 
+KANBAN_ARM_TERMINAL_PERMIT_SCHEMA = {
+    "name": "kanban_arm_terminal_permit",
+    "description": (
+        "Arm one exact next-run terminal permit from a reviewed canonical "
+        "contract file and completed evidence digest. Gateway dispatch-owner "
+        "only; unavailable to workers, delegated children, CLI, and inactive "
+        "or closed issuers."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "Non-running target task id."},
+            "contract_path": {
+                "type": "string",
+                "description": "Absolute regular canonical JSON contract file path.",
+            },
+            "contract_sha256": {
+                "type": "string",
+                "description": "Lowercase SHA-256 digest of the contract file.",
+            },
+            "evidence_task_id": {
+                "type": "string",
+                "description": "Completed evidence task id.",
+            },
+            "evidence_artifact_sha256": {
+                "type": "string",
+                "description": "Lowercase SHA-256 digest recorded in evidence completion metadata.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": [
+            "task_id",
+            "contract_path",
+            "contract_sha256",
+            "evidence_task_id",
+            "evidence_artifact_sha256",
+        ],
+    },
+}
+
 KANBAN_SHOW_SCHEMA = {
     "name": "kanban_show",
     "description": (
@@ -2033,6 +2244,15 @@ KANBAN_LINK_SCHEMA = {
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
+
+registry.register(
+    name="kanban_arm_terminal_permit",
+    toolset="kanban",
+    schema=KANBAN_ARM_TERMINAL_PERMIT_SCHEMA,
+    handler=_handle_arm_terminal_permit,
+    check_fn=_check_arm_terminal_permit,
+    emoji="🔐",
+)
 
 registry.register(
     name="kanban_show",
