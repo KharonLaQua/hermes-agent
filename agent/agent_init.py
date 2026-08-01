@@ -1449,10 +1449,19 @@ def init_agent(
     # Resolving the ~835-token block once here avoids re-running the
     # membership test + reference on every system-prompt rebuild
     # (init + each context compression).
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
-    )
+    from agent.prompt_builder import build_kanban_guidance
+    if "kanban_show" in agent.valid_tool_names:
+        import os as _os
+        from hermes_cli.profiles import read_profile_routing_meta
+
+        _actor = (_os.environ.get("HERMES_PROFILE") or "").strip() or None
+        try:
+            _role = read_profile_routing_meta(_actor)["routing_role"] if _actor else None
+        except (FileNotFoundError, ValueError):
+            _role = "unknown"
+        agent._kanban_worker_guidance = build_kanban_guidance(_actor, _role)
+    else:
+        agent._kanban_worker_guidance = ""
 
     # Check tool requirements
     if agent.tools and not agent.quiet_mode:

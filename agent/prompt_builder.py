@@ -201,7 +201,7 @@ SKILLS_GUIDANCE = (
     "4. **DEDUP** — After reloading a pruned skill, **ignore any remaining `[SKILL_PRUNED]` markers for that same skill** — they are historical artifacts from previous compactions and do not need further action."
 )
 
-KANBAN_GUIDANCE = (
+_KANBAN_GUIDANCE_BASE = (
     "# Kanban task execution protocol\n"
     "You have been assigned ONE task from "
     "the shared board at `~/.hermes/kanban.db`. Your task id is in "
@@ -300,6 +300,84 @@ KANBAN_GUIDANCE = (
     "for short reasoning subtasks inside your own run; board tasks are for "
     "cross-agent handoffs that outlive one API loop."
 )
+
+
+def build_kanban_guidance(actor: str | None, routing_role: str | None) -> str:
+    """Return worker guidance whose create instructions match Option A authority."""
+    if actor is None and routing_role is None:
+        return ""
+
+    generic_followup = (
+        "6. **If follow-up work appears, create it; don't do it.** Use "
+        "`kanban_create(title=..., assignee=<right-profile>, parents=[your-task-id])` "
+        "to spawn a child task for the appropriate specialist profile instead of "
+        "scope-creeping into the next thing.\n"
+    )
+    generic_orchestrator = (
+        "If your task is itself a decomposition task (e.g. a planner profile given "
+        "a high-level goal), use `kanban_create` to fan out into child tasks — one "
+        "per specialist, each with an explicit `assignee` and `parents=[...]` to "
+        "express dependencies. Then `kanban_complete` your own task with a summary "
+        "of the decomposition. Do NOT execute the work yourself; your job is "
+        "routing, not implementation.\n"
+    )
+    generic_assignment = (
+        "- Do not assign follow-up work to yourself. Assign it to the right "
+        "specialist profile.\n"
+    )
+
+    if actor == "default" and routing_role == "router":
+        authority = (
+            "6. **Option A router authority.** Create only to a valid owning lead or exact "
+            "`consigliere`. If Don names a junior, carry that intent on the owning-lead card; "
+            "it is never a direct-create bypass.\n"
+        )
+        orchestration = (
+            "If this task requires decomposition, route one owning-lead card (or exact "
+            "`consigliere` for judgment). The lead owns any child graph.\n"
+        )
+    elif routing_role == "lead":
+        authority = (
+            "6. **Option A lead authority.** Create only to a declared `routing_children` "
+            "child, peer lead, or exact `consigliere`. Atomic scope never authorizes a "
+            "foreign junior.\n"
+        )
+        orchestration = (
+            "If this task requires decomposition, use only declared own children; route "
+            "cross-team work to the peer lead and judgment to exact `consigliere`.\n"
+        )
+    elif actor == "consigliere" and routing_role == "authority":
+        authority = (
+            "6. **Exact Consigliere authority.** Create only to exact `default` or a valid "
+            "lead (`authority_to_router`, `authority_to_lead`). Never target a junior, "
+            "specialist, verifier, executor, or another authority profile.\n"
+        )
+        orchestration = (
+            "Consigliere is not an orchestrator or team lead. Route new work only to exact "
+            "`default` or a valid lead; comment/unblock the existing lead card when possible.\n"
+        )
+    elif routing_role == "authority":
+        authority = (
+            "6. **Non-delegated authority.** You must not create Kanban tasks. "
+            "`routing_role: authority` is classification, not creation power; the denial "
+            "code is `authority_actor_not_delegated`. Return routing intent to `default`.\n"
+        )
+        orchestration = "This authority profile has no orchestrator or fan-out delegation.\n"
+    else:
+        authority = (
+            "6. **Junior/unknown authority.** You have no cross-profile task-create authority. "
+            "Report follow-up work to the owning lead instead of creating it.\n"
+        )
+        orchestration = "Junior and unknown workers do not orchestrate or fan out tasks.\n"
+
+    guidance = _KANBAN_GUIDANCE_BASE.replace(generic_followup, authority)
+    guidance = guidance.replace(generic_orchestrator, orchestration)
+    guidance = guidance.replace(generic_assignment, "")
+    return guidance
+
+
+# Backward-compatible export for fallback code and size checks.
+KANBAN_GUIDANCE = build_kanban_guidance("unknown", "junior")
 
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
