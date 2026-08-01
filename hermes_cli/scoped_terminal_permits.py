@@ -1314,6 +1314,11 @@ class _WorkerPermitClient:
                 raise ScopedTerminalPermitError("operation_forbidden") from None
             if cwd != operation["cwd"]:
                 raise ScopedTerminalPermitError("operation_forbidden")
+        now = int(time.time())
+        if now < payload["not_before"]:
+            raise ScopedTerminalPermitError("not_yet_valid")
+        if now > payload["expires_at"]:
+            raise ScopedTerminalPermitError("expired")
         return PreparedPermitTicket(
             self,
             self.permit_id_digest,

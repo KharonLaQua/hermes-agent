@@ -876,6 +876,86 @@ def test_worker_bootstrap_claims_bridge_once_and_hides_envelope(
     channel.close()
 
 
+def test_phase_a_rechecks_expiry_after_worker_claim(
+    permit_factory, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(permits, "_WORKER_CHANNEL_CLAIMED", False)
+    monkeypatch.setattr(permits, "_WORKER_PERMIT_CLIENT", None)
+    _, issuer, now, _, _ = permit_factory
+    monkeypatch.setattr(permits.time, "time", lambda: now[0])
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id="t_phase_a_expired",
+        contract=_contract(tmp_path),
+        ttl_seconds=60,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest=_HEX_A,
+    )
+    channel = issuer.activate_spawn_channel(
+        board_slug="default",
+        task_id="t_phase_a_expired",
+        run_id=25,
+        profile="bookkeeper",
+        profile_home=str(tmp_path / "profile"),
+        workspace=str(tmp_path / "workspace"),
+    )
+    channel.send_envelope()
+    client_fd = os.dup(channel.child_fd)
+    monkeypatch.setenv(permits.PERMIT_FD_ENV, str(client_fd))
+    client = claim_worker_permit_channel()
+    payload = json.loads(channel.permit.payload)
+    context = {key: copy.deepcopy(payload[key]) for key in issuer.CONTEXT_FIELDS}
+    command = " ".join(payload["operation_sequence"][0]["argv"])
+    now[0] = payload["expires_at"] + 1
+
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        prepare_scoped_terminal_permit(command, "local", context, client=client)
+
+    assert exc.value.failure_class == "expired"
+    assert issuer.permit_status(payload["permit_id"]) == "issued"
+    channel.close()
+
+
+def test_phase_a_rechecks_not_yet_valid_after_worker_claim(
+    permit_factory, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(permits, "_WORKER_CHANNEL_CLAIMED", False)
+    monkeypatch.setattr(permits, "_WORKER_PERMIT_CLIENT", None)
+    _, issuer, now, _, _ = permit_factory
+    monkeypatch.setattr(permits.time, "time", lambda: now[0])
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id="t_phase_a_not_yet_valid",
+        contract=_contract(tmp_path),
+        ttl_seconds=60,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest=_HEX_A,
+    )
+    channel = issuer.activate_spawn_channel(
+        board_slug="default",
+        task_id="t_phase_a_not_yet_valid",
+        run_id=26,
+        profile="bookkeeper",
+        profile_home=str(tmp_path / "profile"),
+        workspace=str(tmp_path / "workspace"),
+    )
+    channel.send_envelope()
+    client_fd = os.dup(channel.child_fd)
+    monkeypatch.setenv(permits.PERMIT_FD_ENV, str(client_fd))
+    client = claim_worker_permit_channel()
+    payload = json.loads(channel.permit.payload)
+    context = {key: copy.deepcopy(payload[key]) for key in issuer.CONTEXT_FIELDS}
+    command = " ".join(payload["operation_sequence"][0]["argv"])
+    now[0] = payload["not_before"] - 1
+
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        prepare_scoped_terminal_permit(command, "local", context, client=client)
+
+    assert exc.value.failure_class == "not_yet_valid"
+    assert issuer.permit_status(payload["permit_id"]) == "issued"
+    channel.close()
+
+
 def test_phase_a_returns_opaque_ticket_only_after_exact_binding(
     permit_factory, tmp_path, monkeypatch
 ):
@@ -915,6 +995,7 @@ def test_phase_a_returns_opaque_ticket_only_after_exact_binding(
     assert ticket.permit_id_digest == permits._digest(channel.permit.permit_id)
     assert "payload" not in repr(ticket)
     assert "signature" not in repr(ticket)
+    assert issuer.permit_status(payload["permit_id"]) == "issued"
     with pytest.raises(ScopedTerminalPermitError) as exc:
         prepare_scoped_terminal_permit(
             "sh -c 'rclone copyto source destination'",
