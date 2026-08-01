@@ -842,3 +842,29 @@ _ACTIVE_ISSUER_LOCK = threading.RLock()
 def get_active_issuer() -> Optional[ScopedTerminalPermitIssuer]:
     with _ACTIVE_ISSUER_LOCK:
         return _ACTIVE_ISSUER
+
+
+def install_active_issuer(issuer: ScopedTerminalPermitIssuer) -> bool:
+    """Install ``issuer`` only when no process-local issuer is already active."""
+    global _ACTIVE_ISSUER
+    if not isinstance(issuer, ScopedTerminalPermitIssuer) or issuer.closed:
+        return False
+    with _ACTIVE_ISSUER_LOCK:
+        if _ACTIVE_ISSUER is not None:
+            return False
+        _ACTIVE_ISSUER = issuer
+        return True
+
+
+def uninstall_active_issuer(issuer: ScopedTerminalPermitIssuer) -> bool:
+    """Remove only the exact issuer installed by the caller.
+
+    Identity matching prevents delayed cleanup from an older dispatcher-owner
+    lifecycle from clearing a newer owner's issuer.
+    """
+    global _ACTIVE_ISSUER
+    with _ACTIVE_ISSUER_LOCK:
+        if _ACTIVE_ISSUER is not issuer:
+            return False
+        _ACTIVE_ISSUER = None
+        return True

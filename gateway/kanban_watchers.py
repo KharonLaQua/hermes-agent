@@ -937,6 +937,93 @@ class GatewayKanbanWatchersMixin:
                 "on config control alone.", _lock_path,
             )
 
+        # The permit issuer is authority-bearing process state, so its lifetime
+        # is tied to this exact lock acquisition rather than merely to the
+        # dispatcher's config flag.  A task done callback covers cancellation or
+        # an exception during startup before the loop's explicit cleanup sites.
+        _permit_issuer = None
+        _lock_is_owned = [_lock_state == "held"]
+        _cleanup_complete = [False]
+
+        def _cleanup_dispatcher_owner() -> None:
+            if _cleanup_complete[0]:
+                return
+            _cleanup_complete[0] = True
+            if _permit_issuer is not None:
+                _permit_issuer.close()
+                try:
+                    from hermes_cli.scoped_terminal_permits import uninstall_active_issuer
+
+                    uninstall_active_issuer(_permit_issuer)
+                except Exception:
+                    # The issuer is already closed, so losing registry cleanup
+                    # cannot preserve signing authority.  Keep lock teardown
+                    # fail-safe and avoid logging exception contents.
+                    logger.warning("kanban dispatcher: permit issuer uninstall failed")
+            _lock_is_owned[0] = False
+            _release_singleton_lock(_lock_handle)
+            if getattr(self, "_kanban_dispatcher_lock_handle", None) is _lock_handle:
+                self._kanban_dispatcher_lock_handle = None
+
+        _owner_task = asyncio.current_task()
+        if _owner_task is not None:
+            _owner_task.add_done_callback(lambda _task: _cleanup_dispatcher_owner())
+
+        scoped_cfg = kanban_cfg.get("scoped_terminal_permits", {})
+        if _lock_state == "held" and isinstance(scoped_cfg, dict):
+            issuer_profiles = scoped_cfg.get("issuer_profiles")
+            max_ttl_seconds = scoped_cfg.get("max_ttl_seconds")
+            try:
+                active_profile = self._active_profile_name()
+            except Exception:
+                active_profile = None
+            should_start_issuer = (
+                scoped_cfg.get("enabled") is True
+                and isinstance(active_profile, str)
+                and bool(active_profile)
+                and isinstance(issuer_profiles, list)
+                and active_profile in issuer_profiles
+                and type(max_ttl_seconds) is int
+                and 1 <= max_ttl_seconds <= 300
+            )
+            if should_start_issuer:
+                candidate = None
+                try:
+                    from hermes_cli.scoped_terminal_permits import (
+                        ScopedTerminalPermitIssuer,
+                        install_active_issuer,
+                    )
+
+                    candidate = ScopedTerminalPermitIssuer(
+                        issuer_profile=active_profile,
+                        max_ttl_seconds=max_ttl_seconds,
+                        lock_owner_check=lambda: (
+                            _lock_is_owned[0]
+                            and getattr(self, "_kanban_dispatcher_lock_handle", None)
+                            is _lock_handle
+                            and not getattr(_lock_handle, "closed", True)
+                        ),
+                    )
+                    if install_active_issuer(candidate):
+                        _permit_issuer = candidate
+                        logger.info(
+                            "kanban dispatcher: scoped terminal permit issuer active "
+                            "for profile %s",
+                            active_profile,
+                        )
+                    else:
+                        candidate.close()
+                        logger.warning(
+                            "kanban dispatcher: scoped terminal permit issuer already active; "
+                            "new issuer disabled"
+                        )
+                except Exception:
+                    if candidate is not None:
+                        candidate.close()
+                    logger.warning(
+                        "kanban dispatcher: scoped terminal permit issuer startup failed; disabled"
+                    )
+
         try:
             interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
         except (ValueError, TypeError):
@@ -1390,8 +1477,7 @@ class GatewayKanbanWatchersMixin:
                         last_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
-                _release_singleton_lock(self._kanban_dispatcher_lock_handle)
-                self._kanban_dispatcher_lock_handle = None
+                _cleanup_dispatcher_owner()
                 raise
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
@@ -1403,5 +1489,4 @@ class GatewayKanbanWatchersMixin:
                 await asyncio.sleep(min(1.0, interval - slept))
                 slept += 1.0
 
-        _release_singleton_lock(self._kanban_dispatcher_lock_handle)
-        self._kanban_dispatcher_lock_handle = None
+        _cleanup_dispatcher_owner()

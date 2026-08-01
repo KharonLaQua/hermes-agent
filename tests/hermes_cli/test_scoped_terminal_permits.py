@@ -3,10 +3,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import threading
 from dataclasses import replace
 
 import pytest
 
+import hermes_cli.scoped_terminal_permits as permits
 from hermes_cli.scoped_terminal_permits import (
     ScopedTerminalPermitError,
     ScopedTerminalPermitIssuer,
@@ -395,6 +397,49 @@ def test_audit_payload_is_secret_and_content_free(permit_factory, tmp_path):
         assert set(payload) <= allowed_keys
         serialized = json.dumps(payload, sort_keys=True)
         assert all(value not in serialized for value in raw_forbidden)
+
+
+def test_active_issuer_registry_installs_one_and_uninstalls_by_identity(monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    issuers = [
+        ScopedTerminalPermitIssuer(
+            issuer_profile="default",
+            lock_owner_check=lambda: True,
+        )
+        for _ in range(2)
+    ]
+    barrier = threading.Barrier(3)
+    results: list[tuple[ScopedTerminalPermitIssuer, bool]] = []
+
+    def install(issuer):
+        barrier.wait()
+        results.append((issuer, permits.install_active_issuer(issuer)))
+
+    threads = [threading.Thread(target=install, args=(issuer,)) for issuer in issuers]
+    try:
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+
+        assert sorted(installed for _, installed in results) == [False, True]
+        winner = next(issuer for issuer, installed in results if installed)
+        loser = next(issuer for issuer, installed in results if not installed)
+        assert permits.get_active_issuer() is winner
+        assert permits.uninstall_active_issuer(loser) is False
+        assert permits.get_active_issuer() is winner
+        assert permits.uninstall_active_issuer(winner) is True
+        assert permits.get_active_issuer() is None
+
+        assert permits.install_active_issuer(loser) is True
+        assert permits.uninstall_active_issuer(winner) is False
+        assert permits.get_active_issuer() is loser
+    finally:
+        for issuer in issuers:
+            permits.uninstall_active_issuer(issuer)
+            issuer.close()
 
 
 def test_close_erases_authority_and_rejects_future_actions(permit_factory, tmp_path):
