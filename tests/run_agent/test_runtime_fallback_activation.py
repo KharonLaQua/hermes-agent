@@ -7,11 +7,11 @@ Claude CLI turn or keep retrying an xAI OAuth quota response.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from agent.error_classifier import FailoverReason, classify_runtime_error
-from agent.kanban_stop import tool_records_called_kanban_terminal
 from run_agent import AIAgent
 
 
@@ -56,12 +56,45 @@ def _response(content: str):
     )
 
 
+def _tool_response(name: str, arguments: dict, *, call_id: str = "call_test"):
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            id=call_id,
+                            type="function",
+                            function=SimpleNamespace(
+                                name=name,
+                                arguments=json.dumps(arguments),
+                            ),
+                        )
+                    ],
+                ),
+                finish_reason="tool_calls",
+            )
+        ],
+        model="fallback/model",
+        usage=None,
+    )
+
+
 class _XaiSpendingLimitError(Exception):
     status_code = 403
 
     def __init__(self):
         super().__init__("HTTP 403 personal-team-blocked:spending-limit")
         self.body = {"error": {"code": "personal-team-blocked:spending-limit"}}
+        self.response = SimpleNamespace(headers={})
+
+
+class _RateLimitedError(Exception):
+    status_code = 429
+
+    def __init__(self):
+        super().__init__("HTTP 429 rate limit exceeded")
         self.response = SimpleNamespace(headers={})
 
 
@@ -182,62 +215,161 @@ def test_xai_spending_limit_turn_continues_through_fallback_transport():
     fallback_client.chat.completions.create.assert_called_once()
 
 
-def test_failed_first_fallback_advances_to_second_exactly_once():
+def test_claude_partial_fallback_chain_advances_once_per_route():
     agent = _make_agent(
         [
             {"provider": "first", "model": "first-model"},
             {"provider": "second", "model": "second-model"},
         ]
+    )
+    agent.api_mode = "claude_cli"
+    agent.runtime_fallbacks_enabled = True
+    agent._run_claude_cli_turn = MagicMock(return_value={
+        "final_response": "Claude CLI turn failed: weekly limit",
+        "messages": [],
+        "api_calls": 0,
+        "completed": False,
+        "partial": True,
+        "error": "weekly usage limit reached",
+    })
+    first_client = _client("first", "first-model")
+    first_client.chat.completions.create.side_effect = _RateLimitedError()
+    second_client = _client("second", "second-model")
+    second_client.chat.completions.create.return_value = _response(
+        "continued on second fallback"
     )
     resolutions = []
 
     def resolve(provider, model=None, **_kwargs):
         resolutions.append((provider, model))
         if provider == "first":
-            return None, None
-        return _client(provider, model), model
+            return first_client, model
+        return second_client, model
 
     with patch("agent.auxiliary_client.resolve_provider_client", side_effect=resolve):
-        assert agent._try_activate_fallback(FailoverReason.rate_limit) is True
+        result = agent.run_conversation("continue")
 
+    assert result["final_response"] == "continued on second fallback"
+    agent._run_claude_cli_turn.assert_called_once()
     assert resolutions == [("first", "first-model"), ("second", "second-model")]
+    first_client.chat.completions.create.assert_called_once()
+    second_client.chat.completions.create.assert_called_once()
     assert agent._fallback_index == 2
     assert agent.provider == "second"
     assert agent.model == "second-model"
 
 
-def test_exhausted_fallback_chain_stops_once_without_replaying_primary():
+def test_claude_partial_exhausts_fallback_chain_without_replaying_primary():
     agent = _make_agent(
         [
             {"provider": "first", "model": "first-model"},
             {"provider": "second", "model": "second-model"},
         ]
     )
+    agent.api_mode = "claude_cli"
+    agent.runtime_fallbacks_enabled = True
+    agent._api_max_retries = 1
+    agent._run_claude_cli_turn = MagicMock(return_value={
+        "final_response": "Claude CLI turn failed: weekly limit",
+        "messages": [],
+        "api_calls": 0,
+        "completed": False,
+        "partial": True,
+        "error": "weekly usage limit reached",
+    })
+    first_client = _client("first", "first-model")
+    first_client.chat.completions.create.side_effect = _RateLimitedError()
+    second_client = _client("second", "second-model")
+    second_client.chat.completions.create.side_effect = _RateLimitedError()
     resolutions = []
 
     def resolve(provider, model=None, **_kwargs):
         resolutions.append((provider, model))
-        return None, None
+        if provider == "first":
+            return first_client, model
+        return second_client, model
 
     with patch("agent.auxiliary_client.resolve_provider_client", side_effect=resolve):
-        assert agent._try_activate_fallback(FailoverReason.billing) is False
-        assert agent._try_activate_fallback(FailoverReason.billing) is False
+        result = agent.run_conversation("continue")
 
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["error"]
+    agent._run_claude_cli_turn.assert_called_once()
     assert resolutions == [("first", "first-model"), ("second", "second-model")]
+    first_client.chat.completions.create.assert_called_once()
+    second_client.chat.completions.create.assert_called_once()
     assert agent._fallback_index == 2
-    assert agent.provider == "anthropic"
+    assert agent.provider == "second"
 
 
-def test_successful_fallback_worker_keeps_terminal_protocol_continuity():
-    from agent.conversation_loop import try_activate_runtime_fallback
+def test_claude_partial_fallback_completes_kanban_run_without_protocol_violation(
+    tmp_path, monkeypatch,
+):
+    """A recovered runtime turn may close its worker task through the normal tool loop."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools  # noqa: F401 - imports the registered handler
+    from tools.registry import registry
 
-    agent = _RuntimeAgent()
-    assert try_activate_runtime_fallback(
-        agent, RuntimeError("weekly usage limit reached"), runtime="claude_cli"
-    ) is True
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    kb.init_db(db_path)
+    conn = kb.connect(db_path)
+    try:
+        task_id = kb.create_task(conn, title="fallback terminal handoff", assignee="worker")
+        claimed = kb.claim_task(conn, task_id, claimer="test-worker")
+        assert claimed is not None
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        run_id = int(row["current_run_id"])
 
-    terminal_ledger = [{"name": "kanban_complete", "is_error": False}]
-    assert tool_records_called_kanban_terminal(terminal_ledger) is True
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+
+        agent = _make_agent([{"provider": "openai", "model": "fallback-model"}])
+        agent.api_mode = "claude_cli"
+        agent.runtime_fallbacks_enabled = True
+        agent._run_claude_cli_turn = MagicMock(return_value={
+            "final_response": "Claude CLI turn failed: weekly limit",
+            "messages": [],
+            "api_calls": 0,
+            "completed": False,
+            "partial": True,
+            "error": "weekly usage limit reached",
+        })
+        entry = registry.get_entry("kanban_complete")
+        assert entry is not None
+        agent.tools = [{"type": "function", "function": entry.schema}]
+        agent.valid_tool_names = {"kanban_complete"}
+
+        fallback_client = _client("openai", "fallback-model")
+        fallback_client.chat.completions.create.side_effect = [
+            _tool_response("kanban_complete", {"summary": "fallback completed worker task"}),
+            _response("terminal handoff finished"),
+        ]
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fallback_client, "fallback-model"),
+        ):
+            result = agent.run_conversation("continue", task_id=task_id)
+
+        assert result["final_response"] == "terminal handoff finished"
+        agent._run_claude_cli_turn.assert_called_once()
+        assert fallback_client.chat.completions.create.call_count == 2
+        task = kb.get_task(conn, task_id)
+        assert task.status == "done"
+        run = kb.latest_run(conn, task_id)
+        assert run is not None
+        assert run.outcome == "completed"
+        assert kb.detect_crashed_workers(conn) == []
+        assert not any(
+            event.kind == "protocol_violation"
+            for event in kb.list_events(conn, task_id)
+        )
+    finally:
+        conn.close()
 
 
 def test_activated_fallback_re_resolves_reasoning_override():
