@@ -90,6 +90,13 @@ _OPERATION_FIELDS = frozenset(
         "execution_context_digest",
     }
 )
+_OPERATION_PREFIXES = {
+    "rclone_copy": ("rclone", "copyto"),
+    "rclone_verify": ("rclone", "check"),
+    "unlink_manifest_batch": ("rm", "--"),
+    "rmdir_manifest_batch": ("rmdir", "--"),
+}
+_SHELL_META_CHARS = frozenset(";&|<>`$*?[]{}~'\\\"\x00")
 
 
 class ScopedTerminalPermitError(RuntimeError):
@@ -231,6 +238,8 @@ def _canonical_path(value: Any) -> str:
     path = _require_text(value)
     if not os.path.isabs(path):
         raise ScopedTerminalPermitError("malformed")
+    if ".." in path.split(os.sep):
+        raise ScopedTerminalPermitError("malformed")
     return os.path.realpath(path)
 
 
@@ -264,7 +273,101 @@ def _validate_destination(value: Any) -> dict[str, Any]:
     return {"kind": kind, "canonical_uri": uri}
 
 
-def _validate_operations(value: Any) -> list[dict[str, Any]]:
+def _require_argv_text(value: Any) -> str:
+    if isinstance(value, str) and any(ord(char) < 32 for char in value):
+        raise ScopedTerminalPermitError("operation_forbidden")
+    return _require_text(value)
+
+
+def _validate_simple_argv(argv: list[str]) -> None:
+    for arg in argv:
+        if any(char in _SHELL_META_CHARS for char in arg):
+            raise ScopedTerminalPermitError("operation_forbidden")
+        if any(token in arg for token in ("$(", "${", "<(", ">(", "))")):
+            raise ScopedTerminalPermitError("operation_forbidden")
+
+
+def _canonical_operation_path(value: str) -> str:
+    if not os.path.isabs(value) or ".." in value.split(os.sep):
+        raise ScopedTerminalPermitError("operation_forbidden")
+    canonical = os.path.realpath(value)
+    if canonical != value:
+        raise ScopedTerminalPermitError("operation_forbidden")
+    return canonical
+
+
+def _path_is_within(path: str, root: str) -> bool:
+    try:
+        return os.path.commonpath((path, root)) == root and path != root
+    except ValueError:
+        return False
+
+
+def _validate_manifest_targets(
+    operation: Mapping[str, Any], source: Mapping[str, Any], *, directories: bool
+) -> None:
+    argv = operation["argv"]
+    if operation["manifest_ref"] is None or source["manifest_path"] is None:
+        raise ScopedTerminalPermitError("operation_forbidden")
+    targets = argv[2:]
+    if not targets:
+        raise ScopedTerminalPermitError("operation_forbidden")
+    root = source["canonical_path"]
+    canonical_targets = [_canonical_operation_path(target) for target in targets]
+    if source["kind"] == "file":
+        if any(target != root for target in canonical_targets):
+            raise ScopedTerminalPermitError("operation_forbidden")
+    elif any(not _path_is_within(target, root) for target in canonical_targets):
+        raise ScopedTerminalPermitError("operation_forbidden")
+    if len(set(canonical_targets)) != len(canonical_targets):
+        raise ScopedTerminalPermitError("operation_forbidden")
+    if directories:
+        for earlier_index, earlier in enumerate(canonical_targets):
+            for later in canonical_targets[earlier_index + 1 :]:
+                if _path_is_within(later, earlier):
+                    raise ScopedTerminalPermitError("operation_forbidden")
+
+
+def _validate_operation_policy(
+    operation: Mapping[str, Any],
+    source: Mapping[str, Any],
+    destination: Mapping[str, Any],
+    workspace: str,
+) -> None:
+    kind = operation["kind"]
+    prefix = _OPERATION_PREFIXES.get(kind)
+    if prefix is None or operation["cwd"] != workspace:
+        raise ScopedTerminalPermitError("operation_forbidden")
+    argv = operation["argv"]
+    _validate_simple_argv(argv)
+    if operation["source_ref"] != "source" or operation["destination_ref"] != "destination":
+        raise ScopedTerminalPermitError("operation_forbidden")
+    if kind in {"rclone_copy", "rclone_verify"}:
+        if (
+            len(argv) != 4
+            or tuple(argv[:2]) != prefix
+            or argv[2] != source["canonical_path"]
+            or argv[3] != destination["canonical_uri"]
+            or operation["manifest_ref"] is not None
+        ):
+            raise ScopedTerminalPermitError("operation_forbidden")
+        return
+    if tuple(argv[:2]) != prefix:
+        raise ScopedTerminalPermitError("operation_forbidden")
+    _validate_manifest_targets(
+        operation,
+        source,
+        directories=kind == "rmdir_manifest_batch",
+    )
+
+
+def _validate_operations(
+    value: Any,
+    *,
+    source: Mapping[str, Any],
+    destination: Mapping[str, Any],
+    workspace: str,
+) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not value:
         raise ScopedTerminalPermitError("malformed")
     normalized: list[dict[str, Any]] = []
@@ -277,8 +380,8 @@ def _validate_operations(value: Any) -> list[dict[str, Any]]:
         item["kind"] = _require_text(item["kind"])
         if not isinstance(item["argv"], list) or not item["argv"]:
             raise ScopedTerminalPermitError("malformed")
-        item["argv"] = [_require_text(arg) for arg in item["argv"]]
-        item["cwd"] = _canonical_path(item["cwd"])
+        item["argv"] = [_require_argv_text(arg) for arg in item["argv"]]
+        item["cwd"] = _canonical_operation_path(item["cwd"])
         if item["background"] is not False or item["pty"] is not False:
             raise ScopedTerminalPermitError("malformed")
         for field in ("source_ref", "destination_ref"):
@@ -286,6 +389,7 @@ def _validate_operations(value: Any) -> list[dict[str, Any]]:
         if item["manifest_ref"] is not None:
             item["manifest_ref"] = _require_text(item["manifest_ref"])
         item["execution_context_digest"] = _require_digest(item["execution_context_digest"])
+        _validate_operation_policy(item, source, destination, workspace)
         normalized.append(item)
     return normalized
 
@@ -301,7 +405,12 @@ def _normalize_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
     copied["workspace"] = _canonical_path(copied["workspace"])
     copied["source"] = _validate_source(copied["source"])
     copied["destination"] = _validate_destination(copied["destination"])
-    copied["operation_sequence"] = _validate_operations(copied["operation_sequence"])
+    copied["operation_sequence"] = _validate_operations(
+        copied["operation_sequence"],
+        source=copied["source"],
+        destination=copied["destination"],
+        workspace=copied["workspace"],
+    )
     index = _require_int(copied["authorized_operation_index"])
     if index >= len(copied["operation_sequence"]):
         raise ScopedTerminalPermitError("malformed")
@@ -328,7 +437,12 @@ def _validate_payload(payload: dict[str, Any]) -> None:
     _canonical_path(payload["workspace"])
     _validate_source(payload["source"])
     _validate_destination(payload["destination"])
-    operations = _validate_operations(payload["operation_sequence"])
+    operations = _validate_operations(
+        payload["operation_sequence"],
+        source=payload["source"],
+        destination=payload["destination"],
+        workspace=payload["workspace"],
+    )
     if _digest(_canonical_bytes(operations)) != payload["operation_sequence_digest"]:
         raise ScopedTerminalPermitError("malformed")
     index = _require_int(payload["authorized_operation_index"])

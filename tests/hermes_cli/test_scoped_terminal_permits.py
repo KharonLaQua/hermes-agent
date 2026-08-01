@@ -209,6 +209,139 @@ def test_arm_copies_an_immutable_normalized_contract(permit_factory, tmp_path):
     assert json.loads(envelope.payload)["source"]["canonical_path"] == original_path
 
 
+@pytest.mark.parametrize(
+    ("kind", "argv"),
+    [
+        ("rclone_copy", ["sh", "-c", "rclone copyto source destination"]),
+        ("rclone_copy", ["bash", "-c", "rclone copyto source destination"]),
+        ("rclone_copy", ["rclone", "copyto", "source", "destination", "&&", "rm"]),
+        ("rclone_copy", ["rclone", "copyto", "source", "destination", "|"]),
+        ("rclone_copy", ["rclone", "copyto", "source", "destination", ">", "out"]),
+        ("rclone_copy", ["rclone", "copyto", "$(touch", "source)", "destination"]),
+        ("rclone_copy", ["rclone", "purge", "source"]),
+        ("rclone_copy", ["rclone", "delete", "source"]),
+        ("rclone_copy", ["rclone", "copyto", "*.bin", "vault:reviewed/source.bin"]),
+        ("unlink_manifest_batch", ["rm", "-r", "--", "/tmp/source.bin"]),
+        ("unlink_manifest_batch", ["rm", "--", "/tmp/unrelated.bin"]),
+        ("unknown_operation", ["anything"]),
+    ],
+)
+def test_arm_rejects_forbidden_operation_before_pending_arm(
+    permit_factory, tmp_path, kind, argv
+):
+    _, issuer, _, events, _ = permit_factory
+    contract = _contract(tmp_path)
+    contract["operation_sequence"][0]["kind"] = kind
+    contract["operation_sequence"][0]["argv"] = argv
+
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        issuer.arm_next_run(
+            board_slug="default",
+            task_id="t_forbidden",
+            contract=contract,
+            ttl_seconds=60,
+            evidence_task_id="t_evidence",
+            evidence_artifact_digest=_HEX_A,
+        )
+
+    assert exc.value.failure_class == "operation_forbidden"
+    assert events == []
+    with pytest.raises(ScopedTerminalPermitError) as missing:
+        issuer.activate_for_spawn(
+            board_slug="default",
+            task_id="t_forbidden",
+            run_id=17,
+            profile="bookkeeper",
+            profile_home=str(tmp_path / "profile"),
+            workspace=str(tmp_path / "workspace"),
+        )
+    assert missing.value.failure_class == "missing"
+
+
+@pytest.mark.parametrize(
+    "path_mutation",
+    [
+        lambda contract, tmp_path: contract["operation_sequence"][0].update(
+            cwd=str(tmp_path / "workspace" / ".." / "workspace")
+        ),
+        lambda contract, tmp_path: contract["operation_sequence"][0]["argv"].__setitem__(
+            2, "relative/source.bin"
+        ),
+    ],
+)
+def test_arm_rejects_relative_or_traversal_operation_paths(
+    permit_factory, tmp_path, path_mutation
+):
+    _, issuer, _, events, _ = permit_factory
+    contract = _contract(tmp_path)
+    path_mutation(contract, tmp_path)
+
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        issuer.arm_next_run(
+            board_slug="default",
+            task_id="t_path_forbidden",
+            contract=contract,
+            ttl_seconds=60,
+            evidence_task_id="t_evidence",
+            evidence_artifact_digest=_HEX_A,
+        )
+
+    assert exc.value.failure_class == "operation_forbidden"
+    assert events == []
+
+
+def test_arm_accepts_exact_rclone_verify_argv(permit_factory, tmp_path):
+    _, issuer, _, _, _ = permit_factory
+    contract = _contract(tmp_path)
+    source = contract["source"]["canonical_path"]
+    destination = contract["destination"]["canonical_uri"]
+    contract["operation_sequence"][0]["kind"] = "rclone_verify"
+    contract["operation_sequence"][0]["argv"] = ["rclone", "check", source, destination]
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id="t_verify",
+        contract=contract,
+        ttl_seconds=60,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest=_HEX_A,
+    )
+    envelope = issuer.activate_for_spawn(
+        board_slug="default",
+        task_id="t_verify",
+        run_id=17,
+        profile="bookkeeper",
+        profile_home=str(tmp_path / "profile"),
+        workspace=str(tmp_path / "workspace"),
+    )
+    assert json.loads(envelope.payload)["operation_sequence"][0]["kind"] == "rclone_verify"
+
+
+@pytest.mark.parametrize("kind", ["unlink_manifest_batch", "rmdir_manifest_batch"])
+def test_arm_accepts_manifest_bounded_batch_forms(permit_factory, tmp_path, kind):
+    _, issuer, _, _, _ = permit_factory
+    contract = _contract(tmp_path)
+    root = str(tmp_path)
+    contract["source"]["kind"] = "directory"
+    contract["source"]["canonical_path"] = root
+    contract["operation_sequence"][0]["kind"] = kind
+    contract["operation_sequence"][0]["manifest_ref"] = "manifest"
+    if kind == "unlink_manifest_batch":
+        targets = [str(tmp_path / "file-a.bin"), str(tmp_path / "nested" / "file-b.bin")]
+        executable = "rm"
+    else:
+        targets = [str(tmp_path / "nested" / "empty"), str(tmp_path / "nested")]
+        executable = "rmdir"
+    contract["operation_sequence"][0]["argv"] = [executable, "--", *targets]
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id=f"t_{kind}",
+        contract=contract,
+        ttl_seconds=60,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest=_HEX_A,
+    )
+
+
 def test_activate_binds_claimed_run_profile_home_and_workspace(permit_factory):
     issue, _, _, _, _ = permit_factory
     _, envelope, _, payload = issue()
