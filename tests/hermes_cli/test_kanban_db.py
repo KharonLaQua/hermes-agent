@@ -4289,6 +4289,237 @@ def test_detect_stale_does_not_tick_failure_counter(kanban_home, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Durable-progress guard — detect_stale_running integration
+# ---------------------------------------------------------------------------
+
+def _progress_guard_config(*, enabled=True, eligible_profiles=("worker",)):
+    return {
+        "enabled": enabled,
+        "interval_seconds": 600,
+        "eligible_profiles": list(eligible_profiles),
+        "protected_profiles": ["robber", "sniper"],
+        "fresh_liveness_seconds": 3600,
+        "log_tail_bytes": 262144,
+    }
+
+
+def _create_progress_guard_task(conn, *, title="guarded", body="", assignee="worker"):
+    task_id = kb.create_task(
+        conn, title=title, body=body, assignee=assignee,
+    )
+    claimed = kb.claim_task(conn, task_id)
+    assert claimed is not None
+    kb._set_worker_pid(conn, task_id, 12345)
+    return task_id, int(kb.get_task(conn, task_id).current_run_id)
+
+
+def _write_progress_guard_log(task_id, text):
+    path = kb.worker_log_path(task_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def test_progress_guard_default_off_is_exact_noop(kanban_home):
+    with kb.connect() as conn:
+        task_id, run_id = _create_progress_guard_task(conn)
+        _write_progress_guard_log(
+            task_id,
+            "  ┊ 🔎 grep progress 0.2s\n  ┊ 🔎 grep progress 0.2s",
+        )
+
+        assert kb.detect_stale_running(
+            conn,
+            stale_timeout_seconds=0,
+            progress_guard_config=_progress_guard_config(enabled=False),
+        ) == []
+        assert kb.get_task(conn, task_id).status == "running"
+        events = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind LIKE 'progress_guard_%'",
+            (task_id, run_id),
+        ).fetchall()
+        assert events == []
+        metadata = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+        ).fetchone()["metadata"]
+        assert metadata is None
+
+
+def test_progress_guard_emits_one_warning_then_reseats_without_failure_tick(
+    kanban_home, monkeypatch,
+):
+    import json
+    import hermes_cli.kanban_db as _kb
+
+    now = [1_000_000]
+    monkeypatch.setattr(_kb.time, "time", lambda: now[0])
+    monkeypatch.setattr(
+        _kb,
+        "_terminate_reclaimed_worker",
+        lambda *a, **k: {
+            "termination_attempted": True,
+            "host_local": True,
+            "terminated": True,
+        },
+    )
+
+    with kb.connect() as conn:
+        task_id, run_id = _create_progress_guard_task(conn)
+        _write_progress_guard_log(
+            task_id,
+            "  ┊ 🔎 grep progress 0.2s\n  ┊ 🔎 grep progress 0.2s",
+        )
+        cfg = _progress_guard_config()
+
+        # First observation establishes a run-scoped baseline only.
+        assert kb.detect_stale_running(
+            conn, stale_timeout_seconds=0, progress_guard_config=cfg,
+        ) == []
+        now[0] += 1200
+        assert kb.detect_stale_running(
+            conn, stale_timeout_seconds=0, progress_guard_config=cfg,
+        ) == []
+        now[0] += 60
+        assert kb.detect_stale_running(
+            conn, stale_timeout_seconds=0, progress_guard_config=cfg,
+        ) == []
+
+        warnings = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'progress_guard_warning'",
+            (task_id, run_id),
+        ).fetchall()
+        assert len(warnings) == 1
+        warning_payload = json.loads(warnings[0]["payload"])
+        assert warning_payload["run_id"] == run_id
+        assert warning_payload["reason"] == "durable_progress_stalled"
+        assert warning_payload["nonprogress_intervals"] == 2
+        assert warning_payload["repeated_nonprogress"] is True
+
+        now[0] = 1_001_800
+        assert kb.detect_stale_running(
+            conn, stale_timeout_seconds=0, progress_guard_config=cfg,
+        ) == [task_id]
+        assert kb.get_task(conn, task_id).status == "ready"
+        row = conn.execute(
+            "SELECT consecutive_failures FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        assert row["consecutive_failures"] in (0, None)
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'progress_guard_reseated'",
+            (task_id, run_id),
+        ).fetchone()
+        assert event is not None
+        payload = json.loads(event["payload"])
+        assert payload["run_id"] == run_id
+        assert payload["reason"] == "durable_progress_stalled"
+        assert payload["nonprogress_intervals"] == 3
+        assert "raw_log" not in event["payload"]
+        assert "task body" not in event["payload"]
+
+
+def test_progress_guard_fresh_write_resets_warning_window(kanban_home, monkeypatch):
+    import hermes_cli.kanban_db as _kb
+
+    now = [2_000_000]
+    monkeypatch.setattr(_kb.time, "time", lambda: now[0])
+    with kb.connect() as conn:
+        task_id, run_id = _create_progress_guard_task(conn)
+        cfg = _progress_guard_config()
+        _write_progress_guard_log(task_id, "  ┊ 🔎 grep progress 0.2s")
+        kb.detect_stale_running(
+            conn, stale_timeout_seconds=0, progress_guard_config=cfg,
+        )
+        now[0] += 1200
+        kb.detect_stale_running(
+            conn, stale_timeout_seconds=0, progress_guard_config=cfg,
+        )
+
+        _write_progress_guard_log(
+            task_id,
+            "  ┊ 🔎 grep progress 0.2s\n  ┊ ✍️ write /tmp/result.md 0.1s",
+        )
+        now[0] += 10
+        assert kb.detect_stale_running(
+            conn, stale_timeout_seconds=0, progress_guard_config=cfg,
+        ) == []
+        state = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+        ).fetchone()["metadata"]
+        assert '"warning_sent": false' in state
+        assert '"progress_category": "artifact_write"' in state
+        assert kb.get_task(conn, task_id).status == "running"
+
+
+def test_progress_guard_stale_prior_run_cannot_reseat_new_attempt(
+    kanban_home, monkeypatch,
+):
+    import hermes_cli.kanban_db as _kb
+
+    now = [3_000_000]
+    monkeypatch.setattr(_kb.time, "time", lambda: now[0])
+    with kb.connect() as conn:
+        task_id, old_run = _create_progress_guard_task(conn)
+        cfg = _progress_guard_config()
+        _write_progress_guard_log(task_id, "  ┊ 🔎 grep progress 0.2s")
+        kb.detect_stale_running(
+            conn, stale_timeout_seconds=0, progress_guard_config=cfg,
+        )
+        now[0] += 1200
+        kb.detect_stale_running(
+            conn, stale_timeout_seconds=0, progress_guard_config=cfg,
+        )
+
+        kb.complete_task(conn, task_id, summary="old attempt done")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,),
+            )
+        assert kb.claim_task(conn, task_id) is not None
+        new_run = int(kb.get_task(conn, task_id).current_run_id)
+        assert new_run != old_run
+
+        now[0] += 700
+        assert kb.detect_stale_running(
+            conn, stale_timeout_seconds=0, progress_guard_config=cfg,
+        ) == []
+        assert kb.get_task(conn, task_id).status == "running"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE run_id = ? "
+            "AND kind = 'progress_guard_reseated'",
+            (new_run,),
+        ).fetchone()[0] == 0
+
+
+def test_progress_guard_hard_exemptions_emit_no_events(kanban_home):
+    cases = [
+        ("DON-ONLY: connect the device", "", "worker"),
+        ("GATE: acceptance decision", "", "worker"),
+        ("market execution", "trading route safety", "worker"),
+        ("ordinary", "", "sniper"),
+    ]
+    with kb.connect() as conn:
+        for title, body, assignee in cases:
+            task_id, run_id = _create_progress_guard_task(
+                conn, title=title, body=body, assignee=assignee,
+            )
+            _write_progress_guard_log(task_id, "  ┊ 🔎 grep progress 0.2s")
+            kb.detect_stale_running(
+                conn,
+                stale_timeout_seconds=0,
+                progress_guard_config=_progress_guard_config(
+                    eligible_profiles=("worker", "sniper"),
+                ),
+            )
+            assert conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE run_id = ? "
+                "AND kind LIKE 'progress_guard_%'",
+                (run_id,),
+            ).fetchone()[0] == 0
+
+
+# ---------------------------------------------------------------------------
 # Corruption guard (issue #30687)
 # ---------------------------------------------------------------------------
 

@@ -2913,6 +2913,18 @@ DEFAULT_CONFIG = {
         # Global shared-harness task-create authority boundary. Default OFF;
         # lane profiles cannot override this cross-fleet policy.
         "authority_enforcement": {"enabled": False},
+        # Durable-progress guard. Default OFF and eligible for no profiles;
+        # rollout requires both explicit enablement and an allowlisted profile.
+        # Heartbeats remain liveness-only. Market/trading and Don-only work are
+        # hard protected in the dispatcher even if a profile is allowlisted.
+        "progress_guard": {
+            "enabled": False,
+            "interval_seconds": 600,
+            "eligible_profiles": [],
+            "protected_profiles": ["robber", "sniper"],
+            "fresh_liveness_seconds": 3600,
+            "log_tail_bytes": 262144,
+        },
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false

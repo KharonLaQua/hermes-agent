@@ -7089,11 +7089,408 @@ def enforce_max_runtime(
 _STALE_HEARTBEAT_GAP_SECONDS = 3600
 
 
+def _resolve_progress_guard_config(explicit: Optional[dict]) -> dict:
+    """Return the progress-guard config without ever making OFF unsafe."""
+    if explicit is not None:
+        return dict(explicit)
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        return dict(((config.get("kanban") or {}).get("progress_guard") or {}))
+    except Exception:
+        return {"enabled": False}
+
+
+def _progress_guard_positive_int(
+    config: dict, key: str, default: int, *, maximum: int,
+) -> int:
+    try:
+        value = int(config.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(1, min(value, maximum))
+
+
+def _progress_guard_exempt_reason(row: sqlite3.Row, config: dict) -> Optional[str]:
+    """Return a typed hard exemption, or None when the run is eligible."""
+    assignee = str(row["assignee"] or "").strip()
+    eligible = {
+        str(profile).strip()
+        for profile in (config.get("eligible_profiles") or [])
+        if str(profile).strip()
+    }
+    if not assignee or assignee not in eligible:
+        return "profile_not_eligible"
+
+    protected = {"robber", "sniper"} | {
+        str(profile).strip()
+        for profile in (config.get("protected_profiles") or [])
+        if str(profile).strip()
+    }
+    if assignee in protected:
+        return "market_trading"
+
+    contract = f"{row['title'] or ''}\n{row['body'] or ''}".lower()
+    if "don-only:" in contract or "don only:" in contract:
+        return "don_only"
+    if any(
+        marker in contract
+        for marker in (
+            "acceptance gate",
+            "review-required:",
+            "gate:",
+            "verify:",
+            "review:",
+            "close:",
+        )
+    ):
+        return "acceptance_gate"
+    if any(
+        marker in contract
+        for marker in ("market", "trading", "broker", "position", "real-money")
+    ):
+        return "market_trading"
+    if "decision:" in contract or "consigliere" in contract:
+        return "team_lead_judgment"
+    return None
+
+
+def _progress_guard_run_metadata(
+    conn: sqlite3.Connection, run_id: int,
+) -> tuple[Optional[dict], Optional[dict]]:
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ? AND status = 'running'",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        return None, None
+    raw = row["metadata"]
+    if raw:
+        try:
+            metadata = json.loads(raw)
+        except (TypeError, ValueError):
+            return None, None
+        if not isinstance(metadata, dict):
+            return None, None
+    else:
+        metadata = {}
+    state = metadata.get("progress_guard")
+    return metadata, state if isinstance(state, dict) else None
+
+
+def _write_progress_guard_state(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: int,
+    metadata: dict,
+    state: dict,
+) -> bool:
+    metadata = dict(metadata)
+    metadata["progress_guard"] = state
+    cur = conn.execute(
+        "UPDATE task_runs SET metadata = ? "
+        "WHERE id = ? AND task_id = ? AND status = 'running' "
+        "AND EXISTS (SELECT 1 FROM tasks WHERE id = ? AND status = 'running' "
+        "            AND current_run_id = ?)",
+        (json.dumps(metadata, ensure_ascii=False), run_id, task_id, task_id, run_id),
+    )
+    return cur.rowcount == 1
+
+
+def _progress_guard_event_payload(
+    *,
+    run_id: int,
+    reason: str,
+    progress_age_seconds: int,
+    progress_category: Optional[str],
+    nonprogress_intervals: int,
+    signals: dict,
+) -> dict:
+    """Build the privacy-bounded audit payload (never raw log/task/tool data)."""
+    return {
+        "run_id": int(run_id),
+        "reason": reason,
+        "progress_age_seconds": max(0, int(progress_age_seconds)),
+        "progress_category": progress_category or "none",
+        "nonprogress_intervals": max(0, int(nonprogress_intervals)),
+        "repeated_nonprogress": bool(
+            signals.get("repeated_nonprogress_signature_count", 0)
+        ),
+        "context_compaction": bool(signals.get("context_compaction_count", 0)),
+        "gui_control": bool(signals.get("gui_control_count", 0)),
+        "evidence_produced": bool(signals.get("evidence_produced")),
+        "post_evidence_churn": bool(
+            signals.get("post_evidence_nonprogress_count", 0)
+        ),
+        "long_operation": bool(signals.get("long_operation_active")),
+        "fresh_liveness": bool(signals.get("fresh_liveness")),
+    }
+
+
+def _detect_progress_guard_stalls(
+    conn: sqlite3.Connection,
+    *,
+    config: dict,
+    board: Optional[str],
+    signal_fn=None,
+) -> list[str]:
+    """Warn/reseat eligible runs whose durable worker-log progress stalls."""
+    if not bool(config.get("enabled", False)):
+        return []
+    eligible = config.get("eligible_profiles") or []
+    if not eligible:
+        return []
+
+    from hermes_cli.kanban_progress import analyze_worker_log, decide_progress_action
+
+    now = int(time.time())
+    interval_seconds = _progress_guard_positive_int(
+        config, "interval_seconds", 600, maximum=3600,
+    )
+    fresh_liveness_seconds = _progress_guard_positive_int(
+        config, "fresh_liveness_seconds", 3600, maximum=24 * 3600,
+    )
+    log_tail_bytes = _progress_guard_positive_int(
+        config, "log_tail_bytes", 262144, maximum=1024 * 1024,
+    )
+    reseated: list[str] = []
+    rows = conn.execute(
+        "SELECT t.id, t.title, t.body, t.assignee, t.status, t.worker_pid, "
+        "       t.claim_lock, t.last_heartbeat_at, t.current_run_id, "
+        "       r.started_at AS run_started_at, r.max_runtime_seconds "
+        "FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running' AND r.status = 'running'"
+    ).fetchall()
+
+    for row in rows:
+        task_id = str(row["id"])
+        run_id = int(row["current_run_id"])
+        if _progress_guard_exempt_reason(row, config):
+            continue
+
+        metadata, state = _progress_guard_run_metadata(conn, run_id)
+        if metadata is None:
+            # Do not overwrite malformed/foreign run metadata merely to make
+            # the optional guard work. Ambiguous state fails open.
+            continue
+        log_text = read_worker_log(
+            task_id, tail_bytes=log_tail_bytes, board=board,
+        ) or ""
+        signals = analyze_worker_log(log_text)
+        last_hb = row["last_heartbeat_at"]
+        hb_age = now - int(last_hb) if last_hb is not None else None
+        signals["fresh_liveness"] = bool(
+            hb_age is not None and hb_age <= fresh_liveness_seconds
+        )
+        current_count = int(signals.get("durable_progress_count") or 0)
+        current_signature = signals.get("durable_progress_signature")
+        current_category = signals.get("durable_progress_category")
+
+        if state is None:
+            baseline = {
+                "run_id": run_id,
+                "progress_at": now,
+                "progress_count": current_count,
+                "progress_signature": current_signature,
+                "progress_category": current_category,
+                "warning_sent": False,
+            }
+            with write_txn(conn):
+                _write_progress_guard_state(
+                    conn,
+                    task_id=task_id,
+                    run_id=run_id,
+                    metadata=metadata,
+                    state=baseline,
+                )
+            continue
+
+        # The state is run-scoped. Treat any mismatch as stale prior-attempt
+        # data and establish a new baseline rather than touching this worker.
+        if int(state.get("run_id") or -1) != run_id:
+            with write_txn(conn):
+                _write_progress_guard_state(
+                    conn,
+                    task_id=task_id,
+                    run_id=run_id,
+                    metadata=metadata,
+                    state={
+                        "run_id": run_id,
+                        "progress_at": now,
+                        "progress_count": current_count,
+                        "progress_signature": current_signature,
+                        "progress_category": current_category,
+                        "warning_sent": False,
+                    },
+                )
+            continue
+
+        previous_count = int(state.get("progress_count") or 0)
+        previous_signature = state.get("progress_signature")
+        progress_changed = (
+            current_count > previous_count
+            or bool(current_signature and current_signature != previous_signature)
+        )
+        log_window_reset = current_count < previous_count
+        if progress_changed or log_window_reset:
+            state = dict(state)
+            state.update(
+                {
+                    "progress_at": now,
+                    "progress_count": current_count,
+                    "progress_signature": current_signature,
+                    "progress_category": current_category,
+                    "warning_sent": False,
+                }
+            )
+            payload = _progress_guard_event_payload(
+                run_id=run_id,
+                reason=(
+                    "durable_progress_changed"
+                    if progress_changed else "log_window_reset"
+                ),
+                progress_age_seconds=0,
+                progress_category=current_category,
+                nonprogress_intervals=0,
+                signals=signals,
+            )
+            with write_txn(conn):
+                if _write_progress_guard_state(
+                    conn,
+                    task_id=task_id,
+                    run_id=run_id,
+                    metadata=metadata,
+                    state=state,
+                ):
+                    _append_event(
+                        conn, task_id, "progress_guard_progress", payload,
+                        run_id=run_id,
+                    )
+            continue
+
+        progress_at = int(state.get("progress_at") or now)
+        progress_age = max(0, now - progress_at)
+        intervals = progress_age // interval_seconds
+        warning_sent = bool(state.get("warning_sent"))
+        warning_interval = int(state.get("warning_interval") or -1)
+        if warning_sent and intervals <= warning_interval:
+            action = "continue"
+        else:
+            action = decide_progress_action(
+                enabled=True,
+                runtime_seconds=max(0, now - int(row["run_started_at"] or now)),
+                seconds_since_progress=progress_age,
+                nonprogress_intervals=intervals,
+                warning_sent=warning_sent,
+                signals=signals,
+            )
+        payload = _progress_guard_event_payload(
+            run_id=run_id,
+            reason="durable_progress_stalled",
+            progress_age_seconds=progress_age,
+            progress_category=state.get("progress_category"),
+            nonprogress_intervals=intervals,
+            signals=signals,
+        )
+
+        if action == "warn":
+            state = dict(state)
+            state["warning_sent"] = True
+            state["warning_interval"] = intervals
+            with write_txn(conn):
+                if _write_progress_guard_state(
+                    conn,
+                    task_id=task_id,
+                    run_id=run_id,
+                    metadata=metadata,
+                    state=state,
+                ):
+                    _append_event(
+                        conn, task_id, "progress_guard_warning", payload,
+                        run_id=run_id,
+                    )
+            continue
+        if action != "reseat":
+            continue
+
+        # Stale-attempt isolation immediately before the side effect.
+        active = conn.execute(
+            "SELECT status, current_run_id, claim_lock, worker_pid FROM tasks "
+            "WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            active is None
+            or active["status"] != "running"
+            or int(active["current_run_id"] or -1) != run_id
+        ):
+            continue
+        termination = _terminate_reclaimed_worker(
+            active["worker_pid"], active["claim_lock"] or "",
+            signal_fn=signal_fn,
+        )
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn,
+                task_id,
+                active["claim_lock"] or "",
+                now,
+                termination,
+                reason="progress_guard_worker_alive",
+            )
+            continue
+
+        payload.update(
+            {
+                key: bool(termination.get(key))
+                for key in (
+                    "host_local",
+                    "termination_attempted",
+                    "terminated",
+                    "sigkill",
+                )
+            }
+        )
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, "
+                "last_heartbeat_at = NULL "
+                "WHERE id = ? AND status = 'running' AND current_run_id = ? "
+                "AND claim_lock IS ?",
+                (task_id, run_id, active["claim_lock"]),
+            )
+            if cur.rowcount != 1:
+                continue
+            ended_run_id = _end_run(
+                conn,
+                task_id,
+                outcome="reclaimed",
+                status="reclaimed",
+                error="progress guard: durable progress stalled",
+                metadata=payload,
+            )
+            if ended_run_id != run_id:
+                continue
+            _append_event(
+                conn, task_id, "progress_guard_reseated", payload,
+                run_id=run_id,
+            )
+            reseated.append(task_id)
+        # Deliberately no _record_task_failure: a guard reseat is a neutral
+        # harness action, not a worker/org verdict.
+    return reseated
+
+
 def detect_stale_running(
     conn: sqlite3.Connection,
     *,
     stale_timeout_seconds: int = 0,
     signal_fn=None,
+    progress_guard_config: Optional[dict] = None,
+    board: Optional[str] = None,
 ) -> list[str]:
     """Reclaim ``running`` tasks that show no progress (heartbeat) within the
     staleness window.
@@ -7113,17 +7510,24 @@ def detect_stale_running(
     Only considers ``status='running'`` tasks. Blocked tasks are never
     candidates.  Returns the list of reclaimed task IDs.
 
-    ``stale_timeout_seconds=0`` disables the check entirely (returns ``[]``
-    immediately).  ``signal_fn`` is a test hook; defaults to ``os.kill``
-    on POSIX.
+    ``stale_timeout_seconds=0`` disables the legacy heartbeat-stale check.
+    The separately configured progress guard remains default-OFF. ``signal_fn``
+    is a test hook; defaults to ``os.kill`` on POSIX.
     """
+    guard_config = _resolve_progress_guard_config(progress_guard_config)
+    progress_reseated = _detect_progress_guard_stalls(
+        conn,
+        config=guard_config,
+        board=board,
+        signal_fn=signal_fn,
+    )
     if stale_timeout_seconds <= 0:
-        return []
+        return progress_reseated
 
 
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
-    reclaimed: list[str] = []
+    reclaimed: list[str] = list(progress_reseated)
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
@@ -8106,7 +8510,7 @@ def _dispatch_once_locked(
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
-        conn, stale_timeout_seconds=stale_timeout_seconds,
+        conn, stale_timeout_seconds=stale_timeout_seconds, board=board,
     )
     result.crashed = detect_crashed_workers(conn)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
