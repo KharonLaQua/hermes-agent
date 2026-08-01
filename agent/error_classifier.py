@@ -161,6 +161,20 @@ _RATE_LIMIT_PATTERNS = [
     "servicequotaexceededexception",
 ]
 
+# Claude CLI subscription failures are emitted by a local subprocess rather
+# than an HTTP client, so they arrive without a status code.  Keep this list
+# deliberately limited to provider-capacity/allowance language: malformed
+# prompts, safety refusals, cancellation, and permanent authentication errors
+# must retain their existing terminal handling.
+_CLAUDE_CLI_RECOVERABLE_RUNTIME_PATTERNS = [
+    "weekly usage limit",
+    "weekly limit",
+    "session usage limit",
+    "usage limit reached",
+    "concurrency cap",
+    "too many concurrent",
+]
+
 # Patterns that indicate provider-side overload, NOT a per-credential rate
 # limit or billing problem.  The credential is valid — the server is just
 # busy — so the correct recovery is "back off and retry the same key", never
@@ -918,6 +932,44 @@ def classify_api_error(
     # ── 9. Fallback: unknown ────────────────────────────────────────
 
     return _result(FailoverReason.unknown, retryable=True)
+
+
+def classify_runtime_error(
+    error: Exception,
+    *,
+    runtime: str,
+    provider: str = "",
+    model: str = "",
+) -> ClassifiedError:
+    """Classify a recoverable error produced by a non-HTTP runtime.
+
+    The normal classifier remains the authority for HTTP/xAI failures.  Claude
+    CLI errors bypass that loop as structured partial turns, so recognize only
+    its explicit allowance and saturation signals here.  Other CLI errors
+    deliberately keep the normal terminal behavior.
+    """
+    runtime_name = (runtime or "").strip().lower()
+    error_message = str(error or "").lower()
+    if runtime_name == "claude_cli" and any(
+        pattern in error_message for pattern in _CLAUDE_CLI_RECOVERABLE_RUNTIME_PATTERNS
+    ):
+        return ClassifiedError(
+            reason=FailoverReason.rate_limit,
+            provider=provider,
+            model=model,
+            message=str(error),
+            retryable=False,
+            should_fallback=True,
+        )
+
+    classified = classify_api_error(error, provider=provider, model=model)
+    if runtime_name == "claude_cli":
+        # A generic runtime exception is not enough evidence to route a fresh
+        # provider.  The Claude CLI may use it for local validation, cancelled
+        # sessions, and permanent auth errors, all of which retain their prior
+        # early-return behavior.
+        classified.should_fallback = False
+    return classified
 
 
 # ── Status code classification ──────────────────────────────────────────

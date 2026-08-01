@@ -983,6 +983,10 @@ DEFAULT_CONFIG = {
         # on flaky primaries; raise it if you prefer to tolerate longer
         # provider hiccups on a single provider.
         "api_max_retries": 3,
+        # Opt-in for recoverable failures emitted outside the normal HTTP
+        # request loop (Claude CLI allowance/concurrency and xAI OAuth quota).
+        # Off until an operator explicitly enables and verifies the chain.
+        "runtime_fallbacks_enabled": False,
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.

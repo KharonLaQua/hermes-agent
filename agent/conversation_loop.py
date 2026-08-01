@@ -39,7 +39,11 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
-from agent.error_classifier import FailoverReason, classify_api_error
+from agent.error_classifier import (
+    FailoverReason,
+    classify_api_error,
+    classify_runtime_error,
+)
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
@@ -86,6 +90,44 @@ from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+
+def try_activate_runtime_fallback(agent, error: Exception, *, runtime: str) -> bool:
+    """Activate one configured fallback for an opt-in runtime failure.
+
+    Claude CLI returns some failures as a partial result before the regular
+    request loop can classify them.  xAI OAuth quota errors can also be
+    intercepted by credential refresh before ordinary failover.  Both paths
+    share the existing ordered activator, which performs the full runtime
+    re-resolution and advances each chain entry at most once.
+    """
+    if not bool(getattr(agent, "runtime_fallbacks_enabled", False)):
+        return False
+
+    runtime_name = (runtime or "").strip().lower()
+    classified = classify_runtime_error(
+        error,
+        runtime=runtime_name,
+        provider=str(getattr(agent, "provider", "") or ""),
+        model=str(getattr(agent, "model", "") or ""),
+    )
+    allowed = (
+        runtime_name == "claude_cli"
+        and classified.reason == FailoverReason.rate_limit
+    ) or (
+        runtime_name == "xai_oauth"
+        and classified.reason in {FailoverReason.billing, FailoverReason.rate_limit}
+    )
+    if not (allowed and classified.should_fallback and agent._has_pending_fallback()):
+        return False
+
+    try:
+        agent._buffer_status(
+            "⚠️ Recoverable runtime limit reached — switching to fallback provider..."
+        )
+    except Exception:
+        pass
+    return bool(agent._try_activate_fallback(reason=classified.reason))
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
@@ -1048,13 +1090,24 @@ def run_conversation(
         from agent.transports.claude_cli import ClaudeCliConcurrencyError
 
         try:
-            return agent._run_claude_cli_turn(
+            _claude_result = agent._run_claude_cli_turn(
                 user_message=user_message,
                 original_user_message=original_user_message,
                 messages=messages,
                 effective_task_id=effective_task_id,
                 should_review_memory=_should_review_memory,
             )
+            _claude_error = _claude_result.get("error") if isinstance(_claude_result, dict) else None
+            if not (
+                _claude_result.get("partial")
+                and _claude_error
+                and try_activate_runtime_fallback(
+                    agent,
+                    RuntimeError(str(_claude_error)),
+                    runtime="claude_cli",
+                )
+            ):
+                return _claude_result
         except ClaudeCliConcurrencyError as _claude_conc_exc:
             logger.warning(
                 "claude_cli concurrency saturated — trying fallback: %s",
@@ -3441,6 +3494,25 @@ def run_conversation(
                             force=True,
                         )
                         continue
+
+                # xAI OAuth quota/spending-limit responses are account-wide;
+                # a credential-pool refresh cannot repair them.  When the
+                # explicit runtime flag is enabled, advance immediately so the
+                # worker continues on its configured fallback instead of
+                # terminating as a partial provider turn.
+                if (
+                    getattr(agent, "provider", "") == "xai-oauth"
+                    and try_activate_runtime_fallback(
+                        agent, api_error, runtime="xai_oauth"
+                    )
+                ):
+                    active_system_prompt = _sync_failover_system_message(
+                        agent, api_messages, active_system_prompt
+                    )
+                    retry_count = 0
+                    compression_attempts = 0
+                    _retry.primary_recovery_attempted = False
+                    continue
 
                 recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
                     status_code=status_code,

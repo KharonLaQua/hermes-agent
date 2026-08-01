@@ -1588,6 +1588,16 @@ def init_agent(
     except Exception:
         _agent_cfg = {}
 
+    # Runtime-originated fallback is an explicit, session-stable opt-in.  It
+    # covers recoverable failures that do not naturally enter the HTTP retry
+    # loop; ordinary configured provider fallback behavior is unchanged.
+    _runtime_fallback_cfg = _agent_cfg.get("agent", {})
+    agent.runtime_fallbacks_enabled = bool(
+        _runtime_fallback_cfg.get("runtime_fallbacks_enabled", False)
+        if isinstance(_runtime_fallback_cfg, dict)
+        else False
+    )
+
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as
     # visible mid-turn updates through the interim message path. When false,
