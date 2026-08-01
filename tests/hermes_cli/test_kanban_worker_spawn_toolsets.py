@@ -365,6 +365,7 @@ def test_default_spawn_passes_exact_permit_channel_only_for_armed_next_run(
     )
     assert issuer.channel.sent is True
     assert issuer.channel.released is True
+    assert issuer.channel.parent.fileno() >= 0
     assert issuer.activated == {
         "board_slug": "default",
         "task_id": "t_spawn_tools",

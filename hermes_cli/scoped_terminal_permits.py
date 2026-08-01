@@ -27,6 +27,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 _DOMAIN = b"HERMES-KANBAN-TERMINAL-PERMIT\x00v1\x00"
+_RESPONSE_DOMAIN = b"HERMES-KANBAN-TERMINAL-PERMIT-RESPONSE\x00v1\x00"
 _HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 _BOARD = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 
@@ -241,6 +242,14 @@ class _PermitRecord:
     evidence_task_id: str
     evidence_artifact_digest: str
     arm_contract_digest: str
+
+
+_CONSUME_REQUEST_FIELDS = frozenset(
+    {"version", "permit_id", "payload", "signature", "challenge", "context"}
+)
+_CONSUME_RESPONSE_FIELDS = frozenset(
+    {"version", "permit_id_digest", "challenge", "allowed", "failure_class", "decided_at"}
+)
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -551,6 +560,13 @@ def _validate_payload(payload: dict[str, Any]) -> None:
     _require_digest(payload["nonce"])
 
 
+def _default_audit_writer(kind: str, payload: Mapping[str, Any]) -> None:
+    """Persist a digest-only permit event through the board transaction helper."""
+    from hermes_cli.kanban_db import append_terminal_permit_event
+
+    append_terminal_permit_event(kind, payload)
+
+
 class ScopedTerminalPermitIssuer:
     """Ephemeral issuer owned by the embedded gateway dispatcher."""
 
@@ -634,7 +650,7 @@ class ScopedTerminalPermitIssuer:
         self.max_ttl_seconds = max_ttl_seconds
         self._lock_owner_check = lock_owner_check
         self._clock = clock or time.time
-        self._audit_writer = audit_writer or (lambda _kind, _payload: None)
+        self._audit_writer = audit_writer or _default_audit_writer
         self._lock = threading.RLock()
         self._closed = False
         self._signing_key: Ed25519PrivateKey | None = Ed25519PrivateKey.generate()
@@ -648,6 +664,7 @@ class ScopedTerminalPermitIssuer:
         self._pending: dict[tuple[str, str], _PendingArm] = {}
         self._permits: dict[str, _PermitRecord] = {}
         self._nonces: set[str] = set()
+        self._challenges: set[str] = set()
         self._spawn_channels: dict[str, SpawnPermitChannel] = {}
 
     @property
@@ -846,6 +863,12 @@ class ScopedTerminalPermitIssuer:
             )
             with self._lock:
                 self._spawn_channels[envelope.permit_id] = channel
+            threading.Thread(
+                target=self._serve_spawn_channel,
+                args=(channel,),
+                name="hermes-scoped-permit-broker",
+                daemon=True,
+            ).start()
             return channel
         except Exception:
             for endpoint in (parent_endpoint, child_endpoint):
@@ -859,6 +882,103 @@ class ScopedTerminalPermitIssuer:
                 if record is not None:
                     record.status = "cancelled"
             raise ScopedTerminalPermitError("channel_failed") from None
+
+    def _serve_spawn_channel(self, channel: SpawnPermitChannel) -> None:
+        """Serve exactly one authenticated consume request on a spawn channel."""
+        try:
+            frame_size = int.from_bytes(_recv_exact(channel.parent_endpoint, 4), "big")
+            request_bytes = _recv_exact(channel.parent_endpoint, frame_size)
+            response = self._handle_consume_request(channel, request_bytes)
+            channel.parent_endpoint.sendall(
+                len(response).to_bytes(4, "big") + response
+            )
+        except (ScopedTerminalPermitError, OSError, ValueError, TypeError):
+            # A lost worker or malformed transport is terminal for this channel;
+            # never fall back to ordinary approval or revive the permit.
+            try:
+                with self._lock:
+                    record = self._permits.get(channel.permit.permit_id)
+                if record is not None and record.status == "issued":
+                    self.consume(
+                        record.envelope,
+                        context={},
+                        challenge=secrets.token_hex(32),
+                    )
+            except Exception:
+                pass
+            pass
+        finally:
+            with self._lock:
+                self._spawn_channels.pop(channel.permit.permit_id, None)
+            channel.close()
+
+    def _handle_consume_request(
+        self, channel: SpawnPermitChannel, request_bytes: bytes
+    ) -> bytes:
+        """Validate the wire envelope, consume the parent-held permit, and sign deny/allow."""
+        challenge = secrets.token_hex(32)
+        failure = "malformed"
+        decision = PermitDecision(False, failure, _digest(channel.permit.permit_id))
+        try:
+            request = _parse_canonical(request_bytes)
+            if set(request) != _CONSUME_REQUEST_FIELDS or request.get("version") != 1:
+                raise ScopedTerminalPermitError("malformed")
+            challenge = request["challenge"]
+            if not isinstance(challenge, str) or not re.fullmatch(r"[0-9a-f]{64}", challenge):
+                raise ScopedTerminalPermitError("malformed")
+            with self._lock:
+                if challenge in self._challenges:
+                    raise ScopedTerminalPermitError("replay")
+                self._challenges.add(challenge)
+            permit_id = _require_text(request["permit_id"])
+            payload = _require_text(request["payload"]).encode("utf-8")
+            signature = _decode_hex(request["signature"], length=64)
+            context = request["context"]
+            envelope = SignedPermit(permit_id, payload, signature)
+            if permit_id != channel.permit.permit_id:
+                raise ScopedTerminalPermitError("malformed")
+            decision = self.consume(envelope, context=context, challenge=challenge)
+        except ScopedTerminalPermitError as exc:
+            if challenge not in self._challenges and re.fullmatch(
+                r"[0-9a-f]{64}", challenge
+            ):
+                self._challenges.add(challenge)
+            try:
+                record = self._permits.get(channel.permit.permit_id)
+                if record is not None and record.status == "issued":
+                    decision = self.consume(
+                        record.envelope,
+                        context={},
+                        challenge=challenge,
+                    )
+            except Exception:
+                decision = PermitDecision(
+                    False, exc.failure_class, _digest(channel.permit.permit_id)
+                )
+            if decision.failure_class is None or decision.allowed:
+                decision = PermitDecision(
+                    False, exc.failure_class, _digest(channel.permit.permit_id)
+                )
+        except Exception:
+            decision = PermitDecision(
+                False, "malformed", _digest(channel.permit.permit_id)
+            )
+        response = {
+            "version": 1,
+            "permit_id_digest": decision.permit_id_digest
+            or _digest(channel.permit.permit_id),
+            "challenge": challenge,
+            "allowed": bool(decision.allowed),
+            "failure_class": decision.failure_class,
+            "decided_at": int(self._clock()),
+        }
+        response_bytes = _canonical_bytes(response)
+        with self._lock:
+            signing_key = self._signing_key
+            if signing_key is None:
+                raise ScopedTerminalPermitError("issuer_unavailable")
+            signature = signing_key.sign(_RESPONSE_DOMAIN + response_bytes)
+        return _canonical_bytes({"response": response_bytes.decode("utf-8"), "signature": signature.hex()})
 
     def cancel_spawn_channel(self, channel: SpawnPermitChannel) -> None:
         """Spend an activated spawn permit and close both channel endpoints."""
@@ -1195,12 +1315,20 @@ def _decode_hex(value: Any, *, length: int) -> bytes:
 class _WorkerPermitClient:
     """Private authenticated view of the one inherited permit envelope."""
 
-    __slots__ = ("_envelope", "_public_key", "_payload")
+    __slots__ = ("_envelope", "_public_key", "_payload", "_endpoint", "_closed")
 
-    def __init__(self, envelope: SignedPermit, public_key: bytes, payload: dict[str, Any]):
+    def __init__(
+        self,
+        envelope: SignedPermit,
+        public_key: bytes,
+        payload: dict[str, Any],
+        endpoint: socket.socket,
+    ):
         self._envelope = envelope
         self._public_key = public_key
         self._payload = payload
+        self._endpoint = endpoint
+        self._closed = False
 
     @property
     def permit_id_digest(self) -> str:
@@ -1326,6 +1454,91 @@ class _WorkerPermitClient:
             payload["command_digest"],
         )
 
+    def consume(
+        self, ticket: PreparedPermitTicket, execution_context: Mapping[str, Any]
+    ) -> PermitDecision:
+        if ticket._client is not self:
+            raise ScopedTerminalPermitError("malformed")
+        if self._closed or self._endpoint is None:
+            raise ScopedTerminalPermitError("missing")
+        if not isinstance(execution_context, Mapping) or not ScopedTerminalPermitIssuer.CONTEXT_FIELDS.issubset(execution_context):
+            raise ScopedTerminalPermitError("malformed")
+        challenge = secrets.token_hex(32)
+        request = {
+            "version": 1,
+            "permit_id": self._envelope.permit_id,
+            "payload": self._envelope.payload.decode("utf-8"),
+            "signature": self._envelope.signature.hex(),
+            "challenge": challenge,
+            # The terminal execution context also carries transient dispatch
+            # flags (cwd, stdin, notifications). Only the signed binding
+            # fields cross the broker; the parent requires this exact shape.
+            "context": {
+                key: execution_context[key]
+                for key in ScopedTerminalPermitIssuer.CONTEXT_FIELDS
+            },
+        }
+        request_bytes = _canonical_bytes(request)
+        endpoint = self._endpoint
+        try:
+            endpoint.sendall(len(request_bytes).to_bytes(4, "big") + request_bytes)
+            frame_size = int.from_bytes(_recv_exact(endpoint, 4), "big")
+            response_frame = _recv_exact(endpoint, frame_size)
+        except (ScopedTerminalPermitError, OSError):
+            raise ScopedTerminalPermitError("broker_unreachable") from None
+        finally:
+            self.close()
+        try:
+            frame = _parse_canonical(response_frame)
+            if set(frame) != {"response", "signature"}:
+                raise ScopedTerminalPermitError("broker_protocol_error")
+            response_bytes = _require_text(frame["response"]).encode("utf-8")
+            signature = _decode_hex(frame["signature"], length=64)
+            response = _parse_canonical(response_bytes)
+            if set(response) != _CONSUME_RESPONSE_FIELDS or response.get("version") != 1:
+                raise ScopedTerminalPermitError("broker_protocol_error")
+            if (
+                response["permit_id_digest"] != self.permit_id_digest
+                or response["challenge"] != challenge
+                or not isinstance(response["allowed"], bool)
+                or (
+                    response["failure_class"] is not None
+                    and not isinstance(response["failure_class"], str)
+                )
+            ):
+                raise ScopedTerminalPermitError("broker_protocol_error")
+            try:
+                Ed25519PublicKey.from_public_bytes(self._public_key).verify(
+                    signature, _RESPONSE_DOMAIN + response_bytes
+                )
+            except (InvalidSignature, ValueError, TypeError):
+                raise ScopedTerminalPermitError("response_signature_invalid") from None
+            if response["allowed"]:
+                if response["failure_class"] is not None:
+                    raise ScopedTerminalPermitError("broker_protocol_error")
+                return PermitDecision(True, None, self.permit_id_digest)
+            return PermitDecision(
+                False,
+                response["failure_class"] or "malformed",
+                self.permit_id_digest,
+            )
+        except ScopedTerminalPermitError:
+            raise
+        except Exception:
+            raise ScopedTerminalPermitError("broker_protocol_error") from None
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        endpoint = self._endpoint
+        self._endpoint = None
+        if endpoint is not None:
+            try:
+                endpoint.close()
+            except OSError:
+                pass
+
 
 def claim_worker_permit_channel() -> _WorkerPermitClient:
     """Claim, authenticate, and consume the inherited FD bridge once.
@@ -1354,15 +1567,16 @@ def claim_worker_permit_channel() -> _WorkerPermitClient:
             frame_size = int.from_bytes(_recv_exact(endpoint, 4), "big")
             body_bytes = _recv_exact(endpoint, frame_size)
         except ScopedTerminalPermitError:
+            if endpoint is not None:
+                endpoint.close()
             raise
         except (OSError, TypeError, ValueError):
-            raise ScopedTerminalPermitError("partial_bridge") from None
-        finally:
-            try:
-                if endpoint is not None:
+            if endpoint is not None:
+                try:
                     endpoint.close()
-            except OSError:
-                pass
+                except OSError:
+                    pass
+            raise ScopedTerminalPermitError("partial_bridge") from None
 
         try:
             body = _parse_canonical(body_bytes)
@@ -1388,12 +1602,22 @@ def claim_worker_permit_channel() -> _WorkerPermitClient:
                 raise ScopedTerminalPermitError("not_yet_valid")
             if now > payload["expires_at"]:
                 raise ScopedTerminalPermitError("expired")
-            client = _WorkerPermitClient(envelope, public_key, payload)
+            client = _WorkerPermitClient(envelope, public_key, payload, endpoint)
             _WORKER_PERMIT_CLIENT = client
             return client
         except ScopedTerminalPermitError:
+            if endpoint is not None:
+                try:
+                    endpoint.close()
+                except OSError:
+                    pass
             raise
         except Exception:
+            if endpoint is not None:
+                try:
+                    endpoint.close()
+                except OSError:
+                    pass
             raise ScopedTerminalPermitError("malformed") from None
 
 
@@ -1414,3 +1638,15 @@ def prepare_scoped_terminal_permit(
     if selected is None:
         raise ScopedTerminalPermitError("missing")
     return selected.prepare(command, env_type, execution_context)
+
+
+def consume_scoped_terminal_permit(
+    ticket: PreparedPermitTicket, execution_context: Mapping[str, Any]
+) -> PermitDecision:
+    """Consume a prepared ticket through its authenticated parent broker channel."""
+    if not isinstance(ticket, PreparedPermitTicket):
+        raise ScopedTerminalPermitError("malformed")
+    client = ticket._client
+    if not isinstance(client, _WorkerPermitClient):
+        raise ScopedTerminalPermitError("malformed")
+    return client.consume(ticket, execution_context)

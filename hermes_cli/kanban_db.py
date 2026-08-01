@@ -3757,6 +3757,36 @@ def _append_event(
     )
 
 
+def append_terminal_permit_event(
+    kind: str, payload: dict[str, Any], *, board: Optional[str] = None
+) -> None:
+    """Append one digest-only scoped-permit event in the board write transaction."""
+    allowed_kinds = {
+        "terminal_permit_armed",
+        "terminal_permit_activated",
+        "terminal_permit_consumed",
+        "terminal_permit_rejected",
+        "terminal_permit_cancelled",
+    }
+    if kind not in allowed_kinds or not isinstance(payload, dict):
+        raise ValueError("invalid terminal permit event")
+    task_id = payload.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        raise ValueError("terminal permit event requires task_id")
+    run_id = payload.get("run_id")
+    if run_id is not None and (isinstance(run_id, bool) or not isinstance(run_id, int)):
+        raise ValueError("terminal permit event has invalid run_id")
+    # Serialize before opening the transaction so malformed payloads cannot
+    # partially mutate the board. The issuer supplies the digest-only allowlist.
+    json.dumps(payload, ensure_ascii=False, allow_nan=False)
+    conn = connect(board=board)
+    try:
+        with write_txn(conn):
+            _append_event(conn, task_id, kind, payload, run_id=run_id)
+    finally:
+        conn.close()
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,

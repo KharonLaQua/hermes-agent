@@ -15,6 +15,7 @@ from hermes_cli.scoped_terminal_permits import (
     ScopedTerminalPermitError,
     ScopedTerminalPermitIssuer,
     claim_worker_permit_channel,
+    consume_scoped_terminal_permit,
     prepare_scoped_terminal_permit,
 )
 
@@ -1005,3 +1006,88 @@ def test_phase_a_returns_opaque_ticket_only_after_exact_binding(
         )
     assert exc.value.failure_class == "operation_forbidden"
     channel.close()
+
+
+def test_authenticated_consume_uses_inherited_channel_once_and_closes_endpoints(
+    permit_factory, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(permits, "_WORKER_CHANNEL_CLAIMED", False)
+    monkeypatch.setattr(permits, "_WORKER_PERMIT_CLIENT", None)
+    issue, issuer, now, _, _ = permit_factory
+    monkeypatch.setattr(permits.time, "time", lambda: now[0])
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id="t_channel_consume",
+        contract=_contract(tmp_path),
+        ttl_seconds=60,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest=_HEX_A,
+    )
+    channel = issuer.activate_spawn_channel(
+        board_slug="default",
+        task_id="t_channel_consume",
+        run_id=31,
+        profile="bookkeeper",
+        profile_home=str(tmp_path / "profile"),
+        workspace=str(tmp_path / "workspace"),
+    )
+    channel.send_envelope()
+    client_fd = os.dup(channel.child_fd)
+    monkeypatch.setenv(permits.PERMIT_FD_ENV, str(client_fd))
+    client = claim_worker_permit_channel()
+    payload = json.loads(channel.permit.payload)
+    context = {key: copy.deepcopy(payload[key]) for key in issuer.CONTEXT_FIELDS}
+    command = " ".join(payload["operation_sequence"][0]["argv"])
+    ticket = prepare_scoped_terminal_permit(command, "local", context, client=client)
+
+    decision = consume_scoped_terminal_permit(ticket, context)
+
+    assert decision.allowed is True
+    assert issuer.permit_status(payload["permit_id"]) == "consumed"
+    assert channel.parent_endpoint.fileno() == -1
+    assert channel.child_endpoint.fileno() == -1
+    with pytest.raises(ScopedTerminalPermitError) as replay:
+        consume_scoped_terminal_permit(ticket, context)
+    assert replay.value.failure_class == "missing"
+
+
+def test_authenticated_consume_rejects_tampered_context_and_spends_channel(
+    permit_factory, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(permits, "_WORKER_CHANNEL_CLAIMED", False)
+    monkeypatch.setattr(permits, "_WORKER_PERMIT_CLIENT", None)
+    issue, issuer, now, _, _ = permit_factory
+    monkeypatch.setattr(permits.time, "time", lambda: now[0])
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id="t_channel_tamper",
+        contract=_contract(tmp_path),
+        ttl_seconds=60,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest=_HEX_A,
+    )
+    channel = issuer.activate_spawn_channel(
+        board_slug="default",
+        task_id="t_channel_tamper",
+        run_id=32,
+        profile="bookkeeper",
+        profile_home=str(tmp_path / "profile"),
+        workspace=str(tmp_path / "workspace"),
+    )
+    channel.send_envelope()
+    client_fd = os.dup(channel.child_fd)
+    monkeypatch.setenv(permits.PERMIT_FD_ENV, str(client_fd))
+    client = claim_worker_permit_channel()
+    payload = json.loads(channel.permit.payload)
+    context = {key: copy.deepcopy(payload[key]) for key in issuer.CONTEXT_FIELDS}
+    command = " ".join(payload["operation_sequence"][0]["argv"])
+    ticket = prepare_scoped_terminal_permit(command, "local", context, client=client)
+    context["task_id"] = "t_other"
+
+    decision = consume_scoped_terminal_permit(ticket, context)
+
+    assert decision.allowed is False
+    assert decision.failure_class == "task_mismatch"
+    assert issuer.permit_status(payload["permit_id"]) == "rejected"
+    assert channel.parent_endpoint.fileno() == -1
+    assert channel.child_endpoint.fileno() == -1
