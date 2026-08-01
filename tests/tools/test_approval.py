@@ -133,6 +133,92 @@ def test_no_permit_keeps_non_kanban_approval_behavior_unchanged():
     assert payload["marker_present_after_import"] is False
 
 
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("rm -rf /", "recursive delete of root filesystem"),
+        ("sudo -S id", "sudo password guessing"),
+        ("echo forbidden", "user-defined deny rule"),
+    ],
+    ids=["hardline", "sudo-stdin", "user-deny"],
+)
+def test_scoped_permit_floor_precedence(monkeypatch, command, expected):
+    monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+    monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+    if command == "echo forbidden":
+        monkeypatch.setattr(
+            approval_module,
+            "_get_approval_config",
+            lambda: {"mode": "off", "deny": ["echo forbidden"]},
+        )
+    result = approval_module.check_all_command_guards(
+        command,
+        "local",
+        execution_context={},
+    )
+    assert result["approved"] is False
+    assert expected in result["message"]
+    assert result.get("permit_failure_class") is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sh -c 'rclone copyto source destination'",
+        "bash -c 'rclone copyto source destination'",
+        "rclone copyto source destination && rm source",
+        "rclone copyto source destination | tee output",
+        "rclone copyto source > output",
+        "rclone copyto $(touch source) destination",
+    ],
+    ids=["sh-c", "bash-c", "chain", "pipe", "redirect", "substitution"],
+)
+def test_scoped_permit_rejects_wrapper(monkeypatch, command):
+    monkeypatch.setattr(approval_module, "_WORKER_PERMIT_BOOTSTRAP_FAILURE", None)
+    monkeypatch.setattr(approval_module, "get_worker_permit_client", lambda: object())
+
+    def reject(*_args, **_kwargs):
+        raise approval_module.ScopedTerminalPermitError("operation_forbidden")
+
+    monkeypatch.setattr(approval_module, "prepare_scoped_terminal_permit", reject)
+    result = approval_module.check_all_command_guards(
+        command,
+        "local",
+        execution_context={"required": True},
+    )
+    assert result["approved"] is False
+    assert result["permit_failure_class"] == "operation_forbidden"
+    assert result["status"] == "scoped_permit_denied"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rclone purge source",
+        "rclone delete source",
+        "rclone copyto '*.bin' destination",
+        "rm -- /unrelated/file",
+    ],
+    ids=["rclone-purge", "rclone-delete", "wildcard", "unrelated-rm"],
+)
+def test_scoped_permit_rejects_operation(monkeypatch, command):
+    monkeypatch.setattr(approval_module, "_WORKER_PERMIT_BOOTSTRAP_FAILURE", None)
+    monkeypatch.setattr(approval_module, "get_worker_permit_client", lambda: object())
+
+    def reject(*_args, **_kwargs):
+        raise approval_module.ScopedTerminalPermitError("operation_forbidden")
+
+    monkeypatch.setattr(approval_module, "prepare_scoped_terminal_permit", reject)
+    result = approval_module.check_all_command_guards(
+        command,
+        "local",
+        execution_context={"required": True},
+    )
+    assert result["approved"] is False
+    assert result["permit_failure_class"] == "operation_forbidden"
+    assert "fall back" in result["message"]
+
+
 class TestApprovalModeParsing:
     def test_unquoted_yaml_off_boolean_false_maps_to_off(self):
         with mock_patch("hermes_cli.config.load_config", return_value={"approvals": {"mode": False}}):

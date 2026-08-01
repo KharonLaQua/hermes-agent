@@ -12,6 +12,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import socket
 import threading
 import time
@@ -124,6 +125,41 @@ class SignedPermit:
     signature: bytes
 
 
+@dataclass(frozen=True)
+class PreparedPermitTicket:
+    """Opaque Phase-A result passed to the later broker-consume phase.
+
+    The signed envelope and verification key intentionally remain private to
+    the worker client.  Callers can use only the digest/index metadata when
+    constructing an execution request; this object never authorizes or
+    consumes a permit by itself.
+    """
+
+    _client: object
+    _permit_id_digest: str
+    _operation_index: int
+    _command_digest: str
+
+    @property
+    def permit_id_digest(self) -> str:
+        return self._permit_id_digest
+
+    @property
+    def operation_index(self) -> int:
+        return self._operation_index
+
+    @property
+    def command_digest(self) -> str:
+        return self._command_digest
+
+    def __repr__(self) -> str:
+        return (
+            "PreparedPermitTicket("
+            f"permit_id_digest={self._permit_id_digest!r}, "
+            f"operation_index={self._operation_index})"
+        )
+
+
 PERMIT_FD_ENV = "HERMES_KANBAN_TERMINAL_PERMIT_FD"
 
 
@@ -139,6 +175,7 @@ class SpawnPermitChannel:
     permit: SignedPermit
     parent_endpoint: socket.socket
     child_endpoint: socket.socket
+    public_key: bytes = b""
     _child_released: bool = False
 
     @property
@@ -155,6 +192,7 @@ class SpawnPermitChannel:
             {
                 "payload": self.permit.payload.decode("utf-8"),
                 "signature": self.permit.signature.hex(),
+                "public_key": self.public_key.hex(),
             }
         )
         self.parent_endpoint.sendall(len(body).to_bytes(4, "big") + body)
@@ -800,7 +838,12 @@ class ScopedTerminalPermitIssuer:
             parent_endpoint, child_endpoint = socket.socketpair()
             parent_endpoint.set_inheritable(False)
             child_endpoint.set_inheritable(False)
-            channel = SpawnPermitChannel(envelope, parent_endpoint, child_endpoint)
+            channel = SpawnPermitChannel(
+                envelope,
+                parent_endpoint,
+                child_endpoint,
+                self._public_key_bytes or b"",
+            )
             with self._lock:
                 self._spawn_channels[envelope.permit_id] = channel
             return channel
@@ -1107,3 +1150,262 @@ def uninstall_active_issuer(issuer: ScopedTerminalPermitIssuer) -> bool:
             return False
         _ACTIVE_ISSUER = None
         return True
+
+
+# ---------------------------------------------------------------------------
+# Worker-side Phase-A client
+# ---------------------------------------------------------------------------
+
+_WORKER_CHANNEL_LOCK = threading.Lock()
+_WORKER_CHANNEL_CLAIMED = False
+_WORKER_PERMIT_CLIENT: Optional["_WorkerPermitClient"] = None
+
+
+def _recv_exact(endpoint: socket.socket, size: int) -> bytes:
+    if size < 0 or size > 2 * 1024 * 1024:
+        raise ScopedTerminalPermitError("malformed")
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        try:
+            chunk = endpoint.recv(remaining)
+        except socket.timeout:
+            raise ScopedTerminalPermitError("broker_unreachable") from None
+        except OSError:
+            raise ScopedTerminalPermitError("broker_unreachable") from None
+        if not chunk:
+            raise ScopedTerminalPermitError("partial_bridge")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _decode_hex(value: Any, *, length: int) -> bytes:
+    if not isinstance(value, str) or len(value) != length * 2:
+        raise ScopedTerminalPermitError("malformed")
+    try:
+        decoded = bytes.fromhex(value)
+    except ValueError:
+        raise ScopedTerminalPermitError("malformed") from None
+    if decoded.hex() != value:
+        raise ScopedTerminalPermitError("malformed")
+    return decoded
+
+
+class _WorkerPermitClient:
+    """Private authenticated view of the one inherited permit envelope."""
+
+    __slots__ = ("_envelope", "_public_key", "_payload")
+
+    def __init__(self, envelope: SignedPermit, public_key: bytes, payload: dict[str, Any]):
+        self._envelope = envelope
+        self._public_key = public_key
+        self._payload = payload
+
+    @property
+    def permit_id_digest(self) -> str:
+        return _digest(self._envelope.permit_id)
+
+    def prepare(
+        self,
+        command: str,
+        env_type: str,
+        execution_context: Mapping[str, Any],
+    ) -> PreparedPermitTicket:
+        payload = self._payload
+        if env_type != "local":
+            raise ScopedTerminalPermitError("operation_forbidden")
+        if not isinstance(execution_context, Mapping):
+            raise ScopedTerminalPermitError("malformed")
+        required = ScopedTerminalPermitIssuer.CONTEXT_FIELDS
+        if not required.issubset(execution_context):
+            raise ScopedTerminalPermitError("malformed")
+
+        for field, failure in (
+            ("board_slug", "task_mismatch"),
+            ("task_id", "task_mismatch"),
+            ("run_id", "run_mismatch"),
+        ):
+            if execution_context[field] != payload[field]:
+                raise ScopedTerminalPermitError(failure)
+        if (
+            not isinstance(execution_context["profile"], str)
+            or execution_context["profile"].strip().lower() != payload["profile"]
+        ):
+            raise ScopedTerminalPermitError("profile_mismatch")
+        for field, failure in (
+            ("profile_home", "profile_home_mismatch"),
+            ("workspace", "workspace_mismatch"),
+        ):
+            try:
+                actual = _canonical_path(execution_context[field])
+            except ScopedTerminalPermitError:
+                raise ScopedTerminalPermitError(failure) from None
+            if actual != payload[field]:
+                raise ScopedTerminalPermitError(failure)
+
+        try:
+            actual_source = _validate_source(execution_context["source"])
+        except ScopedTerminalPermitError:
+            raise ScopedTerminalPermitError("source_mismatch") from None
+        expected_source = payload["source"]
+        if actual_source["expected_size_bytes"] != expected_source["expected_size_bytes"]:
+            raise ScopedTerminalPermitError("size_mismatch")
+        if (
+            actual_source["content_sha256"] != expected_source["content_sha256"]
+            or actual_source["manifest_sha256"] != expected_source["manifest_sha256"]
+        ):
+            raise ScopedTerminalPermitError("hash_mismatch")
+        if actual_source != expected_source:
+            raise ScopedTerminalPermitError("source_mismatch")
+        try:
+            actual_destination = _validate_destination(execution_context["destination"])
+        except ScopedTerminalPermitError:
+            raise ScopedTerminalPermitError("destination_mismatch") from None
+        if actual_destination != payload["destination"]:
+            raise ScopedTerminalPermitError("destination_mismatch")
+
+        if (
+            execution_context["operation_sequence"] != payload["operation_sequence"]
+            or execution_context["authorized_operation_index"]
+            != payload["authorized_operation_index"]
+            or execution_context["predecessor_receipt_digest"]
+            != payload["predecessor_receipt_digest"]
+        ):
+            raise ScopedTerminalPermitError("operation_sequence_mismatch")
+        if execution_context["command_digest"] != payload["command_digest"]:
+            raise ScopedTerminalPermitError("command_mismatch")
+
+        if any(
+            execution_context.get(field)
+            for field in (
+                "background",
+                "pty",
+                "stdin",
+                "force",
+                "notify_on_complete",
+                "watch_patterns",
+            )
+        ):
+            raise ScopedTerminalPermitError("operation_forbidden")
+        command_text = command if isinstance(command, str) else ""
+        try:
+            argv = shlex.split(command_text, posix=True)
+        except (ValueError, TypeError):
+            raise ScopedTerminalPermitError("operation_forbidden") from None
+        if not argv or shlex.join(argv) != command_text or any(
+            any(ord(char) < 32 for char in arg) for arg in argv
+        ):
+            raise ScopedTerminalPermitError("operation_forbidden")
+        if any(any(char in _SHELL_META_CHARS for char in arg) for arg in argv):
+            raise ScopedTerminalPermitError("operation_forbidden")
+        operation = payload["operation_sequence"][payload["authorized_operation_index"]]
+        if any(
+            token in argv
+            for token in ("sh", "bash", "zsh", "env", "sudo", "hermes")
+        ) and argv != operation["argv"]:
+            raise ScopedTerminalPermitError("operation_forbidden")
+        if argv != operation["argv"]:
+            raise ScopedTerminalPermitError("command_mismatch")
+        if execution_context.get("cwd") is not None:
+            try:
+                cwd = _canonical_operation_path(execution_context["cwd"])
+            except ScopedTerminalPermitError:
+                raise ScopedTerminalPermitError("operation_forbidden") from None
+            if cwd != operation["cwd"]:
+                raise ScopedTerminalPermitError("operation_forbidden")
+        return PreparedPermitTicket(
+            self,
+            self.permit_id_digest,
+            payload["authorized_operation_index"],
+            payload["command_digest"],
+        )
+
+
+def claim_worker_permit_channel() -> _WorkerPermitClient:
+    """Claim, authenticate, and consume the inherited FD bridge once.
+
+    The environment value is only a descriptor bridge.  It is removed before
+    any caller can inspect it, and the descriptor is made close-on-exec before
+    the signed envelope is read.  All failures are stable, non-secret classes.
+    """
+    global _WORKER_CHANNEL_CLAIMED, _WORKER_PERMIT_CLIENT
+    with _WORKER_CHANNEL_LOCK:
+        if _WORKER_CHANNEL_CLAIMED:
+            raise ScopedTerminalPermitError("missing")
+        _WORKER_CHANNEL_CLAIMED = True
+        fd_text = os.environ.pop(PERMIT_FD_ENV, None)
+        if fd_text is None:
+            raise ScopedTerminalPermitError("missing")
+        endpoint: socket.socket | None = None
+        try:
+            fd = int(fd_text, 10)
+            if fd < 0:
+                raise ValueError
+            os.set_inheritable(fd, False)
+            endpoint = socket.socket(fileno=fd)
+            endpoint.set_inheritable(False)
+            endpoint.settimeout(5.0)
+            frame_size = int.from_bytes(_recv_exact(endpoint, 4), "big")
+            body_bytes = _recv_exact(endpoint, frame_size)
+        except ScopedTerminalPermitError:
+            raise
+        except (OSError, TypeError, ValueError):
+            raise ScopedTerminalPermitError("partial_bridge") from None
+        finally:
+            try:
+                if endpoint is not None:
+                    endpoint.close()
+            except OSError:
+                pass
+
+        try:
+            body = _parse_canonical(body_bytes)
+            if set(body) != {"payload", "signature", "public_key"}:
+                raise ScopedTerminalPermitError("malformed")
+            payload_bytes = _require_text(body["payload"]).encode("utf-8")
+            signature = _decode_hex(body["signature"], length=64)
+            public_key = _decode_hex(body["public_key"], length=32)
+            payload = _parse_canonical(payload_bytes)
+            _validate_payload(payload)
+            if _digest(public_key) != payload["issuer_key_id"]:
+                raise ScopedTerminalPermitError("unknown_key_generation")
+            try:
+                Ed25519PublicKey.from_public_bytes(public_key).verify(
+                    signature, _DOMAIN + payload_bytes
+                )
+            except (InvalidSignature, ValueError, TypeError):
+                raise ScopedTerminalPermitError("signature_invalid") from None
+            permit_id = _require_text(payload["permit_id"])
+            envelope = SignedPermit(permit_id, payload_bytes, signature)
+            now = int(time.time())
+            if now < payload["not_before"]:
+                raise ScopedTerminalPermitError("not_yet_valid")
+            if now > payload["expires_at"]:
+                raise ScopedTerminalPermitError("expired")
+            client = _WorkerPermitClient(envelope, public_key, payload)
+            _WORKER_PERMIT_CLIENT = client
+            return client
+        except ScopedTerminalPermitError:
+            raise
+        except Exception:
+            raise ScopedTerminalPermitError("malformed") from None
+
+
+def get_worker_permit_client() -> Optional[_WorkerPermitClient]:
+    with _WORKER_CHANNEL_LOCK:
+        return _WORKER_PERMIT_CLIENT
+
+
+def prepare_scoped_terminal_permit(
+    command: str,
+    env_type: str,
+    execution_context: Mapping[str, Any],
+    *,
+    client: Optional[_WorkerPermitClient] = None,
+) -> PreparedPermitTicket:
+    """Validate exact Phase-A scope without consuming or executing anything."""
+    selected = client or get_worker_permit_client()
+    if selected is None:
+        raise ScopedTerminalPermitError("missing")
+    return selected.prepare(command, env_type, execution_context)

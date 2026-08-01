@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import threading
 from dataclasses import replace
 
@@ -10,8 +11,11 @@ import pytest
 
 import hermes_cli.scoped_terminal_permits as permits
 from hermes_cli.scoped_terminal_permits import (
+    PreparedPermitTicket,
     ScopedTerminalPermitError,
     ScopedTerminalPermitIssuer,
+    claim_worker_permit_channel,
+    prepare_scoped_terminal_permit,
 )
 
 
@@ -831,3 +835,92 @@ def test_spawn_channel_is_one_fd_and_cancellation_spends_fresh_arm(
     )
     assert fresh_channel.permit.permit_id != permit_id
     issuer.cancel_spawn_channel(fresh_channel)
+
+
+def test_worker_bootstrap_claims_bridge_once_and_hides_envelope(
+    permit_factory, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(permits, "_WORKER_CHANNEL_CLAIMED", False)
+    monkeypatch.setattr(permits, "_WORKER_PERMIT_CLIENT", None)
+    _, issuer, now, _, _ = permit_factory
+    monkeypatch.setattr(permits.time, "time", lambda: now[0])
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id="t_worker_bootstrap",
+        contract=_contract(tmp_path),
+        ttl_seconds=60,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest=_HEX_A,
+    )
+    channel = issuer.activate_spawn_channel(
+        board_slug="default",
+        task_id="t_worker_bootstrap",
+        run_id=23,
+        profile="bookkeeper",
+        profile_home=str(tmp_path / "profile"),
+        workspace=str(tmp_path / "workspace"),
+    )
+    channel.send_envelope()
+    child_fd = channel.child_fd
+    client_fd = os.dup(child_fd)
+    monkeypatch.setenv(permits.PERMIT_FD_ENV, str(client_fd))
+
+    client = claim_worker_permit_channel()
+
+    assert client is not None
+    assert permits.PERMIT_FD_ENV not in os.environ
+    assert client.permit_id_digest == permits._digest(channel.permit.permit_id)
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        claim_worker_permit_channel()
+    assert exc.value.failure_class == "missing"
+    channel.close()
+
+
+def test_phase_a_returns_opaque_ticket_only_after_exact_binding(
+    permit_factory, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(permits, "_WORKER_CHANNEL_CLAIMED", False)
+    monkeypatch.setattr(permits, "_WORKER_PERMIT_CLIENT", None)
+    _, issuer, now, _, _ = permit_factory
+    monkeypatch.setattr(permits.time, "time", lambda: now[0])
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id="t_phase_a",
+        contract=_contract(tmp_path),
+        ttl_seconds=60,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest=_HEX_A,
+    )
+    channel = issuer.activate_spawn_channel(
+        board_slug="default",
+        task_id="t_phase_a",
+        run_id=24,
+        profile="bookkeeper",
+        profile_home=str(tmp_path / "profile"),
+        workspace=str(tmp_path / "workspace"),
+    )
+    channel.send_envelope()
+    client_fd = os.dup(channel.child_fd)
+    monkeypatch.setenv(permits.PERMIT_FD_ENV, str(client_fd))
+    client = claim_worker_permit_channel()
+    payload = json.loads(channel.permit.payload)
+    context = {key: copy.deepcopy(payload[key]) for key in issuer.CONTEXT_FIELDS}
+    command = " ".join(payload["operation_sequence"][0]["argv"])
+
+    ticket = prepare_scoped_terminal_permit(
+        command, "local", context, client=client
+    )
+
+    assert isinstance(ticket, PreparedPermitTicket)
+    assert ticket.permit_id_digest == permits._digest(channel.permit.permit_id)
+    assert "payload" not in repr(ticket)
+    assert "signature" not in repr(ticket)
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        prepare_scoped_terminal_permit(
+            "sh -c 'rclone copyto source destination'",
+            "local",
+            context,
+            client=client,
+        )
+    assert exc.value.failure_class == "operation_forbidden"
+    channel.close()

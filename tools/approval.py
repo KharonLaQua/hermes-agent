@@ -21,8 +21,15 @@ import tempfile
 import threading
 import time
 import unicodedata
-from typing import Optional
+from typing import Any, Mapping, Optional
 from hermes_cli.config import cfg_get
+from hermes_cli.scoped_terminal_permits import (
+    PreparedPermitTicket,
+    ScopedTerminalPermitError,
+    claim_worker_permit_channel,
+    get_worker_permit_client,
+    prepare_scoped_terminal_permit,
+)
 
 from tools.interrupt import is_interrupted
 from utils import env_var_enabled, is_truthy_value
@@ -42,6 +49,20 @@ _YOLO_MODE_FROZEN: bool = is_truthy_value(os.getenv("HERMES_YOLO_MODE", ""))
 _KANBAN_HEADLESS_NO_RESPONDER_FROZEN: bool = is_truthy_value(
     os.environ.pop("HERMES_KANBAN_HEADLESS_NO_RESPONDER", "")
 )
+
+# The permit FD is a one-shot worker capability, never an approval bypass.
+# Claiming it at import removes the bridge before model/tool code runs.  Keep
+# only a stable failure class if a partial or malformed bridge was inherited;
+# raw descriptor/envelope errors must not escape into logs or approval output.
+try:
+    claim_worker_permit_channel()
+    _WORKER_PERMIT_BOOTSTRAP_FAILURE: str | None = None
+except ScopedTerminalPermitError as exc:
+    _WORKER_PERMIT_BOOTSTRAP_FAILURE = (
+        None if exc.failure_class == "missing" else exc.failure_class
+    )
+except Exception:
+    _WORKER_PERMIT_BOOTSTRAP_FAILURE = "partial_bridge"
 
 # Per-thread/per-task gateway session identity.
 # Gateway runs agent turns concurrently in executor threads, so reading a
@@ -3186,9 +3207,55 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 
 
+def _scoped_permit_failure_result(failure_class: str) -> dict:
+    """Return a secret-free Phase-A denial for a required permit route."""
+    return {
+        "approved": False,
+        "status": "scoped_permit_denied",
+        "scoped_permit": False,
+        "permit_failure_class": failure_class,
+        "approval_pending": False,
+        "message": (
+            f"BLOCKED: scoped terminal permit validation failed ({failure_class}). "
+            "Do NOT retry or fall back to ordinary approval."
+        ),
+    }
+
+
+def _prepare_scoped_permit_result(
+    command: str,
+    env_type: str,
+    execution_context: Optional[Mapping[str, Any]],
+) -> dict:
+    """Perform Phase A only; broker consumption belongs to terminal_tool."""
+    if _WORKER_PERMIT_BOOTSTRAP_FAILURE is not None:
+        return _scoped_permit_failure_result(_WORKER_PERMIT_BOOTSTRAP_FAILURE)
+    if get_worker_permit_client() is None:
+        return _scoped_permit_failure_result("missing")
+    if execution_context is None:
+        return _scoped_permit_failure_result("partial_bridge")
+    try:
+        ticket = prepare_scoped_terminal_permit(command, env_type, execution_context)
+    except ScopedTerminalPermitError as exc:
+        return _scoped_permit_failure_result(exc.failure_class)
+    if not isinstance(ticket, PreparedPermitTicket):
+        return _scoped_permit_failure_result("malformed")
+    return {
+        "approved": False,
+        "status": "permit_prepared",
+        "scoped_permit": True,
+        "permit_prepared": True,
+        "prepared_permit": ticket,
+        "permit_id_digest": ticket.permit_id_digest,
+        "operation_index": ticket.operation_index,
+        "message": None,
+    }
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             execution_context: Optional[Mapping[str, Any]] = None) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
 
     Gathers findings from tirith and dangerous-command detection, then
@@ -3200,10 +3267,6 @@ def check_all_command_guards(command: str, env_type: str,
     such a session is no longer isolated, so it goes through the normal flow
     instead of the container fast-path.
     """
-    # Skip isolated container backends for both checks. Docker stops skipping
-    # once host paths are bind-mounted into the sandbox.
-    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
-        return {"approved": True, "message": None}
 
     # Hardline floor: unconditional block for catastrophic commands
     # (rm -rf /, mkfs, dd to raw device, shutdown/reboot, fork bomb,
@@ -3233,6 +3296,24 @@ def check_all_command_guards(command: str, env_type: str,
         logger.warning("User deny rule %r blocked command: %s",
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
+
+    # Phase A is deliberately between the three unconditional floors and all
+    # ordinary bypass/prompt paths. A channel or execution context is a
+    # required scoped route; it may never fall through to yolo, mode=off,
+    # permanent allow, or a no-responder prompt.
+    permit_state_present = (
+        get_worker_permit_client() is not None
+        or _WORKER_PERMIT_BOOTSTRAP_FAILURE is not None
+    )
+    if permit_state_present or execution_context is not None:
+        if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+            return _scoped_permit_failure_result("operation_forbidden")
+        return _prepare_scoped_permit_result(command, env_type, execution_context)
+
+    # Skip isolated container backends for both checks. Docker stops skipping
+    # once host paths are bind-mounted into the sandbox.
+    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+        return {"approved": True, "message": None}
 
     # --yolo or approvals.mode=off: bypass all approval prompts outside the
     # denial-only quiet-worker context. A quiet worker has no responder, so it
