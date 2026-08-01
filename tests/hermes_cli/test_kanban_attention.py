@@ -217,3 +217,64 @@ def test_attention_summary_uses_hq_bounded_active_inventory_before_projection(
     assert [row["id"] for row in payload["blocked"]] == [included]
     assert excluded not in {row["id"] for row in payload["blocked"]}
     assert all(set(row) == {"id", "title", "status", "assignee"} for row in payload["blocked"])
+
+
+def test_desktop_private_reads_do_not_recompute_or_mutate_board(
+    kanban_home: Path,
+) -> None:
+    """Every Desktop-only read stays read-only even with a promotable child."""
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="completed parent", assignee="owner")
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))
+        child = kb.create_task(conn, title="promotable child", assignee="owner")
+        kb.link_tasks(conn, parent, child)
+        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (child,))
+
+    db_path = kb.kanban_db_path(board="default")
+    before = db_path.read_bytes()
+    with kb.connect_closing() as conn:
+        before_statuses = conn.execute(
+            "SELECT id, status FROM tasks ORDER BY id"
+        ).fetchall()
+        before_events = conn.execute(
+            "SELECT task_id, kind, payload FROM task_events ORDER BY id"
+        ).fetchall()
+
+    completed = kc.run_slash("--board default desktop-read completed --json")
+    diagnostics = kc.run_slash(
+        "--board default desktop-read diagnostics --severity error --json"
+    )
+    attention = kc.run_slash("--board default attention --json")
+
+    assert json.loads(completed)[0]["id"] == parent
+    assert json.loads(diagnostics) == []
+    assert child not in {
+        row["id"]
+        for column in ("blocked", "waiting")
+        for row in json.loads(attention)[column]
+    }
+    assert db_path.read_bytes() == before
+    with kb.connect_closing() as conn:
+        assert conn.execute("SELECT id, status FROM tasks ORDER BY id").fetchall() == before_statuses
+        assert conn.execute(
+            "SELECT task_id, kind, payload FROM task_events ORDER BY id"
+        ).fetchall() == before_events
+
+
+def test_desktop_private_reads_fail_without_creating_missing_board(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / ".hermes-missing"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    for command in (
+        "desktop-read completed --json",
+        "desktop-read diagnostics --severity error --json",
+        "attention --json",
+    ):
+        output = kc.run_slash(f"--board default {command}")
+        assert "unavailable" in output
+    assert not (home / "kanban.db").exists()

@@ -446,6 +446,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit the metadata-only semantic summary as JSON",
     )
 
+    # --- desktop-read (private, bounded, read-only plugin surface) ---
+    p_desktop_read = sub.add_parser("desktop-read", help=argparse.SUPPRESS)
+    desktop_read_sub = p_desktop_read.add_subparsers(dest="desktop_read_action")
+    p_desktop_completed = desktop_read_sub.add_parser("completed", help=argparse.SUPPRESS)
+    p_desktop_completed.add_argument("--json", action="store_true")
+    p_desktop_diagnostics = desktop_read_sub.add_parser("diagnostics", help=argparse.SUPPRESS)
+    p_desktop_diagnostics.add_argument(
+        "--severity", choices=["warning", "error", "critical"], default=None
+    )
+    p_desktop_diagnostics.add_argument("--json", action="store_true")
+
     # --- show ---
     p_show = sub.add_parser("show", help="Show a task with comments + events")
     p_show.add_argument("task_id")
@@ -1029,6 +1040,8 @@ def kanban_command(args: argparse.Namespace) -> int:
         # a board before issuing its SQLite mode=ro metadata query.
         if action == "attention":
             return _cmd_attention(args)
+        if action == "desktop-read":
+            return _cmd_desktop_read(args)
         try:
             kb.init_db()
         except Exception as exc:
@@ -1623,6 +1636,42 @@ def _cmd_attention(args: argparse.Namespace) -> int:
         for row in payload[column]:
             assignee = row["assignee"] or "(unassigned)"
             print(f"  {row['id']}  {row['status']:8s}  {assignee:20s}  {row['title']}")
+    return 0
+
+
+def _cmd_desktop_read(args: argparse.Namespace) -> int:
+    """Emit bounded, metadata-only data for the Desktop plugin."""
+    from hermes_cli import kanban_desktop_read as dr
+
+    action = getattr(args, "desktop_read_action", None)
+    try:
+        if action == "completed":
+            payload = dr.completed_rows(board=getattr(args, "board", None))
+        elif action == "diagnostics":
+            payload = dr.diagnostic_rows(
+                board=getattr(args, "board", None),
+                severity=getattr(args, "severity", None),
+            )
+        else:
+            print("kanban desktop-read: a read section is required", file=sys.stderr)
+            return 2
+    except (ValueError, RuntimeError) as exc:
+        print(f"kanban desktop-read: {exc}", file=sys.stderr)
+        return 1
+
+    if getattr(args, "json", False):
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    for row in payload:
+        if action == "completed":
+            assignee = row["assignee"] or "(unassigned)"
+            print(f"{row['id']}  {row['status']:8s}  {assignee:20s}  {row['title']}")
+        else:
+            for diagnostic in row["diagnostics"]:
+                print(
+                    f"{diagnostic['severity'].upper()} · "
+                    f"{row['task_id']} · {diagnostic['title']}"
+                )
     return 0
 
 
