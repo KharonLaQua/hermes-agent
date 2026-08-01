@@ -1,4 +1,10 @@
+import os
+import subprocess
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
+from pathlib import Path
+from threading import Thread
 
 import pytest
 
@@ -200,18 +206,36 @@ def test_human_single_query_main_finalizes_after_query(monkeypatch):
     ]
 
 
-def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatch):
+@pytest.mark.parametrize(
+    ("conversation_result", "expected_exit_code"),
+    [
+        (
+            {
+                "final_response": "",
+                "error": "provider failed",
+                "failed": True,
+            },
+            1,
+        ),
+        (
+            {
+                "final_response": "done",
+                "completed": True,
+            },
+            0,
+        ),
+    ],
+)
+def test_quiet_single_query_main_finalizes_while_preserving_exit_code(
+    monkeypatch, conversation_result, expected_exit_code
+):
     calls = []
 
     import cli as cli_mod
 
     def run_conversation(*, user_message, conversation_history):
         calls.append(("run", user_message, conversation_history))
-        return {
-            "final_response": "",
-            "error": "provider failed",
-            "failed": True,
-        }
+        return conversation_result
 
     class FakeCLI:
         def __init__(self, **_kwargs):
@@ -264,7 +288,108 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
     with pytest.raises(SystemExit) as exc_info:
         cli_mod.main(query="hello", quiet=True, toolsets="terminal")
 
-    assert exc_info.value.code == 1
+    assert exc_info.value.code == expected_exit_code
     assert ("claim", "cli", True) in calls
     assert ("run", "hello", []) in calls
     assert calls[-1] == ("finalize", "quiet-session")
+
+
+def test_quiet_single_query_terminal_401_subprocess_exits_nonzero_and_is_reap_classified(
+    tmp_path,
+):
+    """A real quiet CLI process must not turn terminal provider auth failure into rc=0.
+
+    The local endpoint is deliberate: this exercises the installed module entrypoint,
+    profile override, config resolution, OpenAI transport, quiet CLI path, and process
+    teardown without credentials or a network request.  Feed the observed process exit
+    status through the same reap classifier used by Kanban so the regression is explicit:
+    this is ``nonzero_exit``, never a clean-exit protocol violation.
+    """
+
+    requests = []
+
+    class UnauthorizedHandler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+
+        def _reply(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            requests.append(self.path)
+            payload = b'{"error":{"message":"deliberate terminal auth failure"}}'
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        do_POST = _reply
+        do_GET = _reply
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), UnauthorizedHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        hermes_root = tmp_path / "hermes-root"
+        profile_home = hermes_root / "profiles" / "mutant"
+        profile_home.mkdir(parents=True)
+        (profile_home / "config.yaml").write_text(
+            "model:\n"
+            "  default: mutant-model\n"
+            "  provider: custom\n"
+            f"  base_url: http://127.0.0.1:{server.server_port}/v1\n"
+            "  api_key: deliberately-invalid-test-token\n"
+            "platform_toolsets:\n"
+            "  cli: [terminal]\n",
+            encoding="utf-8",
+        )
+
+        repo_root = Path(__file__).resolve().parents[2]
+        env = os.environ.copy()
+        env["HERMES_HOME"] = str(hermes_root)
+        env.pop("HERMES_PROFILE", None)
+        env.pop("HERMES_KANBAN_TASK", None)
+        env["PYTHONPATH"] = os.pathsep.join(
+            part for part in (str(repo_root), env.get("PYTHONPATH", "")) if part
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "hermes_cli.main",
+                "-p",
+                "mutant",
+                "--cli",
+                "chat",
+                "-q",
+                "MUTANT-401-PROBE",
+                "-Q",
+            ],
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert completed.returncode == 1, (
+        f"quiet terminal-401 process returned {completed.returncode}: "
+        f"stdout={completed.stdout[-1000:]!r} stderr={completed.stderr[-1000:]!r}"
+    )
+    assert requests, "the mutant must reach the local provider endpoint"
+    assert "session_id:" in completed.stderr
+    combined_output = completed.stdout + completed.stderr
+    assert "deliberately-invalid-test-token" not in combined_output
+
+    import hermes_cli.kanban_db as kanban_db
+
+    observed_pid = 987654
+    kanban_db._record_worker_exit(observed_pid, completed.returncode << 8)
+    assert kanban_db._classify_worker_exit(observed_pid) == ("nonzero_exit", 1)
