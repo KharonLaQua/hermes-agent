@@ -435,6 +435,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Restrict to tasks with this current_step_key",
     )
 
+    # --- attention (metadata-only, semantic HQ parity) ---
+    p_attention = sub.add_parser(
+        "attention",
+        help="Read-only semantic Blocked/Waiting summary",
+    )
+    p_attention.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the metadata-only semantic summary as JSON",
+    )
+
     # --- show ---
     p_show = sub.add_parser("show", help="Show a task with comments + events")
     p_show.add_argument("task_id")
@@ -1013,6 +1024,11 @@ def kanban_command(args: argparse.Namespace) -> int:
         # without ever reaching the repair path.
         if action == "repair":
             return _cmd_repair(args)
+        # Attention has a strict read-only contract: unlike the regular
+        # command surface it must not auto-initialize (and therefore mutate)
+        # a board before issuing its SQLite mode=ro metadata query.
+        if action == "attention":
+            return _cmd_attention(args)
         try:
             kb.init_db()
         except Exception as exc:
@@ -1591,6 +1607,22 @@ def _cmd_list(args: argparse.Namespace) -> int:
         return 0
     for t in tasks:
         print(_fmt_task_line(t))
+    return 0
+
+
+def _cmd_attention(args: argparse.Namespace) -> int:
+    """Emit the private metadata-only semantic attention summary."""
+    from hermes_cli import kanban_attention as ka
+
+    payload = ka.attention_summary(board=getattr(args, "board", None))
+    if getattr(args, "json", False):
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    for column, label in (("blocked", "Blocked"), ("waiting", "Waiting")):
+        print(f"{label}: {payload['counts'][column]}")
+        for row in payload[column]:
+            assignee = row["assignee"] or "(unassigned)"
+            print(f"  {row['id']}  {row['status']:8s}  {assignee:20s}  {row['title']}")
     return 0
 
 
