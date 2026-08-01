@@ -34,11 +34,17 @@ ROUTES = [
     ("R15", True, "investigator", "bookkeeper", True, "lead_to_child"),
     ("R16", True, "investigator", "soldier", False, "lead_target_not_owned"),
     ("R17", True, "soldier", "detective", False, "actor_role_denied"),
-    ("R18", True, "consigliere", "developer-capo", True, "authority_to_lead"),
-    ("R19", True, "consigliere", "default", True, "authority_to_router"),
-    ("R20", True, "consigliere", "soldier", False, "authority_target_not_router_or_lead"),
-    ("R21", True, "default", "ghost", False, "unknown_target"),
-    ("R22", True, "ghost", "developer-capo", False, "unknown_actor"),
+    ("R18", True, "default", "consigliere", True, "router_to_consigliere"),
+    ("R19", True, "developer-capo", "consigliere", True, "lead_to_consigliere"),
+    ("R20", True, "consigliere", "developer-capo", True, "authority_to_lead"),
+    ("R21", True, "consigliere", "default", True, "authority_to_router"),
+    ("R22", True, "consigliere", "soldier", False, "authority_target_not_router_or_lead"),
+    ("R23", True, "kharon", "default", False, "authority_actor_not_delegated"),
+    ("R24", True, "underboss", "developer-capo", False, "authority_actor_not_delegated"),
+    ("R25", True, "default", "kharon", False, "router_target_not_lead"),
+    ("R26", True, "default", "ghost", False, "unknown_target"),
+    ("R27", True, "ghost", "developer-capo", False, "unknown_actor"),
+    ("R28", True, "kharon", "ghost", False, "authority_actor_not_delegated"),
 ]
 
 
@@ -52,6 +58,8 @@ def roster(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "investigator": ("lead", ["researcher", "bookkeeper"]),
         "enforcer": ("lead", ["soldier"]),
         "consigliere": ("authority", []),
+        "kharon": ("authority", []),
+        "underboss": ("authority", []),
         "soldier": ("junior", []),
         "drafter": ("junior", []),
         "coder": ("junior", []),
@@ -192,6 +200,13 @@ def test_idempotency_replay_precedes_authorization(roster: Path) -> None:
             authority_actor="default", authority_enabled=True,
         )
         assert replay == existing
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+
+        with pytest.raises(ValueError, match="actor_role_denied"):
+            kb.create_task(
+                conn, title="new forbidden", assignee="developer-capo",
+                idempotency_key="new", authority_actor="soldier", authority_enabled=True,
+            )
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
     finally:
         conn.close()

@@ -1120,6 +1120,19 @@ def _profile_author() -> str:
         return "user"
 
 
+def _trusted_worker_authority_actor() -> Optional[str]:
+    """Return dispatcher identity only for a dispatched worker CLI process.
+
+    ``created_by`` remains provenance and never authenticates. Interactive and
+    administrative CLI calls have no worker marker and retain the compatibility
+    path that omits authority. A worker with no usable profile fails closed via
+    a deliberately non-existent profile sentinel.
+    """
+    if "HERMES_KANBAN_TASK" not in os.environ:
+        return None
+    return os.environ.get("HERMES_PROFILE", "").strip() or "missing-hermes-profile"
+
+
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init",
     "create",
@@ -1526,6 +1539,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            authority_actor=_trusted_worker_authority_actor(),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1567,6 +1581,7 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             created_by=args.created_by or _profile_author(),
             priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
+            authority_actor=_trusted_worker_authority_actor(),
         )
     if getattr(args, "json", False):
         print(json.dumps(created.as_dict(), indent=2, ensure_ascii=False))

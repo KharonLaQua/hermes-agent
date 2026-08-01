@@ -83,6 +83,19 @@ def test_run_slash_no_args_shows_usage(kanban_home):
     assert "create" in out.lower() or "subcommand" in out.lower() or "action" in out.lower()
 
 
+def test_worker_authority_actor_comes_only_from_profile(monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "soldier")
+    assert kc._trusted_worker_authority_actor() is None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+    assert kc._trusted_worker_authority_actor() == "soldier"
+    monkeypatch.setenv("HERMES_PROFILE", "   ")
+    assert kc._trusted_worker_authority_actor() == "missing-hermes-profile"
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    assert kc._trusted_worker_authority_actor() == "missing-hermes-profile"
+
+
 def test_run_slash_create_and_list(kanban_home):
     out = kc.run_slash("create 'ship feature' --assignee alice")
     assert "Created" in out

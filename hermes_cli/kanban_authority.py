@@ -106,6 +106,15 @@ def authorize_task_create(
     actor_role = actor_meta["routing_role"]
     if actor_role == "junior":
         return _decision(False, "actor_role_denied", actor, actor_role, target, None)
+    if actor_role == "authority" and actor != "consigliere":
+        return _decision(
+            False,
+            "authority_actor_not_delegated",
+            actor,
+            actor_role,
+            target,
+            None,
+        )
 
     target_meta, target_error = _read(target)
     if target_error == "unknown":
@@ -118,6 +127,14 @@ def authorize_task_create(
     target_role = target_meta["routing_role"]
 
     if actor_role == "router":
+        if (
+            actor == "default"
+            and target == "consigliere"
+            and target_role == "authority"
+        ):
+            return _decision(
+                True, "router_to_consigliere", actor, actor_role, target, target_role
+            )
         if target_role == "lead":
             return _decision(
                 True, "router_to_lead", actor, actor_role, target, target_role
@@ -127,6 +144,10 @@ def authorize_task_create(
         )
 
     if actor_role == "lead":
+        if target == "consigliere" and target_role == "authority":
+            return _decision(
+                True, "lead_to_consigliere", actor, actor_role, target, target_role
+            )
         if target in actor_meta["routing_children"]:
             return _decision(
                 True, "lead_to_child", actor, actor_role, target, target_role

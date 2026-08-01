@@ -1,4 +1,9 @@
 
+from pathlib import Path
+
+import pytest
+import yaml
+
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_swarm import (
     SwarmWorkerSpec,
@@ -6,6 +11,110 @@ from hermes_cli.kanban_swarm import (
     latest_blackboard,
     post_blackboard_update,
 )
+
+
+MUTATION_TABLES = (
+    "tasks", "task_links", "task_events", "task_comments",
+    "kanban_notify_subs", "task_runs", "task_attachments",
+)
+
+
+@pytest.fixture
+def authority_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text(
+        "kanban:\n  authority_enforcement:\n    enabled: true\n", encoding="utf-8"
+    )
+    roles = {
+        "developer-capo": ("lead", ["drafter", "reviewer", "writer"]),
+        "soldier": ("junior", []),
+        "drafter": ("junior", []),
+        "reviewer": ("junior", []),
+        "writer": ("junior", []),
+    }
+    for name, (role, children) in roles.items():
+        profile = home / "profiles" / name
+        profile.mkdir(parents=True)
+        (profile / "profile.yaml").write_text(
+            yaml.safe_dump({"routing_role": role, "routing_children": children}),
+            encoding="utf-8",
+        )
+    return home
+
+
+def _counts(conn):
+    return {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in MUTATION_TABLES
+    }
+
+
+def test_denied_swarm_is_atomic_across_all_mutation_tables(authority_home):
+    conn = kb.connect(authority_home / "kanban.db")
+    try:
+        before = _counts(conn)
+        with pytest.raises(ValueError, match="actor_role_denied"):
+            create_swarm(
+                conn,
+                goal="Forbidden worker swarm",
+                workers=[SwarmWorkerSpec(profile="developer-capo", title="Foreign", body="x")],
+                verifier_assignee="reviewer",
+                synthesizer_assignee="writer",
+                created_by="default",
+                authority_actor="soldier",
+            )
+        assert _counts(conn) == before
+    finally:
+        conn.close()
+
+
+def test_permitted_lead_swarm_propagates_authority_to_every_create(authority_home):
+    conn = kb.connect(authority_home / "kanban.db")
+    try:
+        created = create_swarm(
+            conn,
+            goal="Owned child swarm",
+            workers=[SwarmWorkerSpec(profile="drafter", title="Build", body="x")],
+            verifier_assignee="reviewer",
+            synthesizer_assignee="writer",
+            created_by="developer-capo",
+            authority_actor="developer-capo",
+        )
+        assert kb.get_task(conn, created.root_id).assignee == "drafter"
+        assert len(created.worker_ids) == 1
+    finally:
+        conn.close()
+
+
+def test_swarm_idempotent_replay_precedes_authority_but_new_key_is_denied(authority_home):
+    conn = kb.connect(authority_home / "kanban.db")
+    kwargs = {
+        "goal": "Replayable swarm",
+        "workers": [SwarmWorkerSpec(profile="drafter", title="Build", body="x")],
+        "verifier_assignee": "reviewer",
+        "synthesizer_assignee": "writer",
+        "created_by": "developer-capo",
+    }
+    try:
+        original = create_swarm(
+            conn, **kwargs, idempotency_key="existing", authority_actor="developer-capo"
+        )
+        before = _counts(conn)
+        replay = create_swarm(
+            conn, **kwargs, idempotency_key="existing", authority_actor="soldier"
+        )
+        assert replay == original
+        assert _counts(conn) == before
+
+        with pytest.raises(ValueError, match="actor_role_denied"):
+            create_swarm(
+                conn, **kwargs, idempotency_key="new", authority_actor="soldier"
+            )
+        assert _counts(conn) == before
+    finally:
+        conn.close()
 
 
 def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path):

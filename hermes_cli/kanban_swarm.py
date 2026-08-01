@@ -90,6 +90,7 @@ def create_swarm(
     workspace_path: Optional[str] = None,
     priority: int = 0,
     idempotency_key: Optional[str] = None,
+    authority_actor: Optional[str] = None,
 ) -> SwarmCreated:
     """Create a durable Kanban swarm graph.
 
@@ -108,6 +109,47 @@ def create_swarm(
         _require_text(spec.profile, f"workers[{i}].profile")
         _require_text(spec.title, f"workers[{i}].title")
 
+    # Preserve a complete historical replay before applying today's policy.
+    if idempotency_key:
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+            (idempotency_key,),
+        ).fetchone()
+        if row:
+            existing = latest_blackboard(conn, row["id"]).get("topology")
+            if isinstance(existing, dict):
+                worker_ids = [str(x) for x in existing.get("worker_ids", []) if x]
+                verifier_id = existing.get("verifier_id")
+                synthesizer_id = existing.get("synthesizer_id")
+                if worker_ids and verifier_id and synthesizer_id:
+                    return SwarmCreated(
+                        root_id=row["id"],
+                        worker_ids=worker_ids,
+                        verifier_id=str(verifier_id),
+                        synthesizer_id=str(synthesizer_id),
+                    )
+
+    # Preflight every target so an authority denial cannot leave a partial
+    # root, event, link, run, attachment, subscription, or blackboard comment.
+    if authority_actor is not None:
+        from hermes_cli.kanban_authority import authorize_task_create
+
+        targets = [
+            worker_specs[0].profile,
+            *(spec.profile for spec in worker_specs),
+            verifier_assignee,
+            synthesizer_assignee,
+        ]
+        for target in targets:
+            decision = authorize_task_create(authority_actor, target)
+            if not decision["allowed"]:
+                raise ValueError(
+                    "task create denied "
+                    f"[{decision['code']}]: actor={decision['actor_profile']} "
+                    f"target={decision['target_profile']}"
+                )
+
     root = kb.create_task(
         conn,
         title=root_title or f"Swarm: {goal.splitlines()[0][:80]}",
@@ -117,13 +159,14 @@ def create_swarm(
             "shared blackboard and audit anchor.\n\n"
             f"Goal:\n{goal}"
         ),
-        assignee=created_by,
+        assignee=worker_specs[0].profile if authority_actor is not None else created_by,
         created_by=created_by,
         tenant=tenant,
         priority=priority,
         idempotency_key=idempotency_key,
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
+        authority_actor=authority_actor,
     )
 
     # If idempotency returned an existing non-archived root, do not duplicate the
@@ -169,6 +212,7 @@ def create_swarm(
             workspace_path=workspace_path,
             skills=spec.skills or None,
             max_runtime_seconds=spec.max_runtime_seconds,
+            authority_actor=authority_actor,
         )
         worker_ids.append(worker_id)
 
@@ -190,6 +234,7 @@ def create_swarm(
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
         skills=["requesting-code-review"],
+        authority_actor=authority_actor,
     )
 
     synthesizer_body = (
@@ -209,6 +254,7 @@ def create_swarm(
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
         skills=["humanizer"],
+        authority_actor=authority_actor,
     )
 
     created = SwarmCreated(root, worker_ids, verifier, synthesizer)
