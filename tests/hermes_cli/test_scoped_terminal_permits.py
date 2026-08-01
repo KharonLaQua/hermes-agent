@@ -1231,36 +1231,130 @@ def test_public_consume_client_mutation_terminalizes_prepared_origin(
         channel.close()
 
 
-def test_public_consume_fresh_client_without_prepare_is_missing(
+def test_public_consume_wrong_type_terminalizes_prepared_authority(
     permit_factory, tmp_path, monkeypatch
 ):
+    monkeypatch.setattr(permits, "_WORKER_CHANNEL_CLAIMED", False)
+    monkeypatch.setattr(permits, "_WORKER_PERMIT_CLIENT", None)
     monkeypatch.setattr(permits, "_PREPARED_TICKET_ORIGINS", {})
-    _, issuer, _, _, _ = permit_factory
-    _, envelope, _, _ = permit_factory[0]()
-    payload = json.loads(envelope.payload)
-    foreign_endpoint, foreign_peer = permits.socket.socketpair()
-    fresh = permits._WorkerPermitClient(
-        envelope,
-        issuer._public_key_bytes or b"",
-        payload,
-        foreign_endpoint,
+    _, issuer, now, _, _ = permit_factory
+    monkeypatch.setattr(permits.time, "time", lambda: now[0])
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id="t_wrong_type_consume",
+        contract=_contract(tmp_path),
+        ttl_seconds=60,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest=_HEX_A,
     )
-    ticket = PreparedPermitTicket(
-        fresh,
-        permits._digest(envelope.permit_id),
+    channel = issuer.activate_spawn_channel(
+        board_slug="default",
+        task_id="t_wrong_type_consume",
+        run_id=36,
+        profile="bookkeeper",
+        profile_home=str(tmp_path / "profile"),
+        workspace=str(tmp_path / "workspace"),
+    )
+    channel.send_envelope()
+    client_fd = os.dup(channel.child_fd)
+    monkeypatch.setenv(permits.PERMIT_FD_ENV, str(client_fd))
+    client = claim_worker_permit_channel()
+    issuer.release_spawn_child(channel)
+    payload = json.loads(channel.permit.payload)
+    context = {key: copy.deepcopy(payload[key]) for key in issuer.CONTEXT_FIELDS}
+    command = " ".join(payload["operation_sequence"][0]["argv"])
+    prepared = prepare_scoped_terminal_permit(command, "local", context, client=client)
+    consume_observed = threading.Event()
+    original_consume = issuer.consume
+
+    def record_consume(*args, **kwargs):
+        try:
+            return original_consume(*args, **kwargs)
+        finally:
+            consume_observed.set()
+
+    monkeypatch.setattr(issuer, "consume", record_consume)
+    try:
+        with pytest.raises(ScopedTerminalPermitError) as wrong_type:
+            consume_scoped_terminal_permit(object(), context)
+        assert wrong_type.value.failure_class == "malformed"
+        assert client._closed is True
+        assert consume_observed.wait(timeout=1)
+        assert issuer.permit_status(payload["permit_id"]) == "rejected"
+        assert permits._PREPARED_TICKET_ORIGINS == {}
+
+        with pytest.raises(ScopedTerminalPermitError) as restored:
+            consume_scoped_terminal_permit(prepared, context)
+        assert restored.value.failure_class == "missing"
+        with pytest.raises(ScopedTerminalPermitError) as later_prepare:
+            prepare_scoped_terminal_permit(command, "local", context, client=client)
+        assert later_prepare.value.failure_class == "missing"
+    finally:
+        channel.close()
+
+
+def test_public_consume_without_prepare_terminalizes_claimed_authority(
+    permit_factory, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(permits, "_WORKER_CHANNEL_CLAIMED", False)
+    monkeypatch.setattr(permits, "_WORKER_PERMIT_CLIENT", None)
+    monkeypatch.setattr(permits, "_PREPARED_TICKET_ORIGINS", {})
+    _, issuer, now, _, _ = permit_factory
+    monkeypatch.setattr(permits.time, "time", lambda: now[0])
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id="t_no_prepare_consume",
+        contract=_contract(tmp_path),
+        ttl_seconds=60,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest=_HEX_A,
+    )
+    channel = issuer.activate_spawn_channel(
+        board_slug="default",
+        task_id="t_no_prepare_consume",
+        run_id=37,
+        profile="bookkeeper",
+        profile_home=str(tmp_path / "profile"),
+        workspace=str(tmp_path / "workspace"),
+    )
+    channel.send_envelope()
+    client_fd = os.dup(channel.child_fd)
+    monkeypatch.setenv(permits.PERMIT_FD_ENV, str(client_fd))
+    client = claim_worker_permit_channel()
+    issuer.release_spawn_child(channel)
+    payload = json.loads(channel.permit.payload)
+    context = {key: copy.deepcopy(payload[key]) for key in issuer.CONTEXT_FIELDS}
+    command = " ".join(payload["operation_sequence"][0]["argv"])
+    unprepared = PreparedPermitTicket(
+        client,
+        permits._digest(channel.permit.permit_id),
         payload["authorized_operation_index"],
         payload["command_digest"],
     )
-    context = {key: copy.deepcopy(payload[key]) for key in issuer.CONTEXT_FIELDS}
+    consume_observed = threading.Event()
+    original_consume = issuer.consume
 
+    def record_consume(*args, **kwargs):
+        try:
+            return original_consume(*args, **kwargs)
+        finally:
+            consume_observed.set()
+
+    monkeypatch.setattr(issuer, "consume", record_consume)
     try:
-        with pytest.raises(ScopedTerminalPermitError) as exc:
-            consume_scoped_terminal_permit(ticket, context)
-        assert exc.value.failure_class == "missing"
-        assert fresh._closed is False
+        with pytest.raises(ScopedTerminalPermitError) as missing:
+            consume_scoped_terminal_permit(unprepared, context)
+        assert missing.value.failure_class == "missing"
+        assert client._closed is True
+        assert consume_observed.wait(timeout=1)
+        assert issuer.permit_status(payload["permit_id"]) == "rejected"
+        assert permits._PREPARED_TICKET_ORIGINS == {}
+
+        with pytest.raises(ScopedTerminalPermitError) as later_prepare:
+            prepare_scoped_terminal_permit(command, "local", context, client=client)
+        assert later_prepare.value.failure_class == "missing"
     finally:
-        fresh.close()
-        foreign_peer.close()
+        channel.close()
 
 
 def test_authenticated_consume_uses_inherited_channel_once_and_closes_endpoints(

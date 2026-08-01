@@ -1289,7 +1289,7 @@ def uninstall_active_issuer(issuer: ScopedTerminalPermitIssuer) -> bool:
 _WORKER_CHANNEL_LOCK = threading.Lock()
 _WORKER_CHANNEL_CLAIMED = False
 _WORKER_PERMIT_CLIENT: Optional["_WorkerPermitClient"] = None
-_PREPARED_TICKET_LOCK = threading.Lock()
+_PREPARED_TICKET_LOCK = threading.RLock()
 _PREPARED_TICKET_ORIGINS: dict[
     int, tuple[PreparedPermitTicket, "_WorkerPermitClient"]
 ] = {}
@@ -1315,27 +1315,36 @@ def _discard_prepared_ticket(
 
 
 def _take_prepared_ticket_origin(
-    ticket: PreparedPermitTicket,
+    ticket: object,
 ) -> "_WorkerPermitClient":
     """Atomically spend and resolve the exact privately retained ticket origin."""
     with _PREPARED_TICKET_LOCK:
         retained = _PREPARED_TICKET_ORIGINS.pop(id(ticket), None)
-        if retained is not None and retained[0] is ticket:
+        if (
+            isinstance(ticket, PreparedPermitTicket)
+            and retained is not None
+            and retained[0] is ticket
+        ):
             return retained[1]
         # An unrecognized ticket must not leave any privately retained Phase-A
-        # capability live. Fail-close every origin without consulting the
-        # incoming ticket's caller-mutable ``_client`` field.
+        # capability or the authenticated claimed channel live. Fail-close
+        # without consulting the incoming ticket's caller-mutable ``_client``.
         retained_entries = list(_PREPARED_TICKET_ORIGINS.values())
         if retained is not None:
             retained_entries.append(retained)
+        had_prepared_origin = bool(retained_entries)
         active_origins = {
             id(origin): origin
             for _, origin in retained_entries
         }
         _PREPARED_TICKET_ORIGINS.clear()
-    if active_origins:
+        with _WORKER_CHANNEL_LOCK:
+            claimed_origin = _WORKER_PERMIT_CLIENT
+        if claimed_origin is not None:
+            active_origins[id(claimed_origin)] = claimed_origin
         for origin in active_origins.values():
             origin.close()
+    if not isinstance(ticket, PreparedPermitTicket) or had_prepared_origin:
         raise ScopedTerminalPermitError("malformed")
     raise ScopedTerminalPermitError("missing")
 
@@ -1409,6 +1418,9 @@ class _WorkerPermitClient:
         env_type: str,
         execution_context: Mapping[str, Any],
     ) -> PreparedPermitTicket:
+        with _PREPARED_TICKET_LOCK:
+            if self._closed or self._endpoint is None:
+                raise ScopedTerminalPermitError("missing")
         payload = self._payload
         if env_type != "local":
             raise ScopedTerminalPermitError("operation_forbidden")
@@ -1527,10 +1539,13 @@ class _WorkerPermitClient:
             binding.operation_index,
             binding.command_digest,
         )
-        _discard_prepared_ticket(self._prepared_ticket, self)
-        self._prepared_ticket = ticket
-        self._prepared_ticket_binding = binding
-        _retain_prepared_ticket(ticket, self)
+        with _PREPARED_TICKET_LOCK:
+            if self._closed or self._endpoint is None:
+                raise ScopedTerminalPermitError("missing")
+            _discard_prepared_ticket(self._prepared_ticket, self)
+            self._prepared_ticket = ticket
+            self._prepared_ticket_binding = binding
+            _retain_prepared_ticket(ticket, self)
         return ticket
 
     def _reject_pre_send_input(self, failure_class: str) -> NoReturn:
@@ -1541,31 +1556,38 @@ class _WorkerPermitClient:
     def consume(
         self, ticket: PreparedPermitTicket, execution_context: Mapping[str, Any]
     ) -> PermitDecision:
-        if self._closed or self._endpoint is None:
-            self._reject_pre_send_input("missing")
-        binding = self._prepared_ticket_binding
-        if (
-            not isinstance(ticket, PreparedPermitTicket)
-            or ticket is not self._prepared_ticket
-            or ticket._client is not self
-            or binding is None
-            or not isinstance(ticket._permit_id_digest, str)
-            or not hmac.compare_digest(ticket._permit_id_digest, binding.permit_id_digest)
-            or ticket._operation_index != binding.operation_index
-            or not isinstance(ticket._command_digest, str)
-            or not hmac.compare_digest(ticket._command_digest, binding.command_digest)
-        ):
-            self._reject_pre_send_input("malformed")
-        if (
-            not isinstance(execution_context, Mapping)
-            or not ScopedTerminalPermitIssuer.CONTEXT_FIELDS.issubset(execution_context)
-        ):
-            self._reject_pre_send_input("malformed")
-        # The ticket capability is one-shot even if later wire serialization
-        # fails. A second caller cannot reuse Phase-A authority on this client.
-        _discard_prepared_ticket(ticket, self)
-        self._prepared_ticket = None
-        self._prepared_ticket_binding = None
+        with _PREPARED_TICKET_LOCK:
+            if self._closed or self._endpoint is None:
+                self._reject_pre_send_input("missing")
+            binding = self._prepared_ticket_binding
+            if (
+                not isinstance(ticket, PreparedPermitTicket)
+                or ticket is not self._prepared_ticket
+                or ticket._client is not self
+                or binding is None
+                or not isinstance(ticket._permit_id_digest, str)
+                or not hmac.compare_digest(
+                    ticket._permit_id_digest, binding.permit_id_digest
+                )
+                or ticket._operation_index != binding.operation_index
+                or not isinstance(ticket._command_digest, str)
+                or not hmac.compare_digest(
+                    ticket._command_digest, binding.command_digest
+                )
+            ):
+                self._reject_pre_send_input("malformed")
+            if (
+                not isinstance(execution_context, Mapping)
+                or not ScopedTerminalPermitIssuer.CONTEXT_FIELDS.issubset(
+                    execution_context
+                )
+            ):
+                self._reject_pre_send_input("malformed")
+            # The ticket capability is one-shot even if later wire serialization
+            # fails. A second caller cannot reuse Phase-A authority on this client.
+            _discard_prepared_ticket(ticket, self)
+            self._prepared_ticket = None
+            self._prepared_ticket_binding = None
         challenge = secrets.token_hex(32)
         request = {
             "version": 1,
@@ -1631,14 +1653,15 @@ class _WorkerPermitClient:
             raise ScopedTerminalPermitError("broker_protocol_error") from None
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        _discard_prepared_ticket(self._prepared_ticket, self)
-        self._prepared_ticket = None
-        self._prepared_ticket_binding = None
-        endpoint = self._endpoint
-        self._endpoint = None
+        with _PREPARED_TICKET_LOCK:
+            if self._closed:
+                return
+            self._closed = True
+            _discard_prepared_ticket(self._prepared_ticket, self)
+            self._prepared_ticket = None
+            self._prepared_ticket_binding = None
+            endpoint = self._endpoint
+            self._endpoint = None
         if endpoint is not None:
             try:
                 endpoint.close()
@@ -1796,10 +1819,10 @@ def prepare_scoped_terminal_permit(
 
 
 def consume_scoped_terminal_permit(
-    ticket: PreparedPermitTicket, execution_context: Mapping[str, Any]
+    ticket: object, execution_context: Mapping[str, Any]
 ) -> PermitDecision:
     """Consume through the authenticated origin privately retained by Phase A."""
+    origin = _take_prepared_ticket_origin(ticket)
     if not isinstance(ticket, PreparedPermitTicket):
         raise ScopedTerminalPermitError("malformed")
-    origin = _take_prepared_ticket_origin(ticket)
     return origin.consume(ticket, execution_context)
