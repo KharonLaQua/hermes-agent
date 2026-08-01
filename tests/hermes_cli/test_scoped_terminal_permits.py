@@ -1008,6 +1008,87 @@ def test_phase_a_returns_opaque_ticket_only_after_exact_binding(
     channel.close()
 
 
+@pytest.mark.parametrize(
+    "ticket_kind",
+    ("forged", "substituted", "metadata_mutated", "cross_client"),
+)
+def test_authenticated_consume_rejects_unprepared_ticket_forms_and_spends_channel(
+    permit_factory, tmp_path, monkeypatch, ticket_kind
+):
+    """Only the exact ticket retained by ``prepare`` may consume the channel."""
+    monkeypatch.setattr(permits, "_WORKER_CHANNEL_CLAIMED", False)
+    monkeypatch.setattr(permits, "_WORKER_PERMIT_CLIENT", None)
+    _, issuer, now, _, _ = permit_factory
+    monkeypatch.setattr(permits.time, "time", lambda: now[0])
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id="t_ticket_identity",
+        contract=_contract(tmp_path),
+        ttl_seconds=60,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest=_HEX_A,
+    )
+    channel = issuer.activate_spawn_channel(
+        board_slug="default",
+        task_id="t_ticket_identity",
+        run_id=33,
+        profile="bookkeeper",
+        profile_home=str(tmp_path / "profile"),
+        workspace=str(tmp_path / "workspace"),
+    )
+    channel.send_envelope()
+    client_fd = os.dup(channel.child_fd)
+    monkeypatch.setenv(permits.PERMIT_FD_ENV, str(client_fd))
+    client = claim_worker_permit_channel()
+    issuer.release_spawn_child(channel)
+    payload = json.loads(channel.permit.payload)
+    context = {key: copy.deepcopy(payload[key]) for key in issuer.CONTEXT_FIELDS}
+    command = " ".join(payload["operation_sequence"][0]["argv"])
+    prepared = prepare_scoped_terminal_permit(command, "local", context, client=client)
+
+    if ticket_kind == "forged":
+        ticket = PreparedPermitTicket(client, _HEX_A, 99, _HEX_C)
+    elif ticket_kind == "substituted":
+        ticket = replace(prepared)
+    elif ticket_kind == "metadata_mutated":
+        object.__setattr__(prepared, "_command_digest", _HEX_C)
+        ticket = prepared
+    else:
+        assert client._endpoint is not None
+        foreign_client = permits._WorkerPermitClient(
+            client._envelope,
+            client._public_key,
+            client._payload,
+            client._endpoint,
+        )
+        ticket = PreparedPermitTicket(
+            foreign_client,
+            prepared.permit_id_digest,
+            prepared.operation_index,
+            prepared.command_digest,
+        )
+
+    consume_observed = threading.Event()
+    original_consume = issuer.consume
+
+    def record_consume(*args, **kwargs):
+        try:
+            return original_consume(*args, **kwargs)
+        finally:
+            consume_observed.set()
+
+    monkeypatch.setattr(issuer, "consume", record_consume)
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        consume_scoped_terminal_permit(ticket, context)
+
+    assert exc.value.failure_class == "malformed"
+    ticket_client = ticket._client
+    assert isinstance(ticket_client, permits._WorkerPermitClient)
+    assert ticket_client._closed is True
+    assert consume_observed.wait(timeout=1)
+    assert issuer.permit_status(payload["permit_id"]) == "rejected"
+
+
 def test_authenticated_consume_uses_inherited_channel_once_and_closes_endpoints(
     permit_factory, tmp_path, monkeypatch
 ):

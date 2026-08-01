@@ -17,7 +17,7 @@ import socket
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, NoReturn, Optional
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
@@ -159,6 +159,15 @@ class PreparedPermitTicket:
             f"permit_id_digest={self._permit_id_digest!r}, "
             f"operation_index={self._operation_index})"
         )
+
+
+@dataclass(frozen=True)
+class _PreparedTicketBinding:
+    """Private Phase-A metadata retained separately from the public ticket."""
+
+    permit_id_digest: str
+    operation_index: int
+    command_digest: str
 
 
 PERMIT_FD_ENV = "HERMES_KANBAN_TERMINAL_PERMIT_FD"
@@ -1315,7 +1324,15 @@ def _decode_hex(value: Any, *, length: int) -> bytes:
 class _WorkerPermitClient:
     """Private authenticated view of the one inherited permit envelope."""
 
-    __slots__ = ("_envelope", "_public_key", "_payload", "_endpoint", "_closed")
+    __slots__ = (
+        "_envelope",
+        "_public_key",
+        "_payload",
+        "_endpoint",
+        "_closed",
+        "_prepared_ticket",
+        "_prepared_ticket_binding",
+    )
 
     def __init__(
         self,
@@ -1329,6 +1346,8 @@ class _WorkerPermitClient:
         self._payload = payload
         self._endpoint = endpoint
         self._closed = False
+        self._prepared_ticket: PreparedPermitTicket | None = None
+        self._prepared_ticket_binding: _PreparedTicketBinding | None = None
 
     @property
     def permit_id_digest(self) -> str:
@@ -1447,22 +1466,55 @@ class _WorkerPermitClient:
             raise ScopedTerminalPermitError("not_yet_valid")
         if now > payload["expires_at"]:
             raise ScopedTerminalPermitError("expired")
-        return PreparedPermitTicket(
-            self,
-            self.permit_id_digest,
-            payload["authorized_operation_index"],
-            payload["command_digest"],
+        binding = _PreparedTicketBinding(
+            permit_id_digest=self.permit_id_digest,
+            operation_index=payload["authorized_operation_index"],
+            command_digest=payload["command_digest"],
         )
+        ticket = PreparedPermitTicket(
+            self,
+            binding.permit_id_digest,
+            binding.operation_index,
+            binding.command_digest,
+        )
+        self._prepared_ticket = ticket
+        self._prepared_ticket_binding = binding
+        return ticket
+
+    def _reject_pre_send_input(self, failure_class: str) -> NoReturn:
+        """Invalidate local Phase A state and terminalize the capability channel."""
+        self._prepared_ticket = None
+        self._prepared_ticket_binding = None
+        self.close()
+        raise ScopedTerminalPermitError(failure_class)
 
     def consume(
         self, ticket: PreparedPermitTicket, execution_context: Mapping[str, Any]
     ) -> PermitDecision:
-        if ticket._client is not self:
-            raise ScopedTerminalPermitError("malformed")
         if self._closed or self._endpoint is None:
-            raise ScopedTerminalPermitError("missing")
-        if not isinstance(execution_context, Mapping) or not ScopedTerminalPermitIssuer.CONTEXT_FIELDS.issubset(execution_context):
-            raise ScopedTerminalPermitError("malformed")
+            self._reject_pre_send_input("missing")
+        binding = self._prepared_ticket_binding
+        if (
+            not isinstance(ticket, PreparedPermitTicket)
+            or ticket is not self._prepared_ticket
+            or ticket._client is not self
+            or binding is None
+            or not isinstance(ticket._permit_id_digest, str)
+            or not hmac.compare_digest(ticket._permit_id_digest, binding.permit_id_digest)
+            or ticket._operation_index != binding.operation_index
+            or not isinstance(ticket._command_digest, str)
+            or not hmac.compare_digest(ticket._command_digest, binding.command_digest)
+        ):
+            self._reject_pre_send_input("malformed")
+        if (
+            not isinstance(execution_context, Mapping)
+            or not ScopedTerminalPermitIssuer.CONTEXT_FIELDS.issubset(execution_context)
+        ):
+            self._reject_pre_send_input("malformed")
+        # The ticket capability is one-shot even if later wire serialization
+        # fails. A second caller cannot reuse Phase-A authority on this client.
+        self._prepared_ticket = None
+        self._prepared_ticket_binding = None
         challenge = secrets.token_hex(32)
         request = {
             "version": 1,
