@@ -34,6 +34,15 @@ logger = logging.getLogger(__name__)
 # instantly bypass all approval checks — a prompt-injection escalation path.
 _YOLO_MODE_FROZEN: bool = is_truthy_value(os.getenv("HERMES_YOLO_MODE", ""))
 
+# Quiet Kanban workers have stdin=DEVNULL and no process capable of answering
+# an approval request. Freeze and remove this internal spawn marker before any
+# tool can mutate the process environment. It is denial-only: its sole effect
+# is to keep approval-requiring warnings from reaching an unattended prompt or
+# the generic non-interactive allow path.
+_KANBAN_HEADLESS_NO_RESPONDER_FROZEN: bool = is_truthy_value(
+    os.environ.pop("HERMES_KANBAN_HEADLESS_NO_RESPONDER", "")
+)
+
 # Per-thread/per-task gateway session identity.
 # Gateway runs agent turns concurrently in executor threads, so reading a
 # process-global env var for session identity is racy. Keep env fallback for
@@ -3225,13 +3234,23 @@ def check_all_command_guards(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
-    # --yolo or approvals.mode=off: bypass all approval prompts.
+    # --yolo or approvals.mode=off: bypass all approval prompts outside the
+    # denial-only quiet-worker context. A quiet worker has no responder, so it
+    # must still classify warnings rather than treating a broad bypass as the
+    # operation-scoped authorization that only the permit flow may provide.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if not _KANBAN_HEADLESS_NO_RESPONDER_FROZEN and (
+        _YOLO_MODE_FROZEN
+        or is_current_session_yolo_enabled()
+        or approval_mode == "off"
+    ):
         return {"approved": True, "message": None}
 
-    if _command_matches_permanent_allowlist(command):
+    if (
+        not _KANBAN_HEADLESS_NO_RESPONDER_FROZEN
+        and _command_matches_permanent_allowlist(command)
+    ):
         return {"approved": True, "message": None}
 
     is_cli = _is_interactive_cli()
@@ -3240,7 +3259,12 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
-    if not is_cli and not is_gateway and not is_ask:
+    if (
+        not _KANBAN_HEADLESS_NO_RESPONDER_FROZEN
+        and not is_cli
+        and not is_gateway
+        and not is_ask
+    ):
         # Cron sessions: respect cron_mode config
         if env_var_enabled("HERMES_CRON_SESSION"):
             if _get_cron_approval_mode() == "deny":
@@ -3379,6 +3403,20 @@ def check_all_command_guards(command: str, env_type: str,
     # Nothing to warn about
     if not warnings:
         return {"approved": True, "message": None}
+
+    if _KANBAN_HEADLESS_NO_RESPONDER_FROZEN:
+        combined_desc = "; ".join(desc for _, desc, _ in warnings)
+        return {
+            "approved": False,
+            "status": "no_responder",
+            "no_responder": True,
+            "approval_pending": False,
+            "message": (
+                f"BLOCKED: This command requires approval ({combined_desc}), but this "
+                "headless Kanban worker has no approval responder. Do NOT retry or "
+                "rephrase the command; report the blocked action instead."
+            ),
+        }
 
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
     # When approvals.mode=smart, ask the aux LLM before prompting the user.

@@ -1,8 +1,12 @@
 """Tests for the dangerous command approval module."""
 
 import ast
+import json
 import os
+import subprocess
+import sys
 import tempfile
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -24,6 +28,109 @@ from tools.approval import (
     load_permanent,
     prompt_dangerous_approval,
 )
+
+
+def _run_noninteractive_approval_probe(*, headless_kanban: bool) -> dict:
+    env = os.environ.copy()
+    for key in (
+        "HERMES_CRON_SESSION",
+        "HERMES_EXEC_ASK",
+        "HERMES_GATEWAY_SESSION",
+        "HERMES_INTERACTIVE",
+        "HERMES_SESSION_KEY",
+        "HERMES_SESSION_PLATFORM",
+        "HERMES_YOLO_MODE",
+    ):
+        env.pop(key, None)
+    if headless_kanban:
+        env["HERMES_KANBAN_HEADLESS_NO_RESPONDER"] = "1"
+    else:
+        env.pop("HERMES_KANBAN_HEADLESS_NO_RESPONDER", None)
+
+    probe = textwrap.dedent(
+        """
+        import json
+        import os
+        import sys
+
+        from tools import approval
+        from tools import tirith_security
+
+        marker_present_after_import = (
+            "HERMES_KANBAN_HEADLESS_NO_RESPONDER" in os.environ
+        )
+        # Import-time state is immutable from the worker's perspective: try to
+        # invert it after approval has frozen and removed the spawn marker.
+        os.environ["HERMES_KANBAN_HEADLESS_NO_RESPONDER"] = sys.argv[1]
+
+        approval._get_approval_config = lambda: {"mode": "manual", "deny": []}
+        approval._permanent_approved.clear()
+        approval._session_approved.clear()
+        approval._pending.clear()
+        tirith_security.check_command_security = lambda _command: {
+            "action": "allow",
+            "findings": [],
+            "summary": "",
+        }
+
+        def fail_prompt(*_args, **_kwargs):
+            raise AssertionError("headless approval flow attempted to prompt")
+
+        approval.prompt_dangerous_approval = fail_prompt
+        result = approval.check_all_command_guards(
+            "rm -rf .git",
+            "local",
+            approval_callback=fail_prompt,
+        )
+        safe_result = approval.check_all_command_guards(
+            "git status",
+            "local",
+            approval_callback=fail_prompt,
+        )
+        print(json.dumps({
+            "marker_present_after_import": marker_present_after_import,
+            "pending": bool(approval._pending),
+            "result": result,
+            "safe_result": safe_result,
+        }))
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", probe, "0" if headless_kanban else "1"],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def test_headless_kanban_warning_without_permit_denies_without_prompt():
+    payload = _run_noninteractive_approval_probe(headless_kanban=True)
+
+    result = payload["result"]
+    assert result["approved"] is False
+    assert result["status"] == "no_responder"
+    assert result["no_responder"] is True
+    assert result["approval_pending"] is False
+    assert result["message"] == (
+        "BLOCKED: This command requires approval (recursive delete), but this "
+        "headless Kanban worker has no approval responder. Do NOT retry or "
+        "rephrase the command; report the blocked action instead."
+    )
+    assert payload["pending"] is False
+    assert payload["marker_present_after_import"] is False
+    assert payload["safe_result"] == {"approved": True, "message": None}
+
+
+def test_no_permit_keeps_non_kanban_approval_behavior_unchanged():
+    payload = _run_noninteractive_approval_probe(headless_kanban=False)
+
+    assert payload["result"] == {"approved": True, "message": None}
+    assert payload["safe_result"] == {"approved": True, "message": None}
+    assert payload["pending"] is False
+    assert payload["marker_present_after_import"] is False
 
 
 class TestApprovalModeParsing:

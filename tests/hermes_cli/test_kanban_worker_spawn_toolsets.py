@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 
 def _make_task(kb, *, assignee: str):
@@ -197,3 +198,76 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def _capture_default_spawn(monkeypatch, tmp_path, *, task=None):
+    from hermes_cli import kanban_db as kb
+
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True, exist_ok=True)
+    profile.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+
+    captured = {}
+
+    class FakeProc:
+        pid = 4245
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs.get("env") or {})
+        captured["pass_fds"] = tuple(kwargs.get("pass_fds") or ())
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    kb._default_spawn(
+        task or _make_task(kb, assignee="elias"),
+        str(workspace),
+        board="default",
+    )
+    return captured, profile.resolve(), workspace.resolve()
+
+
+def test_default_spawn_strips_unanswerable_approval_context(monkeypatch, tmp_path):
+    inherited = {
+        "HERMES_INTERACTIVE": "1",
+        "HERMES_EXEC_ASK": "1",
+        "HERMES_GATEWAY_SESSION": "legacy",
+        "HERMES_SESSION_KEY": "parent-session",
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_USER_ID": "123",
+        "HERMES_KANBAN_TERMINAL_PERMIT_FD": "999",
+        "HERMES_KANBAN_TERMINAL_PERMIT_STALE": "1",
+    }
+    for key, value in inherited.items():
+        monkeypatch.setenv(key, value)
+
+    captured, _profile, _workspace = _capture_default_spawn(monkeypatch, tmp_path)
+
+    child_env = captured["env"]
+    for key in inherited:
+        assert key not in child_env
+    assert child_env["HERMES_KANBAN_HEADLESS_NO_RESPONDER"] == "1"
+
+
+def test_default_spawn_preserves_gateway_lifecycle_and_child_kanban_context(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "parent")
+
+    captured, profile, workspace = _capture_default_spawn(monkeypatch, tmp_path)
+
+    child_env = captured["env"]
+    assert child_env["_HERMES_GATEWAY"] == "1"
+    assert child_env["HERMES_KANBAN_TASK"] == "t_spawn_tools"
+    assert child_env["HERMES_KANBAN_RUN_ID"] == "7"
+    assert child_env["HERMES_PROFILE"] == "elias"
+    assert Path(child_env["HERMES_HOME"]).resolve() == profile
+    assert Path(child_env["HERMES_KANBAN_WORKSPACE"]).resolve() == workspace
+    assert "HERMES_SESSION_PROFILE" not in child_env

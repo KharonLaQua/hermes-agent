@@ -8750,6 +8750,25 @@ def _default_spawn(
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
 
+    # Quiet workers have stdin=DEVNULL and no approval responder.  Do not copy
+    # the dispatching gateway's interactive/session identity into that child:
+    # approval.py would otherwise queue a request nobody can answer.  Remove
+    # stale permit bridge values before adding a fresh, issuer-owned channel
+    # below.  `_HERMES_GATEWAY` is intentionally preserved; terminal_tool uses
+    # it for the independent gateway lifecycle hard block.
+    for key in tuple(env):
+        if key in {
+            "HERMES_INTERACTIVE",
+            "HERMES_EXEC_ASK",
+            "HERMES_GATEWAY_SESSION",
+        } or key.startswith("HERMES_SESSION_") or key.startswith(
+            "HERMES_KANBAN_TERMINAL_PERMIT_"
+        ):
+            env.pop(key, None)
+    # This denial-only marker is frozen and removed by tools.approval at import.
+    # It can make a warning fail closed; it is never an authorization signal.
+    env["HERMES_KANBAN_HEADLESS_NO_RESPONDER"] = "1"
+
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
     # config.  Without this, `env = dict(os.environ)` copies only the parent's
