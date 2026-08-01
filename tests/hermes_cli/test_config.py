@@ -119,6 +119,14 @@ class TestLoadConfigDefaults:
             assert config["terminal"]["backend"] == "local"
             assert config["display"]["interim_assistant_messages"] is True
 
+    def test_scoped_terminal_permits_default_disabled(self):
+        scoped = DEFAULT_CONFIG["kanban"]["scoped_terminal_permits"]
+        assert scoped == {
+            "enabled": False,
+            "issuer_profiles": [],
+            "max_ttl_seconds": 300,
+        }
+
     def test_legacy_root_level_max_turns_migrates_to_agent_config(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             config_path = tmp_path / "config.yaml"

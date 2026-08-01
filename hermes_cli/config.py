@@ -2913,6 +2913,14 @@ DEFAULT_CONFIG = {
         # Global shared-harness task-create authority boundary. Default OFF;
         # lane profiles cannot override this cross-fleet policy.
         "authority_enforcement": {"enabled": False},
+        # Exact, one-operation permits issued only by the embedded gateway that
+        # holds the dispatcher singleton lock.  No profile is trusted by
+        # default, and the standalone daemon has no issuer path.
+        "scoped_terminal_permits": {
+            "enabled": False,
+            "issuer_profiles": [],
+            "max_ttl_seconds": 300,
+        },
         # Durable-progress guard. Default OFF and eligible for no profiles;
         # rollout requires both explicit enablement and an allowlisted profile.
         # Heartbeats remain liveness-only. Market/trading and Don-only work are
