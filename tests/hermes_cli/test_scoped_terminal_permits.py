@@ -592,6 +592,185 @@ def test_close_erases_authority_and_rejects_future_actions(permit_factory, tmp_p
     assert exc.value.failure_class == "issuer_unavailable"
 
 
+@pytest.mark.parametrize(
+    ("activation", "failure_class"),
+    [
+        ({"profile": "other"}, "profile_mismatch"),
+        ({"profile_home": "other-profile"}, "profile_home_mismatch"),
+        ({"workspace": "other-workspace"}, "workspace_mismatch"),
+    ],
+)
+def test_activation_identity_mismatch_cancels_pending_arm(
+    permit_factory, tmp_path, activation, failure_class
+):
+    _, issuer, _, events, _ = permit_factory
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id="t_activation_mismatch",
+        contract=_contract(tmp_path),
+        ttl_seconds=60,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest=_HEX_A,
+    )
+    args = {
+        "board_slug": "default",
+        "task_id": "t_activation_mismatch",
+        "run_id": 19,
+        "profile": "bookkeeper",
+        "profile_home": str(tmp_path / "profile"),
+        "workspace": str(tmp_path / "workspace"),
+    }
+    args.update(
+        {
+            key: value if key == "profile" else str(tmp_path / value)
+            for key, value in activation.items()
+        }
+    )
+
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        issuer.activate_for_spawn(**args)
+
+    assert exc.value.failure_class == failure_class
+    assert issuer._permits == {}
+    assert events[-1][0] == "terminal_permit_cancelled"
+    assert events[-1][1]["failure_class"] == failure_class
+    with pytest.raises(ScopedTerminalPermitError) as missing:
+        issuer.activate_for_spawn(**args)
+    assert missing.value.failure_class == "missing"
+
+
+def test_pending_arm_expiry_cancels_and_requires_fresh_arm(permit_factory, tmp_path):
+    _, issuer, now, events, _ = permit_factory
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id="t_expiring_arm",
+        contract=_contract(tmp_path),
+        ttl_seconds=5,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest=_HEX_A,
+    )
+    now[0] += 6
+    activation = {
+        "board_slug": "default",
+        "task_id": "t_expiring_arm",
+        "run_id": 19,
+        "profile": "bookkeeper",
+        "profile_home": str(tmp_path / "profile"),
+        "workspace": str(tmp_path / "workspace"),
+    }
+
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        issuer.activate_for_spawn(**activation)
+
+    assert exc.value.failure_class == "expired"
+    assert issuer._permits == {}
+    assert events[-1][0] == "terminal_permit_cancelled"
+    assert events[-1][1]["failure_class"] == "expired"
+    with pytest.raises(ScopedTerminalPermitError) as missing:
+        issuer.activate_for_spawn(**activation)
+    assert missing.value.failure_class == "missing"
+
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id="t_expiring_arm",
+        contract=_contract(tmp_path),
+        ttl_seconds=5,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest=_HEX_A,
+    )
+    fresh = issuer.activate_for_spawn(**activation)
+    assert issuer.permit_status(fresh.permit_id) == "issued"
+
+
+def test_activation_audit_failure_rejects_permit_and_requires_fresh_arm(
+    permit_factory, tmp_path, monkeypatch
+):
+    _, issuer, _, _, _ = permit_factory
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id="t_activation_audit",
+        contract=_contract(tmp_path),
+        ttl_seconds=60,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest=_HEX_A,
+    )
+    original_audit_writer = issuer._audit_writer
+
+    def fail_activation(kind, payload):
+        if kind == "terminal_permit_activated":
+            raise OSError("activation audit unavailable")
+        original_audit_writer(kind, payload)
+
+    monkeypatch.setattr(issuer, "_audit_writer", fail_activation)
+    activation = {
+        "board_slug": "default",
+        "task_id": "t_activation_audit",
+        "run_id": 19,
+        "profile": "bookkeeper",
+        "profile_home": str(tmp_path / "profile"),
+        "workspace": str(tmp_path / "workspace"),
+    }
+
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        issuer.activate_for_spawn(**activation)
+
+    assert exc.value.failure_class == "audit_failed"
+    permit_id, = issuer._permits
+    assert issuer.permit_status(permit_id) == "rejected"
+    with pytest.raises(ScopedTerminalPermitError) as missing:
+        issuer.activate_for_spawn(**activation)
+    assert missing.value.failure_class == "missing"
+
+    monkeypatch.setattr(issuer, "_audit_writer", original_audit_writer)
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id="t_activation_audit",
+        contract=_contract(tmp_path),
+        ttl_seconds=60,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest=_HEX_A,
+    )
+    fresh = issuer.activate_for_spawn(**activation)
+    assert fresh.permit_id != permit_id
+    assert issuer.permit_status(fresh.permit_id) == "issued"
+
+
+def test_spawn_channel_creation_failure_cancels_issued_permit(
+    permit_factory, tmp_path, monkeypatch
+):
+    _, issuer, _, _, _ = permit_factory
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id="t_spawn_channel_failure",
+        contract=_contract(tmp_path),
+        ttl_seconds=60,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest=_HEX_A,
+    )
+
+    def fail_socketpair():
+        raise OSError("socketpair unavailable")
+
+    monkeypatch.setattr(permits.socket, "socketpair", fail_socketpair)
+    activation = {
+        "board_slug": "default",
+        "task_id": "t_spawn_channel_failure",
+        "run_id": 19,
+        "profile": "bookkeeper",
+        "profile_home": str(tmp_path / "profile"),
+        "workspace": str(tmp_path / "workspace"),
+    }
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        issuer.activate_spawn_channel(**activation)
+
+    assert exc.value.failure_class == "channel_failed"
+    permit_id, = issuer._permits
+    assert issuer.permit_status(permit_id) == "cancelled"
+    with pytest.raises(ScopedTerminalPermitError) as missing:
+        issuer.activate_spawn_channel(**activation)
+    assert missing.value.failure_class == "missing"
+
+
 def test_spawn_channel_is_one_fd_and_cancellation_spends_fresh_arm(
     permit_factory, tmp_path
 ):
@@ -622,3 +801,33 @@ def test_spawn_channel_is_one_fd_and_cancellation_spends_fresh_arm(
     assert issuer.permit_status(permit_id) == "cancelled"
     assert channel.child_endpoint.fileno() == -1
     assert channel.parent_endpoint.fileno() == -1
+
+    with pytest.raises(ScopedTerminalPermitError) as missing:
+        issuer.activate_spawn_channel(
+            board_slug="default",
+            task_id="t_spawn",
+            run_id=20,
+            profile="bookkeeper",
+            profile_home=str(tmp_path / "profile"),
+            workspace=str(tmp_path / "workspace"),
+        )
+    assert missing.value.failure_class == "missing"
+
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id="t_spawn",
+        contract=_contract(tmp_path),
+        ttl_seconds=60,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest=_HEX_A,
+    )
+    fresh_channel = issuer.activate_spawn_channel(
+        board_slug="default",
+        task_id="t_spawn",
+        run_id=20,
+        profile="bookkeeper",
+        profile_home=str(tmp_path / "profile"),
+        workspace=str(tmp_path / "workspace"),
+    )
+    assert fresh_channel.permit.permit_id != permit_id
+    issuer.cancel_spawn_channel(fresh_channel)
