@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import socket
 from pathlib import Path
 
 
@@ -271,3 +272,124 @@ def test_default_spawn_preserves_gateway_lifecycle_and_child_kanban_context(
     assert Path(child_env["HERMES_HOME"]).resolve() == profile
     assert Path(child_env["HERMES_KANBAN_WORKSPACE"]).resolve() == workspace
     assert "HERMES_SESSION_PROFILE" not in child_env
+
+
+def _permit_spawn_fixture(monkeypatch, tmp_path, *, popen):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import scoped_terminal_permits as permits
+
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(subprocess, "Popen", popen)
+
+    class Channel:
+        def __init__(self):
+            self.parent, self.child = socket.socketpair()
+            self.permit = type("Permit", (), {"permit_id": "permit-spawn"})()
+            self.sent = False
+            self.released = False
+
+        @property
+        def child_fd(self):
+            return self.child.fileno()
+
+        @property
+        def env_bridge(self):
+            return {permits.PERMIT_FD_ENV: str(self.child_fd)}
+
+        def send_envelope(self):
+            self.sent = True
+
+        def release_child_endpoint(self):
+            self.released = True
+            self.child.close()
+
+        def close(self):
+            self.released = True
+            self.child.close()
+            self.parent.close()
+
+    class Issuer:
+        closed = False
+
+        def __init__(self):
+            self.channel = Channel()
+            self.cancelled = False
+            self.activated = None
+
+        def activate_spawn_channel(self, **kwargs):
+            self.activated = kwargs
+            return self.channel
+
+        def cancel_spawn_channel(self, channel):
+            self.cancelled = True
+            channel.close()
+
+        def release_spawn_child(self, channel):
+            channel.release_child_endpoint()
+
+    issuer = Issuer()
+    monkeypatch.setattr(permits, "get_active_issuer", lambda: issuer)
+    return kb, issuer, profile.resolve(), workspace.resolve()
+
+
+def test_default_spawn_passes_exact_permit_channel_only_for_armed_next_run(
+    monkeypatch, tmp_path
+):
+    captured = {}
+
+    class FakeProc:
+        pid = 4246
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured.update(kwargs)
+        return FakeProc()
+
+    kb, issuer, profile, workspace = _permit_spawn_fixture(
+        monkeypatch, tmp_path, popen=fake_popen
+    )
+    fd = issuer.channel.child_fd
+    pid = kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace), board="default")
+
+    assert pid == 4246
+    assert captured["pass_fds"] == (fd,)
+    assert captured["env"]["HERMES_KANBAN_TERMINAL_PERMIT_FD"] == str(
+        fd
+    )
+    assert issuer.channel.sent is True
+    assert issuer.channel.released is True
+    assert issuer.activated == {
+        "board_slug": "default",
+        "task_id": "t_spawn_tools",
+        "run_id": 7,
+        "profile": "elias",
+        "profile_home": str(profile),
+        "workspace": str(workspace),
+    }
+    assert all("payload" not in key and "signature" not in key for key in captured["env"])
+
+
+def test_default_spawn_cancels_permit_when_popen_fails(monkeypatch, tmp_path):
+    def failing_popen(*args, **kwargs):
+        raise OSError("popen failed")
+
+    kb, issuer, _profile, workspace = _permit_spawn_fixture(
+        monkeypatch, tmp_path, popen=failing_popen
+    )
+
+    try:
+        kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace), board="default")
+    except OSError as exc:
+        assert str(exc) == "popen failed"
+    else:  # pragma: no cover - assertion keeps the design node explicit
+        raise AssertionError("Popen failure must propagate")
+
+    assert issuer.cancelled is True
+    assert issuer.channel.released is True

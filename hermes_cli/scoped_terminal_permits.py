@@ -12,6 +12,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import threading
 import time
 from dataclasses import dataclass
@@ -121,6 +122,58 @@ class SignedPermit:
     permit_id: str
     payload: bytes
     signature: bytes
+
+
+PERMIT_FD_ENV = "HERMES_KANBAN_TERMINAL_PERMIT_FD"
+
+
+@dataclass
+class SpawnPermitChannel:
+    """The one-shot capability channel handed to a spawned worker.
+
+    The parent endpoint remains owned by the issuer.  Only ``child_endpoint``
+    is placed in ``pass_fds``; the descriptor number is merely an env bridge
+    and carries no authorization by itself.
+    """
+
+    permit: SignedPermit
+    parent_endpoint: socket.socket
+    child_endpoint: socket.socket
+    _child_released: bool = False
+
+    @property
+    def child_fd(self) -> int:
+        return self.child_endpoint.fileno()
+
+    @property
+    def env_bridge(self) -> dict[str, str]:
+        return {PERMIT_FD_ENV: str(self.child_fd)}
+
+    def send_envelope(self) -> None:
+        """Send the signed envelope without exposing it in env or storage."""
+        body = _canonical_bytes(
+            {
+                "payload": self.permit.payload.decode("utf-8"),
+                "signature": self.permit.signature.hex(),
+            }
+        )
+        self.parent_endpoint.sendall(len(body).to_bytes(4, "big") + body)
+
+    def release_child_endpoint(self) -> None:
+        if self._child_released:
+            return
+        self._child_released = True
+        try:
+            self.child_endpoint.close()
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        self.release_child_endpoint()
+        try:
+            self.parent_endpoint.close()
+        except OSError:
+            pass
 
 
 @dataclass(frozen=True)
@@ -557,6 +610,7 @@ class ScopedTerminalPermitIssuer:
         self._pending: dict[tuple[str, str], _PendingArm] = {}
         self._permits: dict[str, _PermitRecord] = {}
         self._nonces: set[str] = set()
+        self._spawn_channels: dict[str, SpawnPermitChannel] = {}
 
     @property
     def closed(self) -> bool:
@@ -721,6 +775,74 @@ class ScopedTerminalPermitIssuer:
                 record.status = "rejected"
                 raise ScopedTerminalPermitError("audit_failed") from None
             return envelope
+
+    def activate_spawn_channel(
+        self,
+        *,
+        board_slug: str,
+        task_id: str,
+        run_id: int,
+        profile: str,
+        profile_home: str,
+        workspace: str,
+    ) -> SpawnPermitChannel:
+        """Activate one exact arm and create its POSIX capability channel."""
+        envelope = self.activate_for_spawn(
+            board_slug=board_slug,
+            task_id=task_id,
+            run_id=run_id,
+            profile=profile,
+            profile_home=profile_home,
+            workspace=workspace,
+        )
+        parent_endpoint = child_endpoint = None
+        try:
+            parent_endpoint, child_endpoint = socket.socketpair()
+            parent_endpoint.set_inheritable(False)
+            child_endpoint.set_inheritable(False)
+            channel = SpawnPermitChannel(envelope, parent_endpoint, child_endpoint)
+            with self._lock:
+                self._spawn_channels[envelope.permit_id] = channel
+            return channel
+        except Exception:
+            for endpoint in (parent_endpoint, child_endpoint):
+                if endpoint is not None:
+                    try:
+                        endpoint.close()
+                    except OSError:
+                        pass
+            with self._lock:
+                record = self._permits.get(envelope.permit_id)
+                if record is not None:
+                    record.status = "cancelled"
+            raise ScopedTerminalPermitError("channel_failed") from None
+
+    def cancel_spawn_channel(self, channel: SpawnPermitChannel) -> None:
+        """Spend an activated spawn permit and close both channel endpoints."""
+        with self._lock:
+            record = self._permits.get(channel.permit.permit_id)
+            if record is not None and record.status == "issued":
+                record.status = "cancelled"
+                try:
+                    payload = _parse_canonical(record.envelope.payload)
+                    self._write_audit(
+                        "terminal_permit_cancelled",
+                        self._audit_for_record(
+                            record,
+                            payload,
+                            "cancel",
+                            "spawn_failed",
+                            int(self._clock()),
+                        ),
+                    )
+                except Exception:
+                    pass
+            self._spawn_channels.pop(channel.permit.permit_id, None)
+            channel.close()
+
+    def release_spawn_child(self, channel: SpawnPermitChannel) -> None:
+        """Close the gateway's duplicate of the inherited child endpoint."""
+        channel.release_child_endpoint()
 
     def consume(
         self,
@@ -942,6 +1064,9 @@ class ScopedTerminalPermitIssuer:
             for record in self._permits.values():
                 if record.status == "issued":
                     record.status = "rejected"
+            for channel in self._spawn_channels.values():
+                channel.close()
+            self._spawn_channels.clear()
             self._nonces.clear()
             self._signing_key = None
             self._public_key = None

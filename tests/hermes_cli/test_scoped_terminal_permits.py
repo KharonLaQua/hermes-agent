@@ -590,3 +590,35 @@ def test_close_erases_authority_and_rejects_future_actions(permit_factory, tmp_p
             evidence_artifact_digest=_HEX_A,
         )
     assert exc.value.failure_class == "issuer_unavailable"
+
+
+def test_spawn_channel_is_one_fd_and_cancellation_spends_fresh_arm(
+    permit_factory, tmp_path
+):
+    _, issuer, _, _, _ = permit_factory
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id="t_spawn",
+        contract=_contract(tmp_path),
+        ttl_seconds=60,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest=_HEX_A,
+    )
+    channel = issuer.activate_spawn_channel(
+        board_slug="default",
+        task_id="t_spawn",
+        run_id=19,
+        profile="bookkeeper",
+        profile_home=str(tmp_path / "profile"),
+        workspace=str(tmp_path / "workspace"),
+    )
+    permit_id = channel.permit.permit_id
+    assert set(channel.env_bridge) == {permits.PERMIT_FD_ENV}
+    assert channel.child_fd >= 0
+    assert channel.parent_endpoint.fileno() >= 0
+
+    issuer.cancel_spawn_channel(channel)
+
+    assert issuer.permit_status(permit_id) == "cancelled"
+    assert channel.child_endpoint.fileno() == -1
+    assert channel.parent_endpoint.fileno() == -1

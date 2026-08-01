@@ -9315,23 +9315,82 @@ def _default_spawn(
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
+    spawn_channel = None
+    spawn_issuer = None
+    if not _IS_WINDOWS and task.current_run_id is not None:
+        try:
+            from hermes_cli.scoped_terminal_permits import (
+                ScopedTerminalPermitError,
+                get_active_issuer,
+            )
+
+            spawn_issuer = get_active_issuer()
+            if spawn_issuer is not None and not spawn_issuer.closed:
+                profile_home = os.path.realpath(env.get("HERMES_HOME", ""))
+                workspace_real = os.path.realpath(workspace)
+                if profile_home and os.path.isdir(profile_home) and os.path.isdir(workspace_real):
+                    try:
+                        spawn_channel = spawn_issuer.activate_spawn_channel(
+                            board_slug=resolved_board,
+                            task_id=task.id,
+                            run_id=int(task.current_run_id),
+                            profile=profile_arg,
+                            profile_home=profile_home,
+                            workspace=workspace_real,
+                        )
+                        env.update(spawn_channel.env_bridge)
+                    except ScopedTerminalPermitError as exc:
+                        # An unarmed issuer is the ordinary default path.  A
+                        # malformed/stale arm is not: activation already
+                        # consumed the arm and must fail closed.
+                        if exc.failure_class != "missing":
+                            raise RuntimeError(
+                                "scoped terminal permit activation failed"
+                            ) from None
+        except ImportError:
+            # Older/non-feature builds retain ordinary spawn behavior.
+            spawn_issuer = None
+        except Exception:
+            if spawn_channel is not None:
+                spawn_issuer.cancel_spawn_channel(spawn_channel)
+            log_f.close()
+            raise
     try:
+        popen_kwargs = {
+            "cwd": workspace if os.path.isdir(workspace) else None,
+            "stdin": subprocess.DEVNULL,
+            "stdout": log_f,
+            "stderr": subprocess.STDOUT,
+            "env": env,
+            "start_new_session": True,
+            "creationflags": subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+        }
+        if spawn_channel is not None:
+            popen_kwargs["pass_fds"] = (spawn_channel.child_fd,)
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            env=env,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            **popen_kwargs,
         )
-    except FileNotFoundError:
+        if spawn_channel is not None:
+            try:
+                spawn_channel.send_envelope()
+            except Exception:
+                spawn_issuer.cancel_spawn_channel(spawn_channel)
+                raise RuntimeError("scoped terminal permit channel failed") from None
+            finally:
+                # The gateway must retain only the parent broker endpoint; the
+                # child endpoint belongs to the worker via pass_fds.
+                spawn_issuer.release_spawn_child(spawn_channel)
+    except Exception as exc:
+        if spawn_channel is not None:
+            spawn_issuer.cancel_spawn_channel(spawn_channel)
         log_f.close()
-        raise RuntimeError(
-            "`hermes` executable not found on PATH. "
-            "Install Hermes Agent or activate its venv before running the kanban dispatcher."
-        )
+        if isinstance(exc, FileNotFoundError):
+            raise RuntimeError(
+                "`hermes` executable not found on PATH. "
+                "Install Hermes Agent or activate its venv before running the kanban dispatcher."
+            ) from None
+        raise
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's
