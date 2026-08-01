@@ -180,3 +180,40 @@ def test_attention_cli_is_read_only_and_returns_metadata_only_rows(
     ]
     assert "private task body must not leave the database" not in output
     assert db_path.read_bytes() == before
+
+
+def test_attention_summary_uses_hq_bounded_active_inventory_before_projection(
+    kanban_home: Path,
+) -> None:
+    """Only the first HQ source-inventory page can contribute attention rows."""
+    with kb.connect_closing() as conn:
+        for index in range(299):
+            kb.create_task(conn, title=f"active-{index}", assignee="worker", priority=10)
+
+        included = kb.create_task(conn, title="included attention", assignee="worker", priority=5)
+        assert kb.claim_task(conn, included, claimer="worker") is not None
+        assert kb.block_task(
+            conn,
+            included,
+            kind="needs_input",
+            reason="DON-ONLY: approve public send",
+        )
+
+        excluded = kb.create_task(conn, title="excluded attention", assignee="worker", priority=0)
+        assert kb.claim_task(conn, excluded, claimer="worker") is not None
+        assert kb.block_task(
+            conn,
+            excluded,
+            kind="needs_input",
+            reason="DON-ONLY: approve public send",
+        )
+
+        done = kb.create_task(conn, title="high priority done", assignee="worker", priority=100)
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (done,))
+
+    payload = attention_summary(board="default")
+
+    assert payload["counts"] == {"blocked": 1, "waiting": 0}
+    assert [row["id"] for row in payload["blocked"]] == [included]
+    assert excluded not in {row["id"] for row in payload["blocked"]}
+    assert all(set(row) == {"id", "title", "status", "assignee"} for row in payload["blocked"])

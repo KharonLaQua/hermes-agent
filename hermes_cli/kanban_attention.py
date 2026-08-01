@@ -41,8 +41,12 @@ _ATTENTION_QUERY = """
               AND p.status NOT IN ('done', 'archived', 'failed', 'cancelled')
         ) AS open_parents
     FROM tasks t
-    WHERE t.status != 'archived'
-    ORDER BY t.priority DESC, t.created_at DESC
+    WHERE t.status != 'archived' OR t.status = 'done'
+    ORDER BY
+        CASE WHEN t.status IN ('done', 'cancelled') THEN 1 ELSE 0 END ASC,
+        t.priority DESC,
+        t.created_at DESC
+    LIMIT 300
 """
 
 _DON_ONLY_PREFIX = re.compile(r"^\s*DON[-_ ]ONLY\b", re.IGNORECASE)
