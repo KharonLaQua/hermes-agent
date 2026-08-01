@@ -4497,6 +4497,7 @@ def test_progress_guard_hard_exemptions_emit_no_events(kanban_home):
         ("DON-ONLY: connect the device", "", "worker"),
         ("GATE: acceptance decision", "", "worker"),
         ("MARKET: execution", "trading route safety", "worker"),
+        ("LONG-RUN: encode the archive", "", "worker"),
         ("ordinary", "", "sniper"),
     ]
     with kb.connect() as conn:
@@ -4517,13 +4518,18 @@ def test_progress_guard_hard_exemptions_emit_no_events(kanban_home):
                 "AND kind LIKE 'progress_guard_%'",
                 (run_id,),
             ).fetchone()[0] == 0
+            metadata = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+            ).fetchone()["metadata"]
+            assert metadata is None
 
 
 def test_progress_guard_incidental_body_prose_does_not_exempt(kanban_home):
     body = (
         "## Review:\n"
         "Do not touch market, trading, broker, or position routes.\n"
-        "Ask Consigliere if a decision is required."
+        "Ask Consigliere if a decision is required.\n"
+        "Discuss LONG-RUN: and progress-guard-exempt: legitimate_long_run in prose."
     )
     with kb.connect() as conn:
         task_id, run_id = _create_progress_guard_task(conn, body=body)
@@ -4544,6 +4550,23 @@ def test_progress_guard_explicit_body_marker_exempts(kanban_home):
     with kb.connect() as conn:
         task_id, run_id = _create_progress_guard_task(
             conn, body="progress-guard-exempt: acceptance_gate",
+        )
+        _write_progress_guard_log(task_id, "  ┊ 🔎 grep progress 0.2s")
+        kb.detect_stale_running(
+            conn,
+            stale_timeout_seconds=0,
+            progress_guard_config=_progress_guard_config(),
+        )
+        metadata = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+        ).fetchone()["metadata"]
+        assert metadata is None
+
+
+def test_progress_guard_legitimate_long_run_body_marker_exempts(kanban_home):
+    with kb.connect() as conn:
+        task_id, run_id = _create_progress_guard_task(
+            conn, body="progress-guard-exempt: legitimate_long_run",
         )
         _write_progress_guard_log(task_id, "  ┊ 🔎 grep progress 0.2s")
         kb.detect_stale_running(

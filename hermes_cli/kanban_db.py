@@ -7138,6 +7138,8 @@ def _progress_guard_exempt_reason(row: sqlite3.Row, config: dict) -> Optional[st
         for line in body_lines
         if line.startswith("progress-guard-exempt:")
     }
+    if title.startswith("long-run:") or "legitimate_long_run" in explicit_markers:
+        return "legitimate_long_run"
     if title.startswith(("don-only:", "don only:")) or any(
         line.startswith(("don-only:", "don only:")) for line in body_lines
     ) or "don_only" in explicit_markers:

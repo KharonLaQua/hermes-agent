@@ -14,18 +14,8 @@ from typing import Any
 _ALLOWED_DECISIONS = {"disabled", "exempt", "continue", "warn", "reseat"}
 _DURATION_RE = re.compile(r"\b\d+(?:\.\d+)?s\b", re.IGNORECASE)
 _WHITESPACE_RE = re.compile(r"\s+")
-_FAILURE_RE = re.compile(
-    r"(?:^|\s)(?:failed|failure|error|exception|traceback|assertionerror|typeerror|"
-    r"valueerror|runtimeerror)(?:\s|:|-|$)",
-    re.IGNORECASE,
-)
-_TEST_BUILD_SUCCESS_RE = re.compile(
-    r"(?:\b\d+\s+passed\b|\btests?\s+passed\b|\bbuild\s+succeeded\b|"
-    r"\bsuccessfully\s+built\b|\bcompleted\s+successfully\b|"
-    r"\bexit(?:ed)?\s+(?:code\s+)?0\b)",
-    re.IGNORECASE,
-)
 _TOOL_RECORD_PREFIX = r"^\s*┊\s*"
+_TOOL_FAILURE_SUFFIX_RE = re.compile(r"\s+\[[^\r\n]+\]\s*$")
 _WRITE_TOOL_RE = re.compile(
     _TOOL_RECORD_PREFIX
     + r"(?:✍️?\s*|🩹\s*)?(?:write_file|write|patch|kanban_attach)\b",
@@ -37,10 +27,14 @@ _NONPROGRESS_TOOL_RE = re.compile(
     r"browser_snapshot|browser_vision|kanban_he(?:artbeat)?)\b",
     re.IGNORECASE,
 )
-_TERMINAL_TOOL_RE = re.compile(
-    _TOOL_RECORD_PREFIX + r"(?:💻\s*)?(?:\$|terminal\b)",
+_TERMINAL_COMPLETION_RE = re.compile(
+    _TOOL_RECORD_PREFIX
+    + r"(?:💻\s*)?(?:\$|terminal\b)\s*(?P<command>.*?)\s+"
+    + r"(?P<duration>\d+(?:\.\d+)?s)"
+    + r"(?:\s+(?P<failure_marker>\[[^\r\n]+\]))?\s*$",
     re.IGNORECASE,
 )
+_EXIT_MARKER_RE = re.compile(r"^\[exit\s+(-?\d+)\]$", re.IGNORECASE)
 _COMPACTION_RE = re.compile(
     r"(?:pre-api compression|context compaction|compress(?:ing|ed)? context)",
     re.IGNORECASE,
@@ -76,6 +70,18 @@ def _signature(category: str, line: str) -> str:
     return digest[:20]
 
 
+def _terminal_marker_failed(marker: str | None) -> bool:
+    """Interpret the completion suffix emitted by ``agent.display``."""
+    if not marker:
+        return False
+    exit_marker = _EXIT_MARKER_RE.fullmatch(marker)
+    if exit_marker:
+        return int(exit_marker.group(1)) != 0
+    # The terminal renderer appends any other bracketed suffix only when its
+    # structured result reports a failure (for example a timeout/error text).
+    return True
+
+
 def analyze_worker_log(text: str) -> dict[str, Any]:
     """Classify a transport-neutral per-task worker log.
 
@@ -89,8 +95,6 @@ def analyze_worker_log(text: str) -> dict[str, Any]:
     repeated_durable = 0
     compactions = 0
     gui_controls = 0
-    long_operation_started_at: int | None = None
-    structured_terminal_seen = False
     nonprogress_indexes: list[int] = []
 
     for index, raw_line in enumerate((text or "").splitlines()):
@@ -102,10 +106,23 @@ def analyze_worker_log(text: str) -> dict[str, Any]:
         is_gui = bool(_GUI_RE.search(line))
         is_heartbeat = bool(_HEARTBEAT_RE.search(line))
         is_nonprogress_tool = bool(_NONPROGRESS_TOOL_RE.search(line))
-        is_terminal_tool = bool(_TERMINAL_TOOL_RE.search(raw_line))
-        is_success = structured_terminal_seen and bool(_TEST_BUILD_SUCCESS_RE.search(line))
-        is_failure = structured_terminal_seen and bool(_FAILURE_RE.search(line))
-        is_write = bool(_WRITE_TOOL_RE.search(raw_line)) and not is_failure
+        terminal_completion = _TERMINAL_COMPLETION_RE.fullmatch(raw_line)
+        terminal_command = (
+            terminal_completion.group("command") if terminal_completion else ""
+        )
+        is_completed_long_operation = bool(
+            terminal_completion and _LONG_OPERATION_RE.search(terminal_command)
+        )
+        failure_marker = (
+            terminal_completion.group("failure_marker")
+            if terminal_completion else None
+        )
+        is_terminal_failure = bool(
+            terminal_completion and _terminal_marker_failed(failure_marker)
+        )
+        is_write = bool(_WRITE_TOOL_RE.search(raw_line)) and not bool(
+            _TOOL_FAILURE_SUFFIX_RE.search(raw_line)
+        )
 
         if is_compaction:
             compactions += 1
@@ -115,16 +132,14 @@ def analyze_worker_log(text: str) -> dict[str, Any]:
         durable_item: tuple[str, str] | None = None
         if is_write:
             durable_item = ("artifact_write", _signature("artifact_write", line))
-        elif is_success:
+        elif is_completed_long_operation and not is_terminal_failure:
             durable_item = (
                 "test_build_success",
                 _signature("test_build_success", line),
             )
-            long_operation_started_at = None
-        elif is_failure:
+        elif is_terminal_failure:
             fingerprint = _signature("failure_fingerprint", line)
             durable_item = ("changed_failure", fingerprint)
-            long_operation_started_at = None
 
         if durable_item is not None:
             category, fingerprint = durable_item
@@ -136,19 +151,6 @@ def analyze_worker_log(text: str) -> dict[str, Any]:
                 # must not manufacture a newer durable-progress observation.
                 repeated_durable += 1
                 nonprogress_indexes.append(index)
-
-        # A command/tool record that names a recognized bounded long operation
-        # is explicit enough; a generic terminal or heartbeat is not.
-        if (
-            is_terminal_tool
-            and _LONG_OPERATION_RE.search(line)
-            and not is_success
-            and not is_failure
-        ):
-            long_operation_started_at = index
-
-        if is_terminal_tool:
-            structured_terminal_seen = True
 
         if is_nonprogress_tool or is_compaction or is_gui:
             normalized = _normalized(line)
@@ -177,7 +179,10 @@ def analyze_worker_log(text: str) -> dict[str, Any]:
         "gui_control_count": gui_controls,
         "evidence_produced": bool(durable),
         "post_evidence_nonprogress_count": post_evidence_nonprogress,
-        "long_operation_active": long_operation_started_at is not None,
+        # Current worker logs expose command details only in completion records;
+        # their generic "preparing terminal" line cannot identify a long task.
+        # Unobservable long runs therefore require a typed card exemption.
+        "long_operation_active": False,
     }
 
 
@@ -195,7 +200,8 @@ def decide_progress_action(
 
     The first interval is baseline-only, the second emits at most one warning,
     and a later interval may reseat only after that warning. Typed exemptions
-    and a recognized long operation with fresh liveness always win.
+    and an explicit in-flight long-operation signal with fresh liveness always
+    win. Completed terminal records never set that signal.
     """
     if not enabled:
         decision = "disabled"

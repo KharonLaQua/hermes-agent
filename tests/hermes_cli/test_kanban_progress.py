@@ -78,30 +78,50 @@ def test_progress_guard_ignores_prose_and_source_diff_tool_mentions():
     assert signals["long_operation_active"] is False
 
 
-def test_progress_guard_successful_scoped_test_and_build_are_progress():
+def test_progress_guard_completed_structured_test_and_build_records_are_progress():
     signals = analyze_worker_log(
-        "  ┊ 💻 $ pytest -q tests/unit/test_x.py\n12 passed in 1.01s\n"
-        "  ┊ 💻 $ python -m build\nSuccessfully built hermes_agent.whl"
+        "  ┊ 💻 $         python -m pytest -q tests/unit/test_x.py  1.2s\n"
+        "  ┊ 💻 $         python -m build  5.4s"
     )
-    assert signals["durable_progress_count"] >= 2
+    assert signals["durable_progress_count"] == 2
     assert signals["durable_progress_category"] == "test_build_success"
+    assert signals["long_operation_active"] is False
+
+
+def test_progress_guard_unrelated_terminal_does_not_bind_later_result_prose():
+    signals = analyze_worker_log(
+        "  ┊ 💻 $         git status --short  0.1s\n"
+        "The report later says 12 passed in 1.01s.\n"
+        "It also quotes FAILED test_x.py::test_a - AssertionError."
+    )
+    assert signals["durable_progress_count"] == 0
     assert signals["long_operation_active"] is False
 
 
 def test_progress_guard_changed_failure_fingerprint_progresses_once_per_change():
     repeated = analyze_worker_log(
-        "  ┊ 💻 $ pytest -q test_x.py\n"
-        "FAILED test_x.py::test_a - AssertionError: expected 1 got 2\n"
-        "FAILED test_x.py::test_a - AssertionError: expected 1 got 2"
+        "  ┊ 💻 $         pytest -q test_x.py::test_a  1.2s [exit 1]\n"
+        "  ┊ 💻 $         pytest -q test_x.py::test_a  1.3s [exit 1]"
     )
     changed = analyze_worker_log(
-        "  ┊ 💻 $ pytest -q test_x.py\n"
-        "FAILED test_x.py::test_a - AssertionError: expected 1 got 2\n"
-        "FAILED test_x.py::test_a - TypeError: invalid operand"
+        "  ┊ 💻 $         pytest -q test_x.py::test_a  1.2s [exit 1]\n"
+        "  ┊ 💻 $         pytest -q test_x.py::test_b  1.3s [exit 1]"
     )
     assert repeated["durable_progress_count"] == 1
+    assert repeated["durable_progress_category"] == "changed_failure"
+    assert repeated["long_operation_active"] is False
     assert changed["durable_progress_count"] == 2
     assert changed["durable_progress_signature"] != repeated["durable_progress_signature"]
+
+
+def test_progress_guard_structured_terminal_failure_markers_are_progress():
+    for marker in ("[exit 1]", "[command timed out]"):
+        signals = analyze_worker_log(
+            f"  ┊ 💻 $         python verify_progress_guard.py  5.5s {marker}"
+        )
+        assert signals["durable_progress_count"] == 1
+        assert signals["durable_progress_category"] == "changed_failure"
+        assert signals["long_operation_active"] is False
 
 
 def test_progress_guard_repeated_read_search_only_corroborates():
@@ -138,13 +158,13 @@ def test_progress_guard_post_evidence_verification_churn_is_bounded():
     assert _decide(signals, intervals=2, age=1200) == "warn"
 
 
-def test_progress_guard_explicit_long_operation_with_fresh_liveness_exempts():
+def test_progress_guard_completed_long_operation_never_exempts_with_fresh_liveness():
     signals = analyze_worker_log(
-        "  ┊ 💻 $ pytest -q tests/scoped/test_slow.py\ncollecting ..."
+        "  ┊ 💻 $         pytest -q tests/scoped/test_slow.py  45.2s"
     )
     signals["fresh_liveness"] = True
-    assert signals["long_operation_active"] is True
-    assert _decide(signals, intervals=3, warning_sent=True, age=1800) == "exempt"
+    assert signals["long_operation_active"] is False
+    assert _decide(signals, intervals=3, warning_sent=True, age=1800) == "reseat"
 
 
 def test_progress_guard_generic_terminal_and_heartbeat_do_not_exempt():
@@ -164,6 +184,7 @@ def test_progress_guard_typed_exemptions_win():
         "status_not_running",
         "profile_not_eligible",
         "stale_run",
+        "legitimate_long_run",
     ):
         assert _decide(
             signals,
