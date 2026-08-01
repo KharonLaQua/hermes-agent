@@ -54,10 +54,34 @@ def test_progress_guard_write_and_patch_are_durable_progress():
     assert _decide(signals, intervals=0, age=0) == "continue"
 
 
+def test_progress_guard_deduplicates_unchanged_writes_but_counts_changed_targets():
+    unchanged = analyze_worker_log(
+        "  ┊ ✍️ write /tmp/result.md 0.1s\n"
+        "  ┊ ✍️ write /tmp/result.md 0.2s"
+    )
+    changed = analyze_worker_log(
+        "  ┊ ✍️ write /tmp/result.md 0.1s\n"
+        "  ┊ ✍️ write /tmp/other.md 0.2s"
+    )
+    assert unchanged["durable_progress_count"] == 1
+    assert unchanged["repeated_nonprogress_signature_count"] == 1
+    assert changed["durable_progress_count"] == 2
+
+
+def test_progress_guard_ignores_prose_and_source_diff_tool_mentions():
+    signals = analyze_worker_log(
+        "The brief says write the artifact, then patch the file.\n"
+        "+ command = '$ pytest -q tests/unit/test_x.py'\n"
+        "12 passed in 1.01s"
+    )
+    assert signals["durable_progress_count"] == 0
+    assert signals["long_operation_active"] is False
+
+
 def test_progress_guard_successful_scoped_test_and_build_are_progress():
     signals = analyze_worker_log(
-        "$ pytest -q tests/unit/test_x.py\n12 passed in 1.01s\n"
-        "$ python -m build\nSuccessfully built hermes_agent.whl"
+        "  ┊ 💻 $ pytest -q tests/unit/test_x.py\n12 passed in 1.01s\n"
+        "  ┊ 💻 $ python -m build\nSuccessfully built hermes_agent.whl"
     )
     assert signals["durable_progress_count"] >= 2
     assert signals["durable_progress_category"] == "test_build_success"
@@ -66,10 +90,12 @@ def test_progress_guard_successful_scoped_test_and_build_are_progress():
 
 def test_progress_guard_changed_failure_fingerprint_progresses_once_per_change():
     repeated = analyze_worker_log(
+        "  ┊ 💻 $ pytest -q test_x.py\n"
         "FAILED test_x.py::test_a - AssertionError: expected 1 got 2\n"
         "FAILED test_x.py::test_a - AssertionError: expected 1 got 2"
     )
     changed = analyze_worker_log(
+        "  ┊ 💻 $ pytest -q test_x.py\n"
         "FAILED test_x.py::test_a - AssertionError: expected 1 got 2\n"
         "FAILED test_x.py::test_a - TypeError: invalid operand"
     )
@@ -113,7 +139,9 @@ def test_progress_guard_post_evidence_verification_churn_is_bounded():
 
 
 def test_progress_guard_explicit_long_operation_with_fresh_liveness_exempts():
-    signals = analyze_worker_log("$ pytest -q tests/scoped/test_slow.py\ncollecting ...")
+    signals = analyze_worker_log(
+        "  ┊ 💻 $ pytest -q tests/scoped/test_slow.py\ncollecting ..."
+    )
     signals["fresh_liveness"] = True
     assert signals["long_operation_active"] is True
     assert _decide(signals, intervals=3, warning_sent=True, age=1800) == "exempt"

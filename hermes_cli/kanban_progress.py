@@ -25,13 +25,20 @@ _TEST_BUILD_SUCCESS_RE = re.compile(
     r"\bexit(?:ed)?\s+(?:code\s+)?0\b)",
     re.IGNORECASE,
 )
-_WRITE_RE = re.compile(
-    r"(?:✍|🩹|\bwrite_file\b|\bwrite\b|\bpatch\b|\bkanban_attach\b)",
+_TOOL_RECORD_PREFIX = r"^\s*┊\s*"
+_WRITE_TOOL_RE = re.compile(
+    _TOOL_RECORD_PREFIX
+    + r"(?:✍️?\s*|🩹\s*)?(?:write_file|write|patch|kanban_attach)\b",
     re.IGNORECASE,
 )
 _NONPROGRESS_TOOL_RE = re.compile(
-    r"(?:\bgrep\b|\brg\b|\bsearch_files\b|\bread_file\b|\bfind\b|"
-    r"\bbrowser_snapshot\b|\bbrowser_vision\b|\bkanban_he(?:artbeat)?\b)",
+    _TOOL_RECORD_PREFIX
+    + r"(?:🔎\s*|📖\s*|⚡\s*)?(?:grep|rg|search_files|read_file|find|"
+    r"browser_snapshot|browser_vision|kanban_he(?:artbeat)?)\b",
+    re.IGNORECASE,
+)
+_TERMINAL_TOOL_RE = re.compile(
+    _TOOL_RECORD_PREFIX + r"(?:💻\s*)?(?:\$|terminal\b)",
     re.IGNORECASE,
 )
 _COMPACTION_RE = re.compile(
@@ -39,8 +46,9 @@ _COMPACTION_RE = re.compile(
     re.IGNORECASE,
 )
 _GUI_RE = re.compile(
-    r"(?:browser_(?:click|type|press|scroll|navigate)|computer[-_ ]control|"
-    r"macos[-_ ]computer[-_ ]use|gui(?:\s+control)?)",
+    _TOOL_RECORD_PREFIX
+    + r"(?:🖥\s*)?(?:browser_(?:click|type|press|scroll|navigate)|"
+    r"computer[-_ ]control|macos[-_ ]computer[-_ ]use|gui(?:\s+control)?)",
     re.IGNORECASE,
 )
 _LONG_OPERATION_RE = re.compile(
@@ -48,7 +56,10 @@ _LONG_OPERATION_RE = re.compile(
     r"\bcrawl\b|\bcrawling\b)",
     re.IGNORECASE,
 )
-_HEARTBEAT_RE = re.compile(r"\bkanban_he(?:artbeat)?\b|\bheartbeat\b", re.IGNORECASE)
+_HEARTBEAT_RE = re.compile(
+    _TOOL_RECORD_PREFIX + r"(?:⚡\s*)?kanban_he(?:artbeat)?\b",
+    re.IGNORECASE,
+)
 
 
 def _normalized(line: str) -> str:
@@ -57,7 +68,6 @@ def _normalized(line: str) -> str:
     value = _DURATION_RE.sub("<duration>", value)
     value = re.sub(r"\bpid\s+\d+\b", "pid <n>", value)
     value = re.sub(r"0x[0-9a-f]+", "<hex>", value)
-    value = re.sub(r"(?:/private)?/tmp/\S+", "<tmp-path>", value)
     return _WHITESPACE_RE.sub(" ", value)
 
 
@@ -74,11 +84,13 @@ def analyze_worker_log(text: str) -> dict[str, Any]:
     reads/searches, compaction, and GUI control remain non-progress signals.
     """
     durable: list[tuple[int, str, str]] = []
-    failure_signatures: set[str] = set()
+    durable_signatures: set[str] = set()
     nonprogress_signatures: Counter[str] = Counter()
+    repeated_durable = 0
     compactions = 0
     gui_controls = 0
     long_operation_started_at: int | None = None
+    structured_terminal_seen = False
     nonprogress_indexes: list[int] = []
 
     for index, raw_line in enumerate((text or "").splitlines()):
@@ -90,36 +102,53 @@ def analyze_worker_log(text: str) -> dict[str, Any]:
         is_gui = bool(_GUI_RE.search(line))
         is_heartbeat = bool(_HEARTBEAT_RE.search(line))
         is_nonprogress_tool = bool(_NONPROGRESS_TOOL_RE.search(line))
-        is_success = bool(_TEST_BUILD_SUCCESS_RE.search(line))
-        is_failure = bool(_FAILURE_RE.search(line))
-        is_write = bool(_WRITE_RE.search(line)) and not is_failure
+        is_terminal_tool = bool(_TERMINAL_TOOL_RE.search(raw_line))
+        is_success = structured_terminal_seen and bool(_TEST_BUILD_SUCCESS_RE.search(line))
+        is_failure = structured_terminal_seen and bool(_FAILURE_RE.search(line))
+        is_write = bool(_WRITE_TOOL_RE.search(raw_line)) and not is_failure
 
         if is_compaction:
             compactions += 1
         if is_gui:
             gui_controls += 1
 
+        durable_item: tuple[str, str] | None = None
         if is_write:
-            durable.append((index, "artifact_write", _signature("artifact_write", line)))
+            durable_item = ("artifact_write", _signature("artifact_write", line))
         elif is_success:
-            durable.append((index, "test_build_success", _signature("test_build_success", line)))
+            durable_item = (
+                "test_build_success",
+                _signature("test_build_success", line),
+            )
             long_operation_started_at = None
         elif is_failure:
             fingerprint = _signature("failure_fingerprint", line)
-            if fingerprint not in failure_signatures:
-                failure_signatures.add(fingerprint)
-                durable.append((index, "changed_failure", fingerprint))
+            durable_item = ("changed_failure", fingerprint)
             long_operation_started_at = None
+
+        if durable_item is not None:
+            category, fingerprint = durable_item
+            if fingerprint not in durable_signatures:
+                durable_signatures.add(fingerprint)
+                durable.append((index, category, fingerprint))
+            else:
+                # An unchanged repeated write/result corroborates a loop; it
+                # must not manufacture a newer durable-progress observation.
+                repeated_durable += 1
+                nonprogress_indexes.append(index)
 
         # A command/tool record that names a recognized bounded long operation
         # is explicit enough; a generic terminal or heartbeat is not.
         if (
-            _LONG_OPERATION_RE.search(line)
+            is_terminal_tool
+            and _LONG_OPERATION_RE.search(line)
             and not is_success
             and not is_failure
-            and ("$" in line or "terminal" in line.lower() or "running" in line.lower())
         ):
             long_operation_started_at = index
+
+        if is_terminal_tool:
+            structured_terminal_seen = True
 
         if is_nonprogress_tool or is_compaction or is_gui:
             normalized = _normalized(line)
@@ -135,7 +164,7 @@ def analyze_worker_log(text: str) -> dict[str, Any]:
     ) if durable else 0
     repeated_nonprogress = sum(
         count - 1 for count in nonprogress_signatures.values() if count > 1
-    )
+    ) + repeated_durable
     category = durable[-1][1] if durable else None
     signature = durable[-1][2] if durable else None
 

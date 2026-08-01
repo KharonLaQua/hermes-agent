@@ -7131,27 +7131,26 @@ def _progress_guard_exempt_reason(row: sqlite3.Row, config: dict) -> Optional[st
     if assignee in protected:
         return "market_trading"
 
-    contract = f"{row['title'] or ''}\n{row['body'] or ''}".lower()
-    if "don-only:" in contract or "don only:" in contract:
+    title = str(row["title"] or "").strip().lower()
+    body_lines = [line.strip().lower() for line in str(row["body"] or "").splitlines()]
+    explicit_markers = {
+        line.removeprefix("progress-guard-exempt:").strip()
+        for line in body_lines
+        if line.startswith("progress-guard-exempt:")
+    }
+    if title.startswith(("don-only:", "don only:")) or any(
+        line.startswith(("don-only:", "don only:")) for line in body_lines
+    ) or "don_only" in explicit_markers:
         return "don_only"
-    if any(
-        marker in contract
-        for marker in (
-            "acceptance gate",
-            "review-required:",
-            "gate:",
-            "verify:",
-            "review:",
-            "close:",
-        )
-    ):
+    if title.startswith(("gate:", "verify:", "review:", "close:")) or any(
+        line.startswith("review-required:") for line in body_lines
+    ) or "acceptance_gate" in explicit_markers:
         return "acceptance_gate"
-    if any(
-        marker in contract
-        for marker in ("market", "trading", "broker", "position", "real-money")
+    if title.startswith(("market:", "trading:", "betting:", "real-money:")) or (
+        "market_trading" in explicit_markers
     ):
         return "market_trading"
-    if "decision:" in contract or "consigliere" in contract:
+    if title.startswith("decision:") or "team_lead_judgment" in explicit_markers:
         return "team_lead_judgment"
     return None
 
