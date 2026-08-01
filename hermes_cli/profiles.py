@@ -837,6 +837,67 @@ def read_profile_meta(profile_dir: Path) -> dict:
     }
 
 
+def read_profile_routing_meta(profile_name: str) -> dict:
+    """Read strict, profile-owned task-routing metadata without rewriting it.
+
+    ``default`` is the synthetic fleet router and has no ``profile.yaml``.
+    Named profiles must exist and declare one of the closed routing roles.
+    Missing ``routing_children`` is an empty list; a present non-list value is
+    invalid.  Callers can distinguish an unknown profile (``FileNotFoundError``)
+    from malformed metadata (``ValueError``) and fail closed accordingly.
+    """
+    name = normalize_profile_name(profile_name)
+    validate_profile_name(name)
+    if name == "default":
+        return {"routing_role": "router", "routing_children": []}
+
+    profile_dir = get_profile_dir(name)
+    path = _profile_yaml_path(profile_dir)
+    if not profile_dir.is_dir() or not path.is_file():
+        raise FileNotFoundError(f"profile routing metadata not found: {name}")
+
+    try:
+        import yaml
+        with open(path, "r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+    except Exception as exc:
+        raise ValueError(f"invalid profile.yaml for {name}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"invalid profile.yaml for {name}: expected mapping")
+
+    role = data.get("routing_role")
+    if role not in {"lead", "junior", "authority"}:
+        raise ValueError(
+            f"invalid routing_role for {name}: expected lead, junior, or authority"
+        )
+
+    raw_children = data.get("routing_children", [])
+    if raw_children is None:
+        raw_children = []
+    if not isinstance(raw_children, list):
+        raise ValueError(f"invalid routing_children for {name}: expected list")
+
+    children: list[str] = []
+    seen: set[str] = set()
+    for child in raw_children:
+        if not isinstance(child, str):
+            raise ValueError(
+                f"invalid routing_children for {name}: entries must be strings"
+            )
+        try:
+            normalized = normalize_profile_name(child)
+            validate_profile_name(normalized)
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid routing_children for {name}: {child!r}"
+            ) from exc
+        if normalized not in seen:
+            seen.add(normalized)
+            children.append(normalized)
+
+    return {"routing_role": role, "routing_children": children}
+
+
 def write_profile_meta(
     profile_dir: Path,
     *,

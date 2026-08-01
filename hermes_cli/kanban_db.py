@@ -2797,6 +2797,8 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    authority_actor: Optional[str] = None,
+    authority_enabled: Optional[bool] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3003,6 +3005,23 @@ def create_task(
         ).fetchone()
         if row:
             return row["id"]
+
+    # Model-tool callers provide a trusted actor identity. Preserve human CLI,
+    # dashboard, and internal callers by leaving this boundary opt-in. The
+    # replay path above deliberately precedes authorization so historical work
+    # remains idempotent after enforcement is enabled.
+    if authority_actor is not None:
+        from hermes_cli.kanban_authority import authorize_task_create
+
+        decision = authorize_task_create(
+            authority_actor, assignee, enabled=authority_enabled
+        )
+        if not decision["allowed"]:
+            raise ValueError(
+                "task create denied "
+                f"[{decision['code']}]: actor={decision['actor_profile']} "
+                f"target={decision['target_profile']}"
+            )
 
     now = int(time.time())
 

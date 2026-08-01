@@ -390,7 +390,12 @@ def make_claude_cli_event_bridge(agent) -> Callable[[dict], None]:
     return on_event
 
 
-def _extract_system_prompt(agent, messages: List[Dict[str, Any]]) -> Optional[str]:
+def _extract_system_prompt(
+    agent,
+    messages: List[Dict[str, Any]],
+    *,
+    authority_enabled: Optional[bool] = None,
+) -> Optional[str]:
     """Best-effort system prompt for --append-system-prompt-file."""
     # Prefer an explicit agent-composed system message if present on the
     # conversation (first system role), else agent.system_prompt / similar.
@@ -409,6 +414,14 @@ def _extract_system_prompt(agent, messages: List[Dict[str, Any]]) -> Optional[st
                 joined = "\n".join(p for p in parts if p).strip()
                 if joined:
                     return joined
+    if authority_enabled is None:
+        from hermes_cli.kanban_authority import authority_enforcement_enabled
+
+        authority_enabled = authority_enforcement_enabled()
+    if authority_enabled:
+        cached = getattr(agent, "_cached_system_prompt", None)
+        if isinstance(cached, str) and cached.strip():
+            return cached
     for attr in ("system_prompt", "_system_prompt", "system_message"):
         val = getattr(agent, attr, None)
         if isinstance(val, str) and val.strip():

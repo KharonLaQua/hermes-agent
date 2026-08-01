@@ -334,6 +334,17 @@ def _normalize_profile(value: Any) -> Optional[str]:
     return text
 
 
+_MISSING_AUTHORITY_ACTOR = "missing-hermes-profile"
+
+
+def _authority_actor_from_environment() -> str:
+    """Return trusted tool identity, failing closed when it is absent or blank."""
+    actor = os.environ.get("HERMES_PROFILE")
+    if actor is None or not actor.strip():
+        return _MISSING_AUTHORITY_ACTOR
+    return actor
+
+
 def _parse_bool_arg(args: dict, name: str, *, default: bool = False):
     value = args.get(name)
     if value is None:
@@ -1236,6 +1247,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                authority_actor=_authority_actor_from_environment(),
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)

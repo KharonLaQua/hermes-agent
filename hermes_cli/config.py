@@ -2910,6 +2910,9 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Global shared-harness task-create authority boundary. Default OFF;
+        # lane profiles cannot override this cross-fleet policy.
+        "authority_enforcement": {"enabled": False},
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false
