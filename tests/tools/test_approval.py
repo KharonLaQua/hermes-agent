@@ -161,6 +161,29 @@ def test_scoped_permit_floor_precedence(monkeypatch, command, expected):
     assert result.get("permit_failure_class") is None
 
 
+def test_scoped_permit_phase_a_returns_exact_prepared_ticket(monkeypatch):
+    ticket = approval_module.PreparedPermitTicket(object(), "a" * 64, 0, "b" * 64)
+    monkeypatch.setattr(approval_module, "_WORKER_PERMIT_BOOTSTRAP_FAILURE", None)
+    monkeypatch.setattr(approval_module, "get_worker_permit_client", lambda: object())
+    monkeypatch.setattr(
+        approval_module,
+        "prepare_scoped_terminal_permit",
+        lambda *_args, **_kwargs: ticket,
+    )
+
+    result = approval_module.check_all_command_guards(
+        "rclone copyto /source vault:destination",
+        "local",
+        execution_context={"required": True},
+    )
+
+    assert result["approved"] is False
+    assert result["status"] == "permit_prepared"
+    assert result["prepared_permit"] is ticket
+    assert result["permit_id_digest"] == "a" * 64
+    assert result["operation_index"] == 0
+
+
 @pytest.mark.parametrize(
     "command",
     [

@@ -3222,6 +3222,14 @@ def _scoped_permit_failure_result(failure_class: str) -> dict:
     }
 
 
+def scoped_terminal_permit_state_present() -> bool:
+    """Return whether this worker must use the fail-closed scoped route."""
+    return (
+        get_worker_permit_client() is not None
+        or _WORKER_PERMIT_BOOTSTRAP_FAILURE is not None
+    )
+
+
 def _prepare_scoped_permit_result(
     command: str,
     env_type: str,
@@ -3301,10 +3309,7 @@ def check_all_command_guards(command: str, env_type: str,
     # ordinary bypass/prompt paths. A channel or execution context is a
     # required scoped route; it may never fall through to yolo, mode=off,
     # permanent allow, or a no-responder prompt.
-    permit_state_present = (
-        get_worker_permit_client() is not None
-        or _WORKER_PERMIT_BOOTSTRAP_FAILURE is not None
-    )
+    permit_state_present = scoped_terminal_permit_state_present()
     if permit_state_present or execution_context is not None:
         if _should_skip_container_guards(env_type, has_host_access=has_host_access):
             return _scoped_permit_failure_result("operation_forbidden")

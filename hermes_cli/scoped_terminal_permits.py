@@ -6,6 +6,7 @@ inside the dispatcher-lock-owning gateway process.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import hmac
 import json
@@ -1288,6 +1289,55 @@ def uninstall_active_issuer(issuer: ScopedTerminalPermitIssuer) -> bool:
 _WORKER_CHANNEL_LOCK = threading.Lock()
 _WORKER_CHANNEL_CLAIMED = False
 _WORKER_PERMIT_CLIENT: Optional["_WorkerPermitClient"] = None
+_PREPARED_TICKET_LOCK = threading.Lock()
+_PREPARED_TICKET_ORIGINS: dict[
+    int, tuple[PreparedPermitTicket, "_WorkerPermitClient"]
+] = {}
+
+
+def _retain_prepared_ticket(
+    ticket: PreparedPermitTicket, client: "_WorkerPermitClient"
+) -> None:
+    """Retain the Phase-A origin outside caller-mutable ticket metadata."""
+    with _PREPARED_TICKET_LOCK:
+        _PREPARED_TICKET_ORIGINS[id(ticket)] = (ticket, client)
+
+
+def _discard_prepared_ticket(
+    ticket: PreparedPermitTicket | None, client: "_WorkerPermitClient"
+) -> None:
+    if ticket is None:
+        return
+    with _PREPARED_TICKET_LOCK:
+        retained = _PREPARED_TICKET_ORIGINS.get(id(ticket))
+        if retained is not None and retained[0] is ticket and retained[1] is client:
+            _PREPARED_TICKET_ORIGINS.pop(id(ticket), None)
+
+
+def _take_prepared_ticket_origin(
+    ticket: PreparedPermitTicket,
+) -> "_WorkerPermitClient":
+    """Atomically spend and resolve the exact privately retained ticket origin."""
+    with _PREPARED_TICKET_LOCK:
+        retained = _PREPARED_TICKET_ORIGINS.pop(id(ticket), None)
+        if retained is not None and retained[0] is ticket:
+            return retained[1]
+        # An unrecognized ticket must not leave any privately retained Phase-A
+        # capability live. Fail-close every origin without consulting the
+        # incoming ticket's caller-mutable ``_client`` field.
+        retained_entries = list(_PREPARED_TICKET_ORIGINS.values())
+        if retained is not None:
+            retained_entries.append(retained)
+        active_origins = {
+            id(origin): origin
+            for _, origin in retained_entries
+        }
+        _PREPARED_TICKET_ORIGINS.clear()
+    if active_origins:
+        for origin in active_origins.values():
+            origin.close()
+        raise ScopedTerminalPermitError("malformed")
+    raise ScopedTerminalPermitError("missing")
 
 
 def _recv_exact(endpoint: socket.socket, size: int) -> bytes:
@@ -1477,14 +1527,14 @@ class _WorkerPermitClient:
             binding.operation_index,
             binding.command_digest,
         )
+        _discard_prepared_ticket(self._prepared_ticket, self)
         self._prepared_ticket = ticket
         self._prepared_ticket_binding = binding
+        _retain_prepared_ticket(ticket, self)
         return ticket
 
     def _reject_pre_send_input(self, failure_class: str) -> NoReturn:
         """Invalidate local Phase A state and terminalize the capability channel."""
-        self._prepared_ticket = None
-        self._prepared_ticket_binding = None
         self.close()
         raise ScopedTerminalPermitError(failure_class)
 
@@ -1513,6 +1563,7 @@ class _WorkerPermitClient:
             self._reject_pre_send_input("malformed")
         # The ticket capability is one-shot even if later wire serialization
         # fails. A second caller cannot reuse Phase-A authority on this client.
+        _discard_prepared_ticket(ticket, self)
         self._prepared_ticket = None
         self._prepared_ticket_binding = None
         challenge = secrets.token_hex(32)
@@ -1583,6 +1634,9 @@ class _WorkerPermitClient:
         if self._closed:
             return
         self._closed = True
+        _discard_prepared_ticket(self._prepared_ticket, self)
+        self._prepared_ticket = None
+        self._prepared_ticket_binding = None
         endpoint = self._endpoint
         self._endpoint = None
         if endpoint is not None:
@@ -1678,6 +1732,55 @@ def get_worker_permit_client() -> Optional[_WorkerPermitClient]:
         return _WORKER_PERMIT_CLIENT
 
 
+def build_worker_permit_execution_context(
+    *,
+    cwd: str,
+    background: bool,
+    pty: bool,
+    stdin: bool,
+    force: bool,
+    notify_on_complete: bool,
+    watch_patterns: Optional[list[str]],
+    client: Optional[_WorkerPermitClient] = None,
+) -> dict[str, Any]:
+    """Combine signed operation scope with live worker and terminal identity.
+
+    Source, destination, sequence, and command metadata come only from the
+    authenticated envelope. Process identity and transient dispatch modes are
+    sampled from the actual worker call so Phase A can compare both boundaries.
+    """
+    selected = client or get_worker_permit_client()
+    if selected is None:
+        raise ScopedTerminalPermitError("missing")
+    payload = selected._payload
+    run_id_text = os.environ.get("HERMES_KANBAN_RUN_ID", "")
+    try:
+        run_id: Any = int(run_id_text)
+    except (TypeError, ValueError):
+        run_id = run_id_text
+    return {
+        "board_slug": os.environ.get("HERMES_KANBAN_BOARD", ""),
+        "task_id": os.environ.get("HERMES_KANBAN_TASK", ""),
+        "run_id": run_id,
+        "profile": os.environ.get("HERMES_PROFILE", ""),
+        "profile_home": os.environ.get("HERMES_HOME", ""),
+        "workspace": os.environ.get("HERMES_KANBAN_WORKSPACE", ""),
+        "source": copy.deepcopy(payload["source"]),
+        "destination": copy.deepcopy(payload["destination"]),
+        "operation_sequence": copy.deepcopy(payload["operation_sequence"]),
+        "authorized_operation_index": payload["authorized_operation_index"],
+        "predecessor_receipt_digest": payload["predecessor_receipt_digest"],
+        "command_digest": payload["command_digest"],
+        "cwd": cwd,
+        "background": bool(background),
+        "pty": bool(pty),
+        "stdin": bool(stdin),
+        "force": bool(force),
+        "notify_on_complete": bool(notify_on_complete),
+        "watch_patterns": copy.deepcopy(watch_patterns),
+    }
+
+
 def prepare_scoped_terminal_permit(
     command: str,
     env_type: str,
@@ -1695,10 +1798,8 @@ def prepare_scoped_terminal_permit(
 def consume_scoped_terminal_permit(
     ticket: PreparedPermitTicket, execution_context: Mapping[str, Any]
 ) -> PermitDecision:
-    """Consume a prepared ticket through its authenticated parent broker channel."""
+    """Consume through the authenticated origin privately retained by Phase A."""
     if not isinstance(ticket, PreparedPermitTicket):
         raise ScopedTerminalPermitError("malformed")
-    client = ticket._client
-    if not isinstance(client, _WorkerPermitClient):
-        raise ScopedTerminalPermitError("malformed")
-    return client.consume(ticket, execution_context)
+    origin = _take_prepared_ticket_origin(ticket)
+    return origin.consume(ticket, execution_context)

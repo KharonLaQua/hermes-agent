@@ -1,4 +1,9 @@
-"""Regression tests for sudo detection and sudo password handling."""
+"""Regression tests for terminal security and dispatch boundaries."""
+
+import json
+from types import SimpleNamespace
+
+import pytest
 
 import tools.terminal_tool as terminal_tool
 
@@ -9,6 +14,277 @@ def setup_function():
 
 def teardown_function():
     terminal_tool._reset_cached_sudo_passwords()
+
+
+def _install_scoped_terminal_harness(
+    monkeypatch,
+    *,
+    env_type="local",
+    execute_effects=None,
+    context_overrides=None,
+):
+    events = []
+    effects = list(execute_effects or [{"output": "ok", "returncode": 0}])
+
+    class FakeEnv:
+        env = {}
+        cwd = "/workspace"
+
+        def execute(self, command, **kwargs):
+            events.append(("execute", command, kwargs))
+            effect = effects.pop(0)
+            if isinstance(effect, BaseException):
+                raise effect
+            return effect
+
+    config = {
+        "env_type": env_type,
+        "cwd": "/workspace",
+        "timeout": 60,
+        "lifetime_seconds": 3600,
+    }
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda _value: "default")
+    monkeypatch.setattr(
+        terminal_tool,
+        "_scoped_terminal_permit_state_present",
+        lambda: True,
+        raising=False,
+    )
+
+    def build_context(**kwargs):
+        context = {
+            "cwd": kwargs["cwd"],
+            "background": kwargs["background"],
+            "pty": kwargs["pty"],
+            "stdin": kwargs["stdin"],
+            "force": kwargs["force"],
+            "notify_on_complete": kwargs["notify_on_complete"],
+            "watch_patterns": kwargs["watch_patterns"],
+        }
+        context.update(context_overrides or {})
+        events.append(("context", context.copy()))
+        return context
+
+    monkeypatch.setattr(
+        terminal_tool,
+        "_build_scoped_terminal_execution_context",
+        build_context,
+        raising=False,
+    )
+    return events
+
+
+def _prepared_approval(ticket, events):
+    def guard(command, env_type, **kwargs):
+        events.append(("guard", command, env_type, kwargs.get("execution_context")))
+        return {
+            "approved": False,
+            "status": "permit_prepared",
+            "scoped_permit": True,
+            "permit_prepared": True,
+            "prepared_permit": ticket,
+            "permit_id_digest": "a" * 64,
+            "operation_index": 0,
+            "message": None,
+        }
+
+    return guard
+
+
+def test_scoped_permit_consumes_immediately_before_stubbed_foreground_dispatch(monkeypatch):
+    events = _install_scoped_terminal_harness(monkeypatch)
+    ticket = object()
+    monkeypatch.setattr(terminal_tool, "_check_all_guards", _prepared_approval(ticket, events))
+
+    def consume(received_ticket, context):
+        events.append(("consume", received_ticket, context))
+        return SimpleNamespace(
+            allowed=True,
+            failure_class=None,
+            permit_id_digest="a" * 64,
+        )
+
+    monkeypatch.setattr(
+        terminal_tool,
+        "consume_scoped_terminal_permit",
+        consume,
+        raising=False,
+    )
+
+    result = json.loads(terminal_tool.terminal_tool(command="rclone copyto source target"))
+
+    assert result["exit_code"] == 0
+    assert [event[0] for event in events] == ["context", "guard", "consume", "execute"]
+    assert events[2][1] is ticket
+    assert events[2][2] is events[1][3]
+    assert events[1][3] == {
+        "cwd": "/workspace",
+        "background": False,
+        "pty": False,
+        "stdin": False,
+        "force": False,
+        "notify_on_complete": False,
+        "watch_patterns": None,
+    }
+    assert "a" * 64 in result["approval"]
+
+
+def test_scoped_permit_rejection_never_calls_environment_execute(monkeypatch):
+    events = _install_scoped_terminal_harness(monkeypatch)
+    ticket = object()
+    monkeypatch.setattr(terminal_tool, "_check_all_guards", _prepared_approval(ticket, events))
+    monkeypatch.setattr(
+        terminal_tool,
+        "consume_scoped_terminal_permit",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            allowed=False,
+            failure_class="task_mismatch",
+            permit_id_digest="a" * 64,
+        ),
+        raising=False,
+    )
+
+    result = json.loads(terminal_tool.terminal_tool(command="rclone copyto source target"))
+
+    assert result["status"] == "blocked"
+    assert result["exit_code"] == -1
+    assert "task_mismatch" in result["error"]
+    assert not any(event[0] == "execute" for event in events)
+
+
+def test_scoped_permit_bootstrap_failure_never_falls_back_to_dispatch(monkeypatch):
+    events = _install_scoped_terminal_harness(monkeypatch)
+
+    def fail_context(**_kwargs):
+        raise terminal_tool.ScopedTerminalPermitError("bootstrap_failure")
+
+    def reject_guard(command, env_type, **kwargs):
+        assert kwargs.get("execution_context") == {}
+        return {
+            "approved": False,
+            "status": "scoped_permit_denied",
+            "permit_failure_class": "bootstrap_failure",
+            "message": (
+                "BLOCKED: scoped terminal permit validation failed "
+                "(bootstrap_failure)."
+            ),
+        }
+
+    monkeypatch.setattr(
+        terminal_tool,
+        "_build_scoped_terminal_execution_context",
+        fail_context,
+    )
+    monkeypatch.setattr(terminal_tool, "_check_all_guards", reject_guard)
+
+    result = json.loads(terminal_tool.terminal_tool(command="rclone copyto source target"))
+
+    assert result["status"] == "blocked"
+    assert "bootstrap_failure" in result["error"]
+    assert not any(event[0] == "execute" for event in events)
+
+
+@pytest.mark.parametrize(
+    ("terminal_kwargs", "env_type", "context_overrides", "expected_field"),
+    [
+        ({"force": True}, "local", None, "force"),
+        ({"background": True}, "local", None, "background"),
+        ({"pty": True}, "local", None, "pty"),
+        ({"notify_on_complete": True}, "local", None, "notify_on_complete"),
+        ({"watch_patterns": ["ready"]}, "local", None, "watch_patterns"),
+        ({}, "local", {"stdin": True}, "stdin"),
+        ({}, "ssh", None, "env_type"),
+    ],
+    ids=["force", "background", "pty", "notification", "watch", "stdin", "non-local"],
+)
+def test_scoped_permit_rejects_unsupported_terminal_modes_before_dispatch(
+    monkeypatch, terminal_kwargs, env_type, context_overrides, expected_field
+):
+    events = _install_scoped_terminal_harness(
+        monkeypatch,
+        env_type=env_type,
+        context_overrides=context_overrides,
+    )
+    guard_contexts = []
+
+    def reject_guard(command, received_env_type, **kwargs):
+        context = kwargs.get("execution_context")
+        guard_contexts.append((received_env_type, context))
+        assert context is not None
+        forbidden = received_env_type != "local" or any(
+            context.get(field)
+            for field in (
+                "force",
+                "background",
+                "pty",
+                "stdin",
+                "notify_on_complete",
+                "watch_patterns",
+            )
+        )
+        assert forbidden
+        return {
+            "approved": False,
+            "status": "scoped_permit_denied",
+            "permit_failure_class": "operation_forbidden",
+            "message": "BLOCKED: scoped permit terminal mode is forbidden.",
+        }
+
+    monkeypatch.setattr(terminal_tool, "_check_all_guards", reject_guard)
+
+    result = json.loads(
+        terminal_tool.terminal_tool(
+            command="rclone copyto source target",
+            **terminal_kwargs,
+        )
+    )
+
+    assert result["status"] == "blocked"
+    assert "forbidden" in result["error"]
+    assert len(guard_contexts) == 1
+    if expected_field == "env_type":
+        assert guard_contexts[0][0] == "ssh"
+    else:
+        assert guard_contexts[0][1][expected_field]
+    assert not any(event[0] == "execute" for event in events)
+
+
+def test_scoped_permit_never_retries_after_consumption(monkeypatch):
+    events = _install_scoped_terminal_harness(
+        monkeypatch,
+        execute_effects=[RuntimeError("transient backend failure")],
+    )
+    ticket = object()
+    monkeypatch.setattr(terminal_tool, "_check_all_guards", _prepared_approval(ticket, events))
+    consume_calls = []
+
+    def consume(received_ticket, context):
+        consume_calls.append((received_ticket, context))
+        return SimpleNamespace(
+            allowed=True,
+            failure_class=None,
+            permit_id_digest="a" * 64,
+        )
+
+    monkeypatch.setattr(
+        terminal_tool,
+        "consume_scoped_terminal_permit",
+        consume,
+        raising=False,
+    )
+
+    result = json.loads(terminal_tool.terminal_tool(command="rclone copyto source target"))
+
+    assert result["exit_code"] == -1
+    assert "transient backend failure" in result["error"]
+    assert len(consume_calls) == 1
+    assert [event[0] for event in events].count("execute") == 1
 
 
 def test_searching_for_sudo_does_not_trigger_rewrite(monkeypatch):

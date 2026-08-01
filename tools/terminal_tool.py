@@ -254,6 +254,12 @@ def _reset_cached_sudo_passwords() -> None:
 # Dangerous command detection + approval now consolidated in tools/approval.py
 from tools.approval import (
     check_all_command_guards as _check_all_guards_impl,
+    scoped_terminal_permit_state_present as _scoped_terminal_permit_state_present,
+)
+from hermes_cli.scoped_terminal_permits import (
+    ScopedTerminalPermitError,
+    build_worker_permit_execution_context,
+    consume_scoped_terminal_permit,
 )
 
 
@@ -279,11 +285,35 @@ def _docker_has_host_access(config: Dict[str, Any]) -> bool:
 
 
 def _check_all_guards(command: str, env_type: str,
-                      has_host_access: bool = False) -> dict:
+                      has_host_access: bool = False,
+                      execution_context: Optional[Dict[str, Any]] = None) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback(),
-                                  has_host_access=has_host_access)
+                                  has_host_access=has_host_access,
+                                  execution_context=execution_context)
+
+
+def _build_scoped_terminal_execution_context(
+    *,
+    cwd: str,
+    background: bool,
+    pty: bool,
+    stdin: bool,
+    force: bool,
+    notify_on_complete: bool,
+    watch_patterns: Optional[List[str]],
+) -> Dict[str, Any]:
+    """Build the internal Phase-A context without exposing permit scope to callers."""
+    return build_worker_permit_execution_context(
+        cwd=cwd,
+        background=background,
+        pty=pty,
+        stdin=stdin,
+        force=force,
+        notify_on_complete=notify_on_complete,
+        watch_patterns=watch_patterns,
+    )
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -2371,20 +2401,67 @@ def terminal_tool(
                     "status": "error",
                 }, ensure_ascii=False)
 
-        # Pre-exec security checks (tirith + dangerous command detection)
-        # Skip check if force=True (user has confirmed they want to run it)
+        # The session key that drives cwd records: get_current_session_key()'s
+        # contextvar doesn't cross tool-worker threads, so fall back to the raw
+        # task_id (which IS the session_key for the top-level agent) — a
+        # stable, thread-safe anchor.
+        from tools.approval import get_current_session_key
+
+        session_key = get_current_session_key(default="") or (task_id or "")
+        command_cwd = _resolve_command_cwd(
+            workdir=workdir,
+            default_cwd=cwd,
+            session_key=session_key,
+        )
+
+        # Pre-exec security checks (tirith + dangerous command detection).
+        # Ordinary force=True retains its historical confirmed-user bypass, but
+        # an inherited scoped capability always enters the guard so force and
+        # every unsupported dispatch mode fail closed.
         approval_note = None
+        prepared_permit = None
+        scoped_execution_context = None
+        scoped_permit_present = _scoped_terminal_permit_state_present()
+        if scoped_permit_present:
+            try:
+                scoped_execution_context = _build_scoped_terminal_execution_context(
+                    cwd=command_cwd,
+                    background=background,
+                    pty=pty,
+                    stdin=False,
+                    force=force,
+                    notify_on_complete=notify_on_complete,
+                    watch_patterns=watch_patterns,
+                )
+            except ScopedTerminalPermitError:
+                # Approval owns the stable failure classification (including an
+                # import-time bootstrap failure). Supplying an empty context
+                # keeps this route fail-closed without leaking exception detail.
+                scoped_execution_context = {}
         # True when the user explicitly approved this run (or pre-confirmed via
         # force).  Drives the clean-interrupt-slate clear before env.execute so
         # an approved command can't be SIGINT-killed by a bit that landed during
         # the approval-wait (see clear_current_thread_interrupt).
-        _approved_run = bool(force)
-        if not force:
+        _approved_run = bool(force and not scoped_permit_present)
+        if not force or scoped_permit_present:
             approval = _check_all_guards(
                 command, env_type,
                 has_host_access=_docker_has_host_access(config),
+                execution_context=scoped_execution_context,
             )
-            if not approval["approved"]:
+            if approval.get("permit_prepared"):
+                prepared_permit = approval.get("prepared_permit")
+                if prepared_permit is None:
+                    return json.dumps({
+                        "output": "",
+                        "exit_code": -1,
+                        "error": (
+                            "BLOCKED: scoped terminal permit validation failed "
+                            "(malformed). Do NOT retry or fall back to ordinary approval."
+                        ),
+                        "status": "blocked",
+                    }, ensure_ascii=False)
+            elif not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
                 if approval.get("status") == "pending_approval":
                     return json.dumps({
@@ -2411,8 +2488,18 @@ def terminal_tool(
                     "error": approval.get("message", fallback_msg),
                     "status": "blocked"
                 }, ensure_ascii=False)
-            # Track whether approval was explicitly granted by the user
-            if approval.get("user_approved"):
+            elif scoped_permit_present:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": (
+                        "BLOCKED: scoped terminal permit validation failed "
+                        "(malformed). Do NOT retry or fall back to ordinary approval."
+                    ),
+                    "status": "blocked",
+                }, ensure_ascii=False)
+            # Track whether approval was explicitly granted by the user.
+            elif approval.get("user_approved"):
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command required approval ({desc}) and was approved by the user."
                 _approved_run = True
@@ -2444,14 +2531,6 @@ def terminal_tool(
                 "processes, call process(action='close') after writing so it receives "
                 "EOF."
             )
-
-        # The session key that drives cwd records: get_current_session_key()'s
-        # contextvar doesn't cross tool-worker threads, so fall back to the raw
-        # task_id (which IS the session_key for the top-level agent) — a
-        # stable, thread-safe anchor.
-        from tools.approval import get_current_session_key
-
-        session_key = get_current_session_key(default="") or (task_id or "")
 
         if background:
             # Spawn a tracked background process via the process registry.
@@ -2702,10 +2781,9 @@ def terminal_tool(
                 }, ensure_ascii=False)
         else:
             # Run foreground command with retry logic
-            max_retries = 3
+            max_retries = 0 if prepared_permit is not None else 3
             retry_count = 0
             result = None
-            command_cwd = None
 
             # Clean interrupt slate for an approved command, ONCE before the
             # retry loop: drop a stale bit that landed on this thread during the
@@ -2734,6 +2812,43 @@ def terminal_tool(
                         # reads, RPC reads) intentionally stay unbounded.
                         "bounded_capture": True,
                     }
+                    if prepared_permit is not None:
+                        try:
+                            permit_decision = consume_scoped_terminal_permit(
+                                prepared_permit,
+                                scoped_execution_context or {},
+                            )
+                        except ScopedTerminalPermitError as exc:
+                            return json.dumps({
+                                "output": "",
+                                "exit_code": -1,
+                                "error": (
+                                    "BLOCKED: scoped terminal permit consumption failed "
+                                    f"({exc.failure_class}). Do NOT retry or fall back to "
+                                    "ordinary approval."
+                                ),
+                                "status": "blocked",
+                            }, ensure_ascii=False)
+                        if not permit_decision.allowed:
+                            failure_class = permit_decision.failure_class or "malformed"
+                            return json.dumps({
+                                "output": "",
+                                "exit_code": -1,
+                                "error": (
+                                    "BLOCKED: scoped terminal permit consumption failed "
+                                    f"({failure_class}). Do NOT retry or fall back to "
+                                    "ordinary approval."
+                                ),
+                                "status": "blocked",
+                            }, ensure_ascii=False)
+                        permit_digest = permit_decision.permit_id_digest or "unknown"
+                        approval_note = (
+                            "Scoped terminal permit "
+                            f"{permit_digest} consumed immediately before dispatch."
+                        )
+                        _approved_run = True
+                        from tools.interrupt import clear_current_thread_interrupt
+                        clear_current_thread_interrupt()
                     result = env.execute(command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
