@@ -114,6 +114,7 @@ class TestApiServerPlatformConfig:
         assert "discord" not in enabled
         assert "discord_admin" not in enabled
         assert "x_search" not in enabled
+        assert "kanban" not in enabled
 
 
 class TestApiServerAdapterToolset:

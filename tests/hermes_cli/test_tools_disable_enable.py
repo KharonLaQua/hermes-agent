@@ -59,6 +59,37 @@ class TestToolsEnableBuiltin:
         saved = mock_save.call_args[0][0]
         assert saved["platform_toolsets"]["cli"].count("web") == 1
 
+    def test_enable_kanban_is_supported_only_for_api_server(self):
+        config = {"platform_toolsets": {"api_server": []}}
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config") as mock_save:
+            tools_disable_enable_command(Namespace(
+                tools_action="enable", names=["kanban"], platform="api_server"
+            ))
+        saved = mock_save.call_args[0][0]
+        assert "kanban" in saved["platform_toolsets"]["api_server"]
+
+    def test_disable_kanban_is_reversible_for_api_server(self):
+        config = {"platform_toolsets": {"api_server": ["kanban"]}}
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config") as mock_save:
+            tools_disable_enable_command(Namespace(
+                tools_action="disable", names=["kanban"], platform="api_server"
+            ))
+        saved = mock_save.call_args[0][0]
+        assert "kanban" not in saved["platform_toolsets"]["api_server"]
+
+    def test_enable_kanban_rejects_cli(self, capsys):
+        config = {"platform_toolsets": {"cli": []}}
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config") as mock_save:
+            tools_disable_enable_command(Namespace(
+                tools_action="enable", names=["kanban"], platform="cli"
+            ))
+        out = capsys.readouterr().out
+        assert "not available on platform 'cli'" in out
+        assert "kanban" not in config["platform_toolsets"]["cli"]
+
 
 # ── MCP tool disable ────────────────────────────────────────────────────────
 

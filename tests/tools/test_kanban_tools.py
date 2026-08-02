@@ -75,11 +75,11 @@ def _cleanup_arm_issuer(issuer):
     issuer.close()
 
 
-def _bind_gateway_session(profile: str = "gateway"):
+def _bind_gateway_session(profile: str = "gateway", platform: str = "telegram"):
     from gateway.session_context import set_session_vars
 
     return set_session_vars(
-        platform="telegram",
+        platform=platform,
         session_key="gateway-session",
         session_id="gateway-session",
         profile=profile,
@@ -139,6 +139,87 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
+    assert {"kanban_first_prep_resume", "kanban_arm_terminal_permit"}.isdisjoint(kanban)
+
+
+def test_api_server_scoped_controller_tools_resolve_with_gateway_authority(
+    monkeypatch, tmp_path
+):
+    """An API-server opt-in exposes only the two issuer-gated controllers."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "gateway")
+    import tools.kanban_tools  # ensure registered
+    from model_tools import _clear_tool_defs_cache, get_tool_definitions
+    from tools.registry import invalidate_check_fn_cache
+    from hermes_cli.tools_config import _get_platform_tools
+
+    issuer = _install_arm_issuer(monkeypatch, profile="gateway")
+    _bind_gateway_session("gateway", platform="api_server")
+    try:
+        enabled = _get_platform_tools(
+            {"platform_toolsets": {"api_server": ["kanban"]}},
+            "api_server",
+        )
+        assert "kanban" in enabled
+        invalidate_check_fn_cache()
+        _clear_tool_defs_cache()
+        schema = get_tool_definitions(enabled_toolsets=sorted(enabled), quiet_mode=True)
+        names = {s["function"].get("name") for s in schema if "function" in s}
+        assert {"kanban_first_prep_resume", "kanban_arm_terminal_permit"} <= names
+        assert {
+            "kanban_prepare_terminal_contract", "kanban_show", "kanban_complete",
+            "kanban_block", "kanban_heartbeat", "kanban_comment", "kanban_create",
+            "kanban_link", "kanban_unblock", "kanban_list", "kanban_attach",
+            "kanban_attach_url", "kanban_attachments",
+        }.isdisjoint(names)
+    finally:
+        from gateway.session_context import reset_session_vars
+
+        reset_session_vars()
+        _cleanup_arm_issuer(issuer)
+
+
+def test_scoped_controller_checks_reject_worker_closed_and_mismatched_contexts(
+    monkeypatch
+):
+    from gateway.session_context import reset_session_vars
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    issuer = _install_arm_issuer(monkeypatch, profile="gateway")
+    try:
+        reset_session_vars()
+        assert kt._check_first_prep_resume() is False
+        assert kt._check_arm_terminal_permit() is False
+
+        _bind_gateway_session("other-profile")
+        assert kt._check_first_prep_resume() is False
+        assert kt._check_arm_terminal_permit() is False
+
+        _bind_gateway_session("gateway")
+        assert kt._check_first_prep_resume() is True
+        assert kt._check_arm_terminal_permit() is True
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "worker-task")
+        assert kt._check_first_prep_resume() is False
+        assert kt._check_arm_terminal_permit() is False
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.setattr(kt, "_is_delegated_child_context", lambda: True)
+        assert kt._check_first_prep_resume() is False
+        assert kt._check_arm_terminal_permit() is False
+
+        monkeypatch.setattr(kt, "_is_delegated_child_context", lambda: False)
+        reset_session_vars()
+        issuer.close()
+        assert kt._check_first_prep_resume() is False
+        assert kt._check_arm_terminal_permit() is False
+    finally:
+        reset_session_vars()
+        _cleanup_arm_issuer(issuer)
 
 
 def test_arm_terminal_permit_tool_requires_active_dispatch_owner(monkeypatch):
