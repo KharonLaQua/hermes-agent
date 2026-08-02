@@ -90,6 +90,20 @@ class TestToolsEnableBuiltin:
         assert "not available on platform 'cli'" in out
         assert "kanban" not in config["platform_toolsets"]["cli"]
 
+    def test_enable_kanban_rejects_telegram(self, capsys):
+        """Kanban remains API-server-only for unrelated platform lists."""
+        config = {"platform_toolsets": {"telegram": []}}
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config") as mock_save:
+            tools_disable_enable_command(Namespace(
+                tools_action="enable", names=["kanban"], platform="telegram"
+            ))
+        out = capsys.readouterr().out
+        assert "not available on platform 'telegram'" in out
+        assert "kanban" not in config["platform_toolsets"]["telegram"]
+        saved = mock_save.call_args[0][0]
+        assert saved["platform_toolsets"]["telegram"] == []
+
 
 # ── MCP tool disable ────────────────────────────────────────────────────────
 

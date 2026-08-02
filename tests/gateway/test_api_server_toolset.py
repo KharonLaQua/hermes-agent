@@ -177,3 +177,148 @@ class TestApiServerAdapterToolset:
             call_kwargs = mock_agent_cls.call_args
             toolsets = call_kwargs.kwargs.get("enabled_toolsets")
             assert sorted(toolsets) == ["terminal", "web"]
+
+
+def _create_api_server_kanban_agent(monkeypatch, adapter):
+    """Build a real quiet AIAgent through the API adapter's config seam."""
+    with patch("gateway.run._resolve_runtime_agent_kwargs") as mock_kwargs, \
+         patch("gateway.run._resolve_gateway_model") as mock_model, \
+         patch("gateway.run._load_gateway_config") as mock_config, \
+         patch("gateway.run.GatewayRunner._load_reasoning_config") as mock_reasoning, \
+         patch("gateway.run.GatewayRunner._load_fallback_model") as mock_fallback, \
+         patch("gateway.run._current_max_iterations") as mock_iterations, \
+         patch.object(adapter, "_ensure_session_db", return_value=None):
+        mock_kwargs.return_value = {
+            "api_key": "test-key", "base_url": "https://example.test/v1",
+            "provider": "openai", "api_mode": "chat_completions",
+            "command": None, "args": [],
+        }
+        mock_model.return_value = "test/model"
+        mock_config.return_value = {
+            "platform_toolsets": {"api_server": ["kanban"]},
+        }
+        mock_reasoning.return_value = {}
+        mock_fallback.return_value = None
+        mock_iterations.return_value = 1
+        return adapter._create_agent(session_id="kanban-api-session")
+
+
+def _controller_tool_names(agent):
+    return {
+        name for name in agent.valid_tool_names
+        if name.startswith("kanban_")
+    }
+
+
+def _clear_controller_schema_caches():
+    from model_tools import _clear_tool_defs_cache
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+
+
+class TestApiServerScopedKanbanControllers:
+    """Real adapter-to-AIAgent regression coverage for controller visibility."""
+
+    def _setup_authorized_context(self, monkeypatch, tmp_path):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.session_context import set_session_vars
+        from hermes_cli.scoped_terminal_permits import (
+            ScopedTerminalPermitIssuer,
+            install_active_issuer,
+        )
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        _clear_controller_schema_caches()
+        issuer = ScopedTerminalPermitIssuer(
+            issuer_profile="gateway",
+            lock_owner_check=lambda: True,
+        )
+        assert install_active_issuer(issuer)
+        set_session_vars(
+            platform="api_server",
+            session_key="kanban-api-session",
+            session_id="kanban-api-session",
+            profile="gateway",
+            async_delivery=False,
+        )
+        return APIServerAdapter(PlatformConfig(enabled=True)), issuer
+
+    @staticmethod
+    def _cleanup(issuer):
+        from gateway.session_context import reset_session_vars
+        from hermes_cli.scoped_terminal_permits import uninstall_active_issuer
+
+        reset_session_vars()
+        uninstall_active_issuer(issuer)
+        issuer.close()
+        _clear_controller_schema_caches()
+
+    def test_create_agent_assembles_only_scoped_controller_tools(self, monkeypatch, tmp_path):
+        """The production API config seam reaches actual AIAgent assembly."""
+        adapter, issuer = self._setup_authorized_context(monkeypatch, tmp_path)
+        try:
+            agent = _create_api_server_kanban_agent(monkeypatch, adapter)
+            names = _controller_tool_names(agent)
+            assert names == {
+                "kanban_first_prep_resume",
+                "kanban_arm_terminal_permit",
+            }
+            assert "kanban_prepare_terminal_contract" not in agent.valid_tool_names
+        finally:
+            self._cleanup(issuer)
+
+    def test_create_agent_recomputes_controllers_for_mismatched_profile(
+        self, monkeypatch, tmp_path
+    ):
+        """A later API request cannot reuse an authorized profile's schemas."""
+        from gateway.session_context import set_session_vars
+
+        adapter, issuer = self._setup_authorized_context(monkeypatch, tmp_path)
+        try:
+            authorized = _controller_tool_names(
+                _create_api_server_kanban_agent(monkeypatch, adapter)
+            )
+            set_session_vars(
+                platform="api_server",
+                session_key="kanban-api-session-other",
+                session_id="kanban-api-session-other",
+                profile="other-profile",
+                async_delivery=False,
+            )
+            mismatched = _controller_tool_names(
+                _create_api_server_kanban_agent(monkeypatch, adapter)
+            )
+            assert authorized == {
+                "kanban_first_prep_resume",
+                "kanban_arm_terminal_permit",
+            }
+            assert mismatched == set()
+        finally:
+            self._cleanup(issuer)
+
+    def test_create_agent_recomputes_controllers_for_closed_issuer(
+        self, monkeypatch, tmp_path
+    ):
+        """A closed issuer immediately removes controllers on the next request."""
+        adapter, issuer = self._setup_authorized_context(monkeypatch, tmp_path)
+        try:
+            authorized = _controller_tool_names(
+                _create_api_server_kanban_agent(monkeypatch, adapter)
+            )
+            issuer.close()
+            closed = _controller_tool_names(
+                _create_api_server_kanban_agent(monkeypatch, adapter)
+            )
+            assert authorized == {
+                "kanban_first_prep_resume",
+                "kanban_arm_terminal_permit",
+            }
+            assert closed == set()
+        finally:
+            self._cleanup(issuer)

@@ -175,6 +175,39 @@ class TestGetDefinitions:
         assert len(defs) == 2
         assert calls["count"] == 1
 
+    def test_context_sensitive_check_bypasses_ttl_while_normal_check_stays_cached(self):
+        """Request-bound checks refresh every schema pass without changing TTL checks."""
+        reg = ToolRegistry()
+        normal_state = {"calls": 0, "available": True}
+        context_state = {"calls": 0, "available": True}
+
+        def normal_check():
+            normal_state["calls"] += 1
+            return normal_state["available"]
+
+        def context_check():
+            context_state["calls"] += 1
+            return context_state["available"]
+
+        reg.register(
+            name="normal", toolset="availability", schema=_make_schema("normal"),
+            handler=_dummy_handler, check_fn=normal_check,
+        )
+        reg.register(
+            name="context", toolset="availability", schema=_make_schema("context"),
+            handler=_dummy_handler, check_fn=context_check, context_sensitive=True,
+        )
+
+        first = reg.get_definitions({"normal", "context"})
+        normal_state["available"] = False
+        context_state["available"] = False
+        second = reg.get_definitions({"normal", "context"})
+
+        assert {entry["function"]["name"] for entry in first} == {"normal", "context"}
+        assert {entry["function"]["name"] for entry in second} == {"normal"}
+        assert normal_state["calls"] == 1
+        assert context_state["calls"] == 2
+
 
 class TestUnknownToolDispatch:
     def test_returns_error_json(self):

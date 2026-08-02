@@ -285,6 +285,50 @@ def _clear_tool_defs_cache() -> None:
     _tool_defs_cache.clear()
 
 
+def _has_context_sensitive_requested_tools(
+    enabled_toolsets: Optional[List[str]],
+    disabled_toolsets: Optional[List[str]],
+) -> bool:
+    """Return whether a schema request includes request-bound checks.
+
+    This mirrors static toolset selection without running availability
+    checks. Context-sensitive entries must bypass the outer schema cache
+    because their current request context is not a safe cache key.
+    """
+    tool_names: set = set()
+    if enabled_toolsets is not None:
+        effective_enabled_toolsets = list(enabled_toolsets)
+        if (
+            os.environ.get("HERMES_KANBAN_TASK")
+            and not _is_delegated_child_context()
+            and "kanban" not in effective_enabled_toolsets
+        ):
+            effective_enabled_toolsets.append("kanban")
+        for toolset_name in effective_enabled_toolsets:
+            if validate_toolset(toolset_name):
+                tool_names.update(resolve_toolset(toolset_name))
+            elif toolset_name in _LEGACY_TOOLSET_MAP:
+                tool_names.update(_LEGACY_TOOLSET_MAP[toolset_name])
+    else:
+        from toolsets import get_all_toolsets
+
+        for toolset_name in get_all_toolsets():
+            tool_names.update(resolve_toolset(toolset_name))
+
+    for toolset_name in disabled_toolsets or []:
+        if validate_toolset(toolset_name):
+            from toolsets import bundle_non_core_tools, get_toolset
+
+            if toolset_name.startswith("hermes-") or (get_toolset(toolset_name) or {}).get("posture"):
+                tool_names.difference_update(bundle_non_core_tools(toolset_name))
+            else:
+                tool_names.difference_update(resolve_toolset(toolset_name))
+        elif toolset_name in _LEGACY_TOOLSET_MAP:
+            tool_names.difference_update(_LEGACY_TOOLSET_MAP[toolset_name])
+
+    return registry.has_context_sensitive_checks(tool_names)
+
+
 def get_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
@@ -317,7 +361,11 @@ def get_tool_definitions(
     # user-visible config edits that affect dynamic schemas (execute_code
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
-    if quiet_mode:
+    cacheable = quiet_mode and not _has_context_sensitive_requested_tools(
+        enabled_toolsets,
+        disabled_toolsets,
+    )
+    if cacheable:
         try:
             from hermes_cli.config import get_config_path
             cfg_path = get_config_path()
@@ -346,7 +394,7 @@ def get_tool_definitions(
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                        skip_tool_search_assembly=skip_tool_search_assembly)
-    if quiet_mode:
+    if cacheable:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
         # schemas to self.tools) don't poison the cache. Without this, a

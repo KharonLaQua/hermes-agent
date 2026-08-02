@@ -2598,6 +2598,7 @@ registry.register(
     schema=KANBAN_FIRST_PREP_RESUME_SCHEMA,
     handler=_handle_first_prep_resume,
     check_fn=_check_first_prep_resume,
+    context_sensitive=True,
     emoji="▶",
 )
 
@@ -2607,6 +2608,7 @@ registry.register(
     schema=KANBAN_ARM_TERMINAL_PERMIT_SCHEMA,
     handler=_handle_arm_terminal_permit,
     check_fn=_check_arm_terminal_permit,
+    context_sensitive=True,
     emoji="🔐",
 )
 
