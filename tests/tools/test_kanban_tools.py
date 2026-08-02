@@ -315,6 +315,206 @@ def test_authenticated_gateway_can_resume_foreign_bookkeeper_task(monkeypatch, t
         _cleanup_arm_issuer(issuer)
 
 
+def test_first_prep_resume_is_gateway_only_and_non_authorizing(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        target = kb.create_task(
+            conn,
+            title="bookkeeper",
+            assignee="bookkeeper",
+            goal_mode=True,
+            initial_status="blocked",
+        )
+
+    issuer = _install_arm_issuer(monkeypatch, profile="gateway")
+    _bind_gateway_session("gateway")
+    try:
+        result = json.loads(kt._handle_first_prep_resume({"task_id": target}))
+        assert result == {
+            "ok": True,
+            "task_id": target,
+            "status": "ready",
+            "authorization": "preparation_only",
+        }
+        with kb.connect() as conn:
+            resumed = kb.get_task(conn, target)
+            assert resumed is not None and resumed.status == "ready"
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", target)
+        denied = json.loads(kt._handle_first_prep_resume({"task_id": target}))
+        assert "unavailable in this context" in denied["error"]
+    finally:
+        from gateway.session_context import reset_session_vars
+
+        reset_session_vars()
+        _cleanup_arm_issuer(issuer)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "contract", "sequence", "index"])
+def test_controller_wait_tool_rejects_tampered_or_missing_binding(
+    monkeypatch, tmp_path, mutation
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "bookkeeper")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        target = kb.create_task(
+            conn,
+            title="bookkeeper",
+            assignee="bookkeeper",
+            goal_mode=True,
+            initial_status="running",
+        )
+        assert kb.claim_task(conn, target)
+        task = kb.get_task(conn, target)
+        assert task is not None and task.current_run_id is not None
+        binding = {
+            "contract_digest": "1" * 64,
+            "contract_path_digest": "2" * 64,
+            "operation_sequence_digest": "3" * 64,
+            "authorized_operation_index": 0,
+            "evidence_task_id": "evidence",
+            "evidence_artifact_digest": "4" * 64,
+        }
+        if mutation != "missing":
+            assert kb.record_controller_contract_prepared(
+                conn,
+                task_id=target,
+                run_id=task.current_run_id,
+                **binding,
+            )
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", target)
+    args = {
+        "reason": "waiting for controller",
+        "kind": "controller_wait",
+        **binding,
+    }
+    if mutation == "contract":
+        args["contract_digest"] = "5" * 64
+    elif mutation == "sequence":
+        args["operation_sequence_digest"] = "6" * 64
+    elif mutation == "index":
+        args["authorized_operation_index"] = 1
+    else:
+        args.pop("contract_path_digest")
+    result = json.loads(kt._handle_block(args))
+    assert "binding rejected" in result.get("error", "")
+    with kb.connect() as conn:
+        current = kb.get_task(conn, target)
+        assert current is not None and current.status == "running"
+
+
+def test_gateway_arm_accepts_only_durable_controller_wait(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "source.bin"
+    source.write_bytes(b"source")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "bookkeeper")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        evidence = kb.create_task(conn, title="evidence", assignee="reviewer")
+        assert kb.claim_task(conn, evidence)
+        assert kb.complete_task(
+            conn,
+            evidence,
+            summary="evidence",
+            metadata={"artifact_sha256": "4" * 64},
+        )
+        target = kb.create_task(
+            conn,
+            title="bookkeeper",
+            assignee="bookkeeper",
+            goal_mode=True,
+            initial_status="running",
+        )
+        assert kb.claim_task(conn, target)
+
+    contract = _arm_contract(tmp_path, profile="bookkeeper")
+    contract["workspace"] = str(workspace)
+    contract["operation_sequence"][0]["cwd"] = str(workspace)
+    contract["operation_sequence"][0]["argv"][2] = str(source)
+    contract["source"]["canonical_path"] = str(source)
+    prepared_path = workspace / "prepared.json"
+    monkeypatch.setenv("HERMES_KANBAN_TASK", target)
+    prepared = json.loads(
+        kt._handle_prepare_terminal_contract(
+            {
+                "task_id": target,
+                "contract_path": str(prepared_path),
+                "contract": contract,
+            }
+        )
+    )
+    assert prepared["ok"] is True
+    binding = {
+        "contract_digest": prepared["contract_digest"],
+        "contract_path_digest": prepared["contract_path_digest"],
+        "operation_sequence_digest": prepared["operation_sequence_digest"],
+        "authorized_operation_index": 0,
+        "evidence_task_id": evidence,
+        "evidence_artifact_digest": "4" * 64,
+    }
+    blocked = json.loads(
+        kt._handle_block(
+            {"reason": "controller continuation", "kind": "controller_wait", **binding}
+        )
+    )
+    assert blocked["ok"] is True
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    issuer = _install_arm_issuer(monkeypatch, profile="gateway")
+    _bind_gateway_session("gateway")
+    try:
+        armed = json.loads(
+            kt._handle_arm_terminal_permit(
+                {
+                    "task_id": target,
+                    "contract_path": str(prepared_path),
+                    "contract_sha256": prepared["contract_digest"],
+                    "evidence_task_id": evidence,
+                    "evidence_artifact_sha256": "4" * 64,
+                }
+            )
+        )
+        assert armed["ok"] is True
+        assert ("default", target) in issuer._pending
+        with kb.connect() as conn:
+            resumed = kb.get_task(conn, target)
+            assert resumed is not None and resumed.status == "ready"
+    finally:
+        from gateway.session_context import reset_session_vars
+
+        reset_session_vars()
+        _cleanup_arm_issuer(issuer)
+
+
 def test_bookkeeper_preparation_writes_only_new_digest_bound_contract(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt

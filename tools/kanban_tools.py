@@ -216,7 +216,9 @@ def _connect(board: Optional[str] = None):
     return kb, kb.connect(board=board)
 
 
-_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
+_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset(
+    {"dependency", "needs_input", "controller_wait"}
+)
 
 
 def _goal_judge_available() -> bool:
@@ -437,6 +439,15 @@ def _check_prepare_terminal_contract() -> bool:
     )
 
 
+def _check_first_prep_resume() -> bool:
+    """Expose the non-authorizing first resume only to gateway authority."""
+    if os.environ.get("HERMES_KANBAN_TASK") or _is_delegated_child_context():
+        return False
+    issuer = _active_arm_issuer()
+    profile = _gateway_bound_profile()
+    return issuer is not None and profile is not None and profile == issuer.issuer_profile
+
+
 def _write_prepared_contract_once(path_value: Any, data: bytes, workspace: str) -> str:
     """Create one private contract artifact under the worker workspace."""
     if not isinstance(path_value, str) or not os.path.isabs(path_value):
@@ -497,6 +508,20 @@ def _handle_prepare_terminal_contract(args: dict, **kw) -> str:
                 return tool_error("kanban_prepare_terminal_contract: workspace mismatch")
             prepared = prepare_scoped_terminal_contract(contract)
             _write_prepared_contract_once(contract_path, prepared.canonical_bytes, workspace)
+            if task.current_run_id is not None and not kb.record_controller_contract_prepared(
+                conn,
+                task_id=task_id,
+                run_id=task.current_run_id,
+                contract_digest=prepared.contract_digest,
+                contract_path_digest=hashlib.sha256(
+                    contract_path.encode("utf-8")
+                ).hexdigest(),
+                operation_sequence_digest=prepared.operation_sequence_digest,
+                authorized_operation_index=prepared.contract["authorized_operation_index"],
+            ):
+                return tool_error(
+                    "kanban_prepare_terminal_contract: preparation binding failed"
+                )
         finally:
             conn.close()
         return _ok(
@@ -513,6 +538,42 @@ def _handle_prepare_terminal_contract(args: dict, **kw) -> str:
     except Exception as exc:
         failure = getattr(exc, "failure_class", None) or str(exc)
         return tool_error(f"kanban_prepare_terminal_contract: {failure}")
+
+
+def _handle_first_prep_resume(args: dict, **kw) -> str:
+    """Resume one exact blocked goal task for contract preparation only."""
+    if not isinstance(args, dict) or not _check_first_prep_resume():
+        return tool_error("kanban_first_prep_resume: unavailable in this context")
+    task_id = _default_task_id(args.get("task_id"))
+    if not task_id:
+        return tool_error("kanban_first_prep_resume: task_id is required")
+    try:
+        from hermes_cli import kanban_db as kb
+
+        board = kb._normalize_board_slug(args.get("board")) or kb.get_current_board()
+        _, conn = _connect(board=board)
+        try:
+            task = kb.get_task(conn, task_id)
+            if task is None or task.status != "blocked" or not task.goal_mode:
+                return tool_error(
+                    "kanban_first_prep_resume: target must be a blocked goal-mode task"
+                )
+            if task.block_kind == "controller_wait":
+                return tool_error(
+                    "kanban_first_prep_resume: target is already waiting for a permit"
+                )
+            if not kb.resume_controller_prep(conn, task_id):
+                return tool_error("kanban_first_prep_resume: target was not resumed")
+            resumed = kb.get_task(conn, task_id)
+            return _ok(
+                task_id=task_id,
+                status=resumed.status if resumed is not None else None,
+                authorization="preparation_only",
+            )
+        finally:
+            conn.close()
+    except Exception as exc:
+        return tool_error(f"kanban_first_prep_resume: {exc}")
 
 
 def _read_arm_contract_once(path_value: Any) -> bytes:
@@ -597,6 +658,30 @@ def _handle_arm_terminal_permit(args: dict, **kw) -> str:
                 return tool_error("kanban_arm_terminal_permit: task not found")
             if target.status != "blocked":
                 return tool_error("kanban_arm_terminal_permit: target is not blocked")
+            if target.goal_mode:
+                if target.block_kind != "controller_wait":
+                    return tool_error(
+                        "kanban_arm_terminal_permit: goal-mode target is not in controller_wait"
+                    )
+                expected_sequence = hashlib.sha256(
+                    _canonical_bytes(contract["operation_sequence"])
+                ).hexdigest()
+                expected_path = hashlib.sha256(
+                    contract_path.encode("utf-8")
+                ).hexdigest()
+                if not kb.controller_wait_binding_matches(
+                    conn,
+                    task_id,
+                    contract_digest=contract_sha256,
+                    contract_path_digest=expected_path,
+                    operation_sequence_digest=expected_sequence,
+                    authorized_operation_index=contract["authorized_operation_index"],
+                    evidence_task_id=evidence_task_id,
+                    evidence_artifact_digest=evidence_digest,
+                ):
+                    return tool_error(
+                        "kanban_arm_terminal_permit: controller_wait binding mismatch"
+                    )
             target_profile = _normalize_profile(target.assignee)
             if target_profile is None or contract["profile"] != target_profile.lower():
                 return tool_error("kanban_arm_terminal_permit: target assignee mismatch")
@@ -662,6 +747,8 @@ def _handle_arm_terminal_permit(args: dict, **kw) -> str:
                 current = kb.get_task(resume_conn, task_id)
                 if current is None or current.status != "blocked":
                     return False
+                if current.block_kind == "controller_wait":
+                    return kb.resume_controller_wait(resume_conn, task_id)
                 return kb.unblock_task(resume_conn, task_id)
             finally:
                 resume_conn.close()
@@ -1068,10 +1155,10 @@ def _handle_block(args: dict, **kw) -> str:
         # as terminal, identically to `done`, regardless of kind. Without
         # this, a worker that learns kanban_complete is gated can just call
         # kanban_block(reason="anything") to escape the loop instead.
-        # Restrict goal_mode tasks to the kinds that represent a genuine
-        # external blocker the worker cannot resolve itself; `capability`
-        # and `transient` (or an unset kind) route back through
-        # kanban_complete, which the judge now gates.
+        # Restrict goal_mode tasks to kinds that represent a genuine
+        # external blocker or the dedicated controller continuation state;
+        # `capability` and `transient` (or an unset kind) route back through
+        # `kanban_complete`, which the judge now gates.
         task = kb.get_task(conn, tid)
         if (
             task
@@ -1086,6 +1173,45 @@ def _handle_block(args: dict, **kw) -> str:
                 f"another reason, call kanban_complete instead — the "
                 f"completion judge will evaluate it."
             )
+        if kind == "controller_wait":
+            contract_digest = args.get("contract_digest") or args.get("contract_sha256")
+            operation_sequence_digest = args.get("operation_sequence_digest")
+            evidence_digest = (
+                args.get("evidence_artifact_digest")
+                or args.get("evidence_artifact_sha256")
+            )
+            index = args.get("authorized_operation_index")
+            if not isinstance(contract_digest, str) or not isinstance(
+                operation_sequence_digest, str
+            ) or not isinstance(evidence_digest, str) or not isinstance(index, int):
+                return tool_error(
+                    "kanban_block: controller_wait binding arguments are required"
+                )
+            ok = kb.controller_wait_task(
+                conn,
+                tid,
+                run_id=_worker_run_id(tid),
+                contract_digest=contract_digest,
+                contract_path_digest=args.get("contract_path_digest"),
+                operation_sequence_digest=operation_sequence_digest,
+                authorized_operation_index=index,
+                evidence_task_id=args.get("evidence_task_id"),
+                evidence_artifact_digest=evidence_digest,
+                predecessor_receipt_digest=args.get("predecessor_receipt_digest"),
+                reason=reason,
+            )
+            if not ok:
+                conn.close()
+                return tool_error("kanban_block: controller_wait binding rejected")
+            run = kb.latest_run(conn, tid)
+            result = _ok(
+                task_id=tid,
+                run_id=run.id if run else None,
+                status="blocked",
+                block_kind="controller_wait",
+            )
+            conn.close()
+            return result
         try:
             ok = kb.block_task(
                 conn, tid,
@@ -2001,7 +2127,9 @@ KANBAN_BLOCK_SCHEMA = {
         "goes to todo and auto-resumes when that task finishes, no human "
         "needed), 'needs_input' (you need a human decision/answer), "
         "'capability' (a hard wall: no access, missing credentials, an action "
-        "no agent can do), or 'transient' (a flaky failure that may clear). "
+        "no agent can do), 'transient' (a flaky failure that may clear), or "
+        "'controller_wait' (a goal-mode worker parked on a durable prepared "
+        "contract or consumed-operation binding). "
         "``reason`` is shown to the human on the board. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
@@ -2024,13 +2152,25 @@ KANBAN_BLOCK_SCHEMA = {
             },
             "kind": {
                 "type": "string",
-                "enum": ["dependency", "needs_input", "capability", "transient"],
+                "enum": [
+                    "dependency", "needs_input", "capability", "transient",
+                    "controller_wait",
+                ],
                 "description": (
                     "Why you're blocked. 'dependency' waits in todo and "
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
                 ),
             },
+            "contract_digest": {"type": "string"},
+            "contract_sha256": {"type": "string"},
+            "contract_path_digest": {"type": "string"},
+            "operation_sequence_digest": {"type": "string"},
+            "authorized_operation_index": {"type": "integer", "minimum": 0},
+            "evidence_task_id": {"type": "string"},
+            "evidence_artifact_digest": {"type": "string"},
+            "evidence_artifact_sha256": {"type": "string"},
+            "predecessor_receipt_digest": {"type": "string"},
             "board": _board_schema_prop(),
         },
         "required": ["reason"],
@@ -2409,6 +2549,23 @@ KANBAN_LINK_SCHEMA = {
 }
 
 
+# Gateway-only, non-authorizing first phase. This intentionally does not
+# accept a permit or contract; it only puts the exact blocked worker back in
+# the dispatcher so that worker can create its durable preparation binding.
+KANBAN_FIRST_PREP_RESUME_SCHEMA = {
+    "name": "kanban_first_prep_resume",
+    "description": "Resume one blocked goal-mode task for preparation only; no terminal permit is issued.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "Exact blocked worker task."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id"],
+    },
+}
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -2420,6 +2577,15 @@ registry.register(
     handler=_handle_prepare_terminal_contract,
     check_fn=_check_prepare_terminal_contract,
     emoji="🧾",
+)
+
+registry.register(
+    name="kanban_first_prep_resume",
+    toolset="kanban",
+    schema=KANBAN_FIRST_PREP_RESUME_SCHEMA,
+    handler=_handle_first_prep_resume,
+    check_fn=_check_first_prep_resume,
+    emoji="▶",
 )
 
 registry.register(

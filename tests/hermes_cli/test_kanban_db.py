@@ -1180,6 +1180,65 @@ def test_block_then_unblock(kanban_home):
         assert kb.get_task(conn, t).status == "ready"
 
 
+def test_goal_mode_controller_wait_requires_prepared_binding_and_cannot_auto_promote(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="controller wait", assignee="bookkeeper", goal_mode=True,
+        )
+        assert kb.claim_task(conn, task_id)
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        run_id = task.current_run_id
+        binding = {
+            "contract_digest": "1" * 64,
+            "contract_path_digest": "2" * 64,
+            "operation_sequence_digest": "3" * 64,
+            "authorized_operation_index": 0,
+            "task_id": task_id,
+            "run_id": run_id,
+            "evidence_task_id": "evidence",
+            "evidence_artifact_digest": "4" * 64,
+        }
+        kb.record_controller_contract_prepared(conn, **binding)
+        assert kb.controller_wait_task(
+            conn, task_id, **{key: value for key, value in binding.items() if key != "task_id"}
+        )
+        waited = kb.get_task(conn, task_id)
+        assert waited is not None
+        assert waited.status == "blocked"
+        assert waited.block_kind == "controller_wait"
+        wait_event = kb.list_events(conn, task_id)[-1]
+        assert wait_event.kind == "controller_wait"
+        assert "reason" not in (wait_event.payload or {})
+        assert kb.recompute_ready(conn) == 0
+        assert kb.unblock_task(conn, task_id) is False
+        promoted, _ = kb.promote_task(conn, task_id, actor="test")
+        assert promoted is False
+        assert kb.resume_controller_wait(conn, task_id)
+        assert kb.resume_controller_wait(conn, task_id) is False
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
+def test_first_controller_prep_resume_respects_parent_dependency(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(
+            conn, title="parent", assignee="bookkeeper", initial_status="running"
+        )
+        task_id = kb.create_task(
+            conn,
+            title="controller wait",
+            assignee="bookkeeper",
+            goal_mode=True,
+            initial_status="blocked",
+        )
+        kb.link_tasks(conn, parent, task_id)
+        assert kb.resume_controller_prep(conn, task_id)
+        resumed = kb.get_task(conn, task_id)
+        assert resumed is not None and resumed.status == "todo"
+
+
 def test_unblock_resets_failure_counters(kanban_home):
     """unblock_task must reset consecutive_failures and last_failure_error."""
     with kb.connect() as conn:
