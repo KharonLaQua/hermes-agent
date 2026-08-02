@@ -70,6 +70,64 @@ def _contract(tmp_path):
     }
 
 
+def _directory_content_digest(root):
+    """Canonical content identity expected for a reviewed directory tree."""
+    entries = []
+
+    def visit(directory):
+        for child in sorted(directory.iterdir(), key=lambda item: item.name):
+            relative_path = child.relative_to(root).as_posix()
+            if child.is_dir():
+                entries.append({"kind": "directory", "path": relative_path})
+                visit(child)
+            else:
+                contents = child.read_bytes()
+                entries.append(
+                    {
+                        "kind": "file",
+                        "path": relative_path,
+                        "size": len(contents),
+                        "sha256": hashlib.sha256(contents).hexdigest(),
+                    }
+                )
+
+    visit(root)
+    return hashlib.sha256(
+        json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _directory_contract(tmp_path, *, with_content_identity=True):
+    root = tmp_path / "reviewed-directory"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    (root / "root.bin").write_bytes(b"root-data")
+    (nested / "child.bin").write_bytes(b"child-data")
+
+    contract = _contract(tmp_path)
+    manifest = tmp_path / "directory-manifest.json"
+    manifest.write_text("[]", encoding="utf-8")
+    contract["source"] = {
+        "kind": "directory",
+        "canonical_path": str(root),
+        "expected_size_bytes": sum(
+            path.stat().st_size for path in root.rglob("*") if path.is_file()
+        ),
+        "content_sha256": _directory_content_digest(root)
+        if with_content_identity
+        else None,
+        "manifest_path": str(manifest),
+        "manifest_sha256": hashlib.sha256(b"[]").hexdigest(),
+    }
+    contract["operation_sequence"][0]["argv"] = [
+        "rclone",
+        "copyto",
+        str(root),
+        "vault:reviewed/source.bin",
+    ]
+    return contract, root
+
+
 def test_prepare_scoped_terminal_contract_returns_canonical_digest_only_artifact(
     tmp_path,
 ):
@@ -89,6 +147,94 @@ def test_prepare_scoped_terminal_contract_returns_canonical_digest_only_artifact
     assert prepared.source_size_bytes == len(b"reviewed")
     assert prepared.source_content_sha256 == hashlib.sha256(b"reviewed").hexdigest()
     assert "reviewed" not in prepared.readback_json
+
+
+def test_prepare_directory_contract_returns_canonical_content_identity(tmp_path):
+    contract, root = _directory_contract(tmp_path)
+
+    prepared = prepare_scoped_terminal_contract(contract)
+
+    assert prepared.source_size_bytes == sum(
+        path.stat().st_size for path in root.rglob("*") if path.is_file()
+    )
+    assert prepared.source_content_sha256 == contract["source"]["content_sha256"]
+
+
+def test_directory_preparation_rejects_manifest_only_identity_after_same_size_mutation(
+    tmp_path,
+):
+    contract, root = _directory_contract(tmp_path, with_content_identity=False)
+    child = root / "nested" / "child.bin"
+    child.write_bytes(b"other-data")
+
+    with pytest.raises(ScopedTerminalPermitError):
+        prepare_scoped_terminal_contract(contract)
+
+
+def test_directory_preparation_rejects_same_size_child_content_hash_mismatch(tmp_path):
+    contract, root = _directory_contract(tmp_path)
+    child = root / "nested" / "child.bin"
+    child.write_bytes(b"other-data")
+
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        prepare_scoped_terminal_contract(contract)
+
+    assert exc.value.failure_class == "preparation_hash_mismatch"
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra"])
+def test_directory_preparation_rejects_missing_or_extra_child(tmp_path, mutation):
+    contract, root = _directory_contract(tmp_path)
+    if mutation == "missing":
+        (root / "nested" / "child.bin").unlink()
+    else:
+        (root / "extra.bin").write_bytes(b"extra-data")
+
+    with pytest.raises(ScopedTerminalPermitError):
+        prepare_scoped_terminal_contract(contract)
+
+
+@pytest.mark.parametrize("mutation", ["symlink", "non_regular"])
+def test_directory_preparation_rejects_symlink_or_non_regular_child(tmp_path, mutation):
+    contract, root = _directory_contract(tmp_path)
+    child = root / "nested" / "child.bin"
+    child.unlink()
+    if mutation == "symlink":
+        child.symlink_to(root / "root.bin")
+    else:
+        os.mkfifo(child)
+
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        prepare_scoped_terminal_contract(contract)
+
+    assert exc.value.failure_class == "preparation_source_unreadable"
+
+
+def test_directory_preparation_rejects_child_mutated_during_read(monkeypatch, tmp_path):
+    contract, root = _directory_contract(tmp_path)
+    child = root / "nested" / "child.bin"
+    initial = b"a" * (2 * 1024 * 1024)
+    replacement = b"b" * len(initial)
+    child.write_bytes(initial)
+    contract["source"]["expected_size_bytes"] += len(initial) - len(b"child-data")
+    contract["source"]["content_sha256"] = _directory_content_digest(root)
+    original_read = permits.os.read
+    mutated = False
+
+    def mutate_after_first_chunk(fd, size):
+        nonlocal mutated
+        chunk = original_read(fd, size)
+        if chunk and not mutated:
+            mutated = True
+            child.write_bytes(replacement)
+        return chunk
+
+    monkeypatch.setattr(permits.os, "read", mutate_after_first_chunk)
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        prepare_scoped_terminal_contract(contract)
+
+    assert mutated is True
+    assert exc.value.failure_class == "preparation_source_changed"
 
 
 @pytest.fixture

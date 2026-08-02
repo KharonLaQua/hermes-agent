@@ -376,6 +376,12 @@ def test_continuation_requires_prior_consumed_operation_receipt(monkeypatch, tmp
         target = kb.create_task(
             conn, title="bookkeeper", assignee="bookkeeper", initial_status="blocked"
         )
+        # The predecessor receipt must be attached to the just-finished run.
+        assert kb.unblock_task(conn, target)
+        assert kb.claim_task(conn, target)
+        assert kb.block_task(conn, target, reason="first operation consumed")
+        prior_run = kb.latest_run(conn, target)
+        assert prior_run is not None
     contract = _arm_contract(tmp_path, profile="bookkeeper")
     contract["operation_sequence"].append(dict(contract["operation_sequence"][0], index=1))
     contract["authorized_operation_index"] = 1
@@ -389,12 +395,18 @@ def test_continuation_requires_prior_consumed_operation_receipt(monkeypatch, tmp
         {
             "permit_id_digest": "3" * 64,
             "task_id": target,
-            "run_id": 17,
+            "run_id": prior_run.id,
             "operation_sequence_digest": sequence_digest,
             "operation_index": 0,
             "source_digest": source_digest,
             "destination_digest": destination_digest,
             "profile": "bookkeeper",
+            "profile_home_digest": hashlib.sha256(
+                normalized["profile_home"].encode("utf-8")
+            ).hexdigest(),
+            "workspace_digest": hashlib.sha256(
+                normalized["workspace"].encode("utf-8")
+            ).hexdigest(),
             "command_digest": normalized["command_digest"],
             "evidence_task_id": evidence,
             "evidence_artifact_digest": "2" * 64,
@@ -414,6 +426,301 @@ def test_continuation_requires_prior_consumed_operation_receipt(monkeypatch, tmp
     try:
         result = json.loads(kt._handle_arm_terminal_permit(args))
         assert result["ok"] is True
+    finally:
+        from gateway.session_context import reset_session_vars
+
+        reset_session_vars()
+        _cleanup_arm_issuer(issuer)
+
+
+def _seed_continuation_receipt(monkeypatch, tmp_path, *, mutation=None, stale=False):
+    """Create a blocked target with one durable consumed-operation receipt."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.scoped_terminal_permits import _canonical_bytes, _normalize_contract
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        evidence = kb.create_task(conn, title="evidence", assignee="reviewer")
+        assert kb.claim_task(conn, evidence)
+        assert kb.complete_task(
+            conn,
+            evidence,
+            summary="receipt",
+            metadata={"artifact_sha256": "2" * 64},
+        )
+        target = kb.create_task(conn, title="bookkeeper", assignee="bookkeeper")
+        assert kb.claim_task(conn, target)
+        assert kb.block_task(
+            conn,
+            target,
+            reason="first operation consumed",
+            kind="transient" if stale else None,
+        )
+        prior_run = kb.latest_run(conn, target)
+        assert prior_run is not None
+
+    contract = _arm_contract(tmp_path, profile="bookkeeper")
+    contract["operation_sequence"].append(dict(contract["operation_sequence"][0], index=1))
+    contract["authorized_operation_index"] = 1
+    contract["predecessor_receipt_digest"] = "3" * 64
+    normalized = _normalize_contract(contract)
+    receipt = {
+        "permit_id_digest": "3" * 64,
+        "task_id": target,
+        "run_id": prior_run.id,
+        "operation_sequence_digest": hashlib.sha256(
+            _canonical_bytes(normalized["operation_sequence"])
+        ).hexdigest(),
+        "operation_index": 0,
+        "source_digest": hashlib.sha256(_canonical_bytes(normalized["source"])).hexdigest(),
+        "destination_digest": hashlib.sha256(
+            _canonical_bytes(normalized["destination"])
+        ).hexdigest(),
+        "profile": normalized["profile"],
+        "profile_home_digest": hashlib.sha256(
+            normalized["profile_home"].encode("utf-8")
+        ).hexdigest(),
+        "workspace_digest": hashlib.sha256(
+            normalized["workspace"].encode("utf-8")
+        ).hexdigest(),
+        "command_digest": normalized["command_digest"],
+        "evidence_task_id": evidence,
+        "evidence_artifact_digest": "2" * 64,
+    }
+    if mutation == "run_id":
+        receipt["run_id"] = prior_run.id + 1
+    elif mutation == "profile_home":
+        receipt["profile_home_digest"] = "4" * 64
+    elif mutation == "workspace":
+        receipt["workspace_digest"] = "4" * 64
+    elif mutation == "evidence":
+        receipt["evidence_task_id"] = "t_wrong_evidence"
+    elif mutation == "index":
+        receipt["operation_index"] = 1
+    elif mutation is not None:  # pragma: no cover - keeps test setup closed.
+        raise AssertionError(f"unknown mutation {mutation!r}")
+    kb.append_terminal_permit_event(
+        "terminal_permit_consumed", receipt, board="default"
+    )
+
+    if stale:
+        with kb.connect() as conn:
+            assert kb.unblock_task(conn, target)
+            assert kb.claim_task(conn, target)
+            assert kb.block_task(
+                conn,
+                target,
+                reason="later run without receipt",
+                kind="capability",
+            )
+            current = kb.get_task(conn, target)
+            assert current is not None and current.status == "blocked"
+            latest = kb.latest_run(conn, target)
+            assert latest is not None and latest.id != prior_run.id
+
+    contract_path, contract_digest = _write_contract(tmp_path, contract)
+    return {
+        "target": target,
+        "evidence": evidence,
+        "contract_path": contract_path,
+        "contract_digest": contract_digest,
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation", ["run_id", "profile_home", "workspace", "evidence", "index"]
+)
+def test_continuation_rejects_mismatched_durable_predecessor_identity(
+    monkeypatch, tmp_path, mutation
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    seeded = _seed_continuation_receipt(monkeypatch, tmp_path, mutation=mutation)
+    issuer = _install_arm_issuer(monkeypatch, profile="gateway")
+    _bind_gateway_session("gateway")
+    try:
+        result = json.loads(
+            kt._handle_arm_terminal_permit(
+                {
+                    "task_id": seeded["target"],
+                    "contract_path": str(seeded["contract_path"]),
+                    "contract_sha256": seeded["contract_digest"],
+                    "evidence_task_id": seeded["evidence"],
+                    "evidence_artifact_sha256": "2" * 64,
+                }
+            )
+        )
+        assert "predecessor receipt mismatch" in result.get("error", "")
+        assert issuer._pending == {}
+        with kb.connect() as conn:
+            current = kb.get_task(conn, seeded["target"])
+            assert current is not None and current.status == "blocked"
+    finally:
+        from gateway.session_context import reset_session_vars
+
+        reset_session_vars()
+        _cleanup_arm_issuer(issuer)
+
+
+def test_continuation_rejects_receipt_from_stale_prior_run(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    seeded = _seed_continuation_receipt(monkeypatch, tmp_path, stale=True)
+    issuer = _install_arm_issuer(monkeypatch, profile="gateway")
+    _bind_gateway_session("gateway")
+    try:
+        result = json.loads(
+            kt._handle_arm_terminal_permit(
+                {
+                    "task_id": seeded["target"],
+                    "contract_path": str(seeded["contract_path"]),
+                    "contract_sha256": seeded["contract_digest"],
+                    "evidence_task_id": seeded["evidence"],
+                    "evidence_artifact_sha256": "2" * 64,
+                }
+            )
+        )
+        assert "predecessor receipt mismatch" in result.get("error", "")
+        assert issuer._pending == {}
+        with kb.connect() as conn:
+            current = kb.get_task(conn, seeded["target"])
+            assert current is not None and current.status == "blocked"
+    finally:
+        from gateway.session_context import reset_session_vars
+
+        reset_session_vars()
+        _cleanup_arm_issuer(issuer)
+
+
+def test_continuation_accepts_exact_immediately_prior_consumed_run(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    seeded = _seed_continuation_receipt(monkeypatch, tmp_path)
+    issuer = _install_arm_issuer(monkeypatch, profile="gateway")
+    _bind_gateway_session("gateway")
+    try:
+        result = json.loads(
+            kt._handle_arm_terminal_permit(
+                {
+                    "task_id": seeded["target"],
+                    "contract_path": str(seeded["contract_path"]),
+                    "contract_sha256": seeded["contract_digest"],
+                    "evidence_task_id": seeded["evidence"],
+                    "evidence_artifact_sha256": "2" * 64,
+                }
+            )
+        )
+        assert result["ok"] is True
+        with kb.connect() as conn:
+            current = kb.get_task(conn, seeded["target"])
+            assert current is not None and current.status == "ready"
+    finally:
+        from gateway.session_context import reset_session_vars
+
+        reset_session_vars()
+        _cleanup_arm_issuer(issuer)
+
+
+def test_explicit_board_routes_all_permit_receipts_and_continuation(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.scoped_terminal_permits import ScopedTerminalPermitIssuer
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    kb._INITIALIZED_PATHS.clear()
+    with kb.connect(board="default"):
+        pass
+    with kb.connect(board="alt") as conn:
+        evidence = kb.create_task(conn, title="evidence", assignee="reviewer")
+        assert kb.claim_task(conn, evidence)
+        assert kb.complete_task(
+            conn,
+            evidence,
+            summary="receipt",
+            metadata={"artifact_sha256": "2" * 64},
+        )
+        target = kb.create_task(
+            conn, title="target", assignee="gateway", initial_status="blocked"
+        )
+
+    initial = _arm_contract(tmp_path)
+    initial["operation_sequence"].append(dict(initial["operation_sequence"][0], index=1))
+    initial_path, initial_digest = _write_contract(tmp_path, initial)
+    issuer = _install_arm_issuer(monkeypatch, profile="gateway")
+    _bind_gateway_session("gateway")
+    initial_args = {
+        "task_id": target,
+        "contract_path": str(initial_path),
+        "contract_sha256": initial_digest,
+        "evidence_task_id": evidence,
+        "evidence_artifact_sha256": "2" * 64,
+        "board": "alt",
+    }
+    try:
+        assert json.loads(kt._handle_arm_terminal_permit(initial_args))["ok"] is True
+        with kb.connect(board="alt") as conn:
+            assert kb.claim_task(conn, target)
+            current = kb.get_task(conn, target)
+            assert current is not None and current.current_run_id is not None
+            run_id = current.current_run_id
+        envelope = issuer.activate_for_spawn(
+            board_slug="alt",
+            task_id=target,
+            run_id=run_id,
+            profile="gateway",
+            profile_home=initial["profile_home"],
+            workspace=initial["workspace"],
+        )
+        payload = json.loads(envelope.payload)
+        context = {field: payload[field] for field in ScopedTerminalPermitIssuer.CONTEXT_FIELDS}
+        decision = issuer.consume(envelope, context=context, challenge="fresh")
+        assert decision.allowed is True
+        with kb.connect(board="alt") as conn:
+            assert kb.block_task(conn, target, reason="advance exact sequence")
+
+        continuation = dict(initial)
+        continuation["authorized_operation_index"] = 1
+        continuation["predecessor_receipt_digest"] = decision.permit_id_digest
+        continuation_path, continuation_digest = _write_contract(tmp_path, continuation)
+        continuation_args = dict(
+            initial_args,
+            contract_path=str(continuation_path),
+            contract_sha256=continuation_digest,
+        )
+        assert json.loads(kt._handle_arm_terminal_permit(continuation_args))["ok"] is True
+        assert issuer.cancel_pending_arm(board_slug="alt", task_id=target) is True
+
+        with kb.connect(board="alt") as conn:
+            kinds = [
+                event.kind
+                for event in kb.list_events(conn, target)
+                if event.kind.startswith("terminal_permit_")
+            ]
+        assert kinds == [
+            "terminal_permit_armed",
+            "terminal_permit_activated",
+            "terminal_permit_consumed",
+            "terminal_permit_armed",
+            "terminal_permit_cancelled",
+        ]
+        with kb.connect(board="default") as conn:
+            assert not [
+                event
+                for event in kb.list_events(conn, target)
+                if event.kind.startswith("terminal_permit_")
+            ]
     finally:
         from gateway.session_context import reset_session_vars
 

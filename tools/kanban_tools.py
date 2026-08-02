@@ -613,6 +613,8 @@ def _handle_arm_terminal_permit(args: dict, **kw) -> str:
             if contract["authorized_operation_index"] > 0:
                 prior = kb.latest_terminal_permit_event(conn, task_id)
                 prior_payload = prior.payload if prior is not None else None
+                prior_event_run_id = prior.run_id if prior is not None else None
+                prior_run = kb.latest_run(conn, task_id)
                 expected_sequence = hashlib.sha256(
                     _canonical_bytes(contract["operation_sequence"])
                 ).hexdigest()
@@ -621,6 +623,12 @@ def _handle_arm_terminal_permit(args: dict, **kw) -> str:
                 ).hexdigest()
                 expected_destination = hashlib.sha256(
                     _canonical_bytes(contract["destination"])
+                ).hexdigest()
+                expected_profile_home = hashlib.sha256(
+                    contract["profile_home"].encode("utf-8")
+                ).hexdigest()
+                expected_workspace = hashlib.sha256(
+                    contract["workspace"].encode("utf-8")
                 ).hexdigest()
                 if (
                     not isinstance(prior_payload, dict)
@@ -635,6 +643,11 @@ def _handle_arm_terminal_permit(args: dict, **kw) -> str:
                     or prior_payload.get("source_digest") != expected_source
                     or prior_payload.get("destination_digest") != expected_destination
                     or prior_payload.get("profile") != contract["profile"]
+                    or prior_run is None
+                    or prior_event_run_id != prior_run.id
+                    or prior_payload.get("run_id") != prior_event_run_id
+                    or prior_payload.get("profile_home_digest") != expected_profile_home
+                    or prior_payload.get("workspace_digest") != expected_workspace
                     or prior_payload.get("command_digest") != contract["command_digest"]
                     or prior_payload.get("evidence_task_id") != evidence_task_id
                     or prior_payload.get("evidence_artifact_digest") != evidence_digest

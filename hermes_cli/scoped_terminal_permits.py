@@ -267,6 +267,7 @@ class _PermitRecord:
     evidence_task_id: str
     evidence_artifact_digest: str
     arm_contract_digest: str
+    board_slug: str
 
 
 _CONSUME_REQUEST_FIELDS = frozenset(
@@ -381,6 +382,8 @@ def _validate_source(value: Any) -> dict[str, Any]:
         None if normalized["manifest_path"] is None else _canonical_path(normalized["manifest_path"])
     )
     normalized["manifest_sha256"] = _require_digest(normalized["manifest_sha256"], nullable=True)
+    if normalized["kind"] == "directory" and normalized["content_sha256"] is None:
+        raise ScopedTerminalPermitError("malformed")
     if normalized["content_sha256"] is None and normalized["manifest_sha256"] is None:
         raise ScopedTerminalPermitError("malformed")
     if (normalized["manifest_path"] is None) != (normalized["manifest_sha256"] is None):
@@ -549,11 +552,64 @@ def _normalize_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
     return copied
 
 
-def _read_preparation_file_digest(path: str) -> tuple[int, str]:
-    """Read one canonical regular file for non-destructive preparation."""
+def _preparation_stat_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    """Stable identity for a path or opened descriptor during preparation."""
+    return (
+        info.st_dev,
+        info.st_ino,
+        stat.S_IFMT(info.st_mode),
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _preparation_lstat(path: str, *, dir_fd: int | None = None) -> os.stat_result:
+    try:
+        if dir_fd is None:
+            return os.stat(path, follow_symlinks=False)
+        return os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise ScopedTerminalPermitError("preparation_source_unreadable") from exc
+
+
+def _open_preparation_directory(path: str, *, dir_fd: int | None = None) -> int:
+    """Open a directory without following its final path component."""
+    before = _preparation_lstat(path, dir_fd=dir_fd)
+    if not stat.S_ISDIR(before.st_mode):
+        raise ScopedTerminalPermitError("preparation_source_unreadable")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        if dir_fd is None:
+            fd = os.open(path, flags)
+        else:
+            fd = os.open(path, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        raise ScopedTerminalPermitError("preparation_source_unreadable") from exc
+    opened = os.fstat(fd)
+    if not stat.S_ISDIR(opened.st_mode):
+        os.close(fd)
+        raise ScopedTerminalPermitError("preparation_source_unreadable")
+    if _preparation_stat_identity(before) != _preparation_stat_identity(opened):
+        os.close(fd)
+        raise ScopedTerminalPermitError("preparation_source_changed")
+    return fd
+
+
+def _read_preparation_file_digest(
+    path: str, *, dir_fd: int | None = None
+) -> tuple[int, str]:
+    """Read one stable regular file without following path races."""
+    before = _preparation_lstat(path, dir_fd=dir_fd)
+    if not stat.S_ISREG(before.st_mode):
+        raise ScopedTerminalPermitError("preparation_source_unreadable")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, flags)
+        if dir_fd is None:
+            fd = os.open(path, flags)
+        else:
+            fd = os.open(path, flags, dir_fd=dir_fd)
     except OSError as exc:
         raise ScopedTerminalPermitError("preparation_source_unreadable") from exc
     digest = hashlib.sha256()
@@ -562,6 +618,8 @@ def _read_preparation_file_digest(path: str) -> tuple[int, str]:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise ScopedTerminalPermitError("preparation_source_unreadable")
+        if _preparation_stat_identity(before) != _preparation_stat_identity(info):
+            raise ScopedTerminalPermitError("preparation_source_changed")
         try:
             while True:
                 chunk = os.read(fd, 1024 * 1024)
@@ -571,11 +629,68 @@ def _read_preparation_file_digest(path: str) -> tuple[int, str]:
                 size += len(chunk)
         except OSError as exc:
             raise ScopedTerminalPermitError("preparation_source_changed") from exc
+        after = os.fstat(fd)
     finally:
         os.close(fd)
-    if size != info.st_size:
+    final_path = _preparation_lstat(path, dir_fd=dir_fd)
+    if (
+        size != info.st_size
+        or _preparation_stat_identity(before) != _preparation_stat_identity(after)
+        or _preparation_stat_identity(before) != _preparation_stat_identity(final_path)
+    ):
         raise ScopedTerminalPermitError("preparation_source_changed")
     return size, digest.hexdigest()
+
+
+def _read_preparation_directory_digest(path: str) -> tuple[int, str]:
+    """Read every directory entry through stable descriptor-relative paths."""
+    entries: list[dict[str, Any]] = []
+
+    def visit(directory_fd: int, relative_root: str) -> int:
+        before = os.fstat(directory_fd)
+        if not stat.S_ISDIR(before.st_mode):
+            raise ScopedTerminalPermitError("preparation_source_unreadable")
+        try:
+            names = sorted(os.listdir(directory_fd))
+        except OSError as exc:
+            raise ScopedTerminalPermitError("preparation_source_changed") from exc
+        size = 0
+        for name in names:
+            child_relative = f"{relative_root}/{name}" if relative_root else name
+            child_info = _preparation_lstat(name, dir_fd=directory_fd)
+            if stat.S_ISDIR(child_info.st_mode):
+                entries.append({"kind": "directory", "path": child_relative})
+                child_fd = _open_preparation_directory(name, dir_fd=directory_fd)
+                try:
+                    size += visit(child_fd, child_relative)
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(child_info.st_mode):
+                child_size, child_digest = _read_preparation_file_digest(
+                    name, dir_fd=directory_fd
+                )
+                entries.append(
+                    {
+                        "kind": "file",
+                        "path": child_relative,
+                        "size": child_size,
+                        "sha256": child_digest,
+                    }
+                )
+                size += child_size
+            else:
+                raise ScopedTerminalPermitError("preparation_source_unreadable")
+        after = os.fstat(directory_fd)
+        if _preparation_stat_identity(before) != _preparation_stat_identity(after):
+            raise ScopedTerminalPermitError("preparation_source_changed")
+        return size
+
+    root_fd = _open_preparation_directory(path)
+    try:
+        size = visit(root_fd, "")
+    finally:
+        os.close(root_fd)
+    return size, _digest(_canonical_bytes(entries))
 
 
 def _preparation_source_readback(source: Mapping[str, Any]) -> tuple[int, str | None, str | None]:
@@ -592,19 +707,7 @@ def _preparation_source_readback(source: Mapping[str, Any]) -> tuple[int, str | 
     elif source["kind"] == "directory":
         if not stat.S_ISDIR(info.st_mode):
             raise ScopedTerminalPermitError("preparation_source_unreadable")
-        size = 0
-        for root, dirs, files in os.walk(path, followlinks=False):
-            for name in dirs:
-                if stat.S_ISLNK(os.lstat(os.path.join(root, name)).st_mode):
-                    raise ScopedTerminalPermitError("preparation_source_unreadable")
-            dirs[:] = sorted(dirs)
-            for name in sorted(files):
-                child = os.path.join(root, name)
-                child_info = os.lstat(child)
-                if not stat.S_ISREG(child_info.st_mode):
-                    raise ScopedTerminalPermitError("preparation_source_unreadable")
-                size += child_info.st_size
-        digest = None
+        size, digest = _read_preparation_directory_digest(path)
     else:  # pragma: no cover - _normalize_contract owns this check.
         raise ScopedTerminalPermitError("malformed")
     if size != source["expected_size_bytes"]:
@@ -693,11 +796,13 @@ def _validate_payload(payload: dict[str, Any]) -> None:
     _require_digest(payload["nonce"])
 
 
-def _default_audit_writer(kind: str, payload: Mapping[str, Any]) -> None:
+def _default_audit_writer(
+    kind: str, payload: Mapping[str, Any], *, board_slug: str
+) -> None:
     """Persist a digest-only permit event through the board transaction helper."""
     from hermes_cli.kanban_db import append_terminal_permit_event
 
-    append_terminal_permit_event(kind, payload)
+    append_terminal_permit_event(kind, dict(payload), board=board_slug)
 
 
 class ScopedTerminalPermitIssuer:
@@ -783,7 +888,7 @@ class ScopedTerminalPermitIssuer:
         self.max_ttl_seconds = max_ttl_seconds
         self._lock_owner_check = lock_owner_check
         self._clock = clock or time.time
-        self._audit_writer = audit_writer or _default_audit_writer
+        self._audit_writer = audit_writer
         self._lock = threading.RLock()
         self._closed = False
         self._signing_key: Ed25519PrivateKey | None = Ed25519PrivateKey.generate()
@@ -859,7 +964,9 @@ class ScopedTerminalPermitIssuer:
             )
             self._pending[key] = arm
             try:
-                self._write_audit("terminal_permit_armed", self._audit_for_arm(arm, now))
+                self._write_audit(
+                    "terminal_permit_armed", self._audit_for_arm(arm, now), board_slug=arm.board_slug
+                )
             except Exception:
                 self._pending.pop(key, None)
                 raise ScopedTerminalPermitError("audit_failed") from None
@@ -890,6 +997,7 @@ class ScopedTerminalPermitIssuer:
                 self._write_audit(
                     "terminal_permit_cancelled",
                     self._audit_for_arm(arm, now, failure_class),
+                    board_slug=arm.board_slug,
                 )
             except Exception:
                 raise ScopedTerminalPermitError("audit_failed") from None
@@ -963,6 +1071,7 @@ class ScopedTerminalPermitIssuer:
                     self._write_audit(
                         "terminal_permit_cancelled",
                         self._audit_for_arm(arm, now, failure),
+                        board_slug=arm.board_slug,
                     )
                 except Exception:
                     raise ScopedTerminalPermitError("audit_failed") from None
@@ -1010,12 +1119,14 @@ class ScopedTerminalPermitIssuer:
                 evidence_task_id=arm.evidence_task_id,
                 evidence_artifact_digest=arm.evidence_artifact_digest,
                 arm_contract_digest=arm.contract_digest,
+                board_slug=arm.board_slug,
             )
             self._permits[envelope.permit_id] = record
             try:
                 self._write_audit(
                     "terminal_permit_activated",
                     self._audit_for_record(record, payload, "issued", None, now),
+                    board_slug=record.board_slug,
                 )
             except Exception:
                 record.status = "rejected"
@@ -1188,6 +1299,7 @@ class ScopedTerminalPermitIssuer:
                             "spawn_failed",
                             int(self._clock()),
                         ),
+                        board_slug=record.board_slug,
                     )
                 except Exception:
                     pass
@@ -1307,7 +1419,11 @@ class ScopedTerminalPermitIssuer:
     ) -> PermitDecision:
         kind = "terminal_permit_consumed" if allowed else "terminal_permit_rejected"
         try:
-            self._write_audit(kind, self._audit_for_record(record, payload, "allow" if allowed else "deny", failure, now))
+            self._write_audit(
+                kind,
+                self._audit_for_record(record, payload, "allow" if allowed else "deny", failure, now),
+                board_slug=record.board_slug,
+            )
         except Exception:
             record.status = "rejected"
             return PermitDecision(False, "audit_failed", _digest(payload["permit_id"]))
@@ -1319,6 +1435,7 @@ class ScopedTerminalPermitIssuer:
             self._write_audit(
                 "terminal_permit_rejected",
                 self._audit_for_record(record, payload, "deny", "replay", int(self._clock())),
+                board_slug=record.board_slug,
             )
         except Exception:
             return PermitDecision(False, "audit_failed", _digest(payload["permit_id"]))
@@ -1384,10 +1501,18 @@ class ScopedTerminalPermitIssuer:
             "decided_at": now,
         }
 
-    def _write_audit(self, kind: str, payload: Mapping[str, Any]) -> None:
+    def _write_audit(
+        self, kind: str, payload: Mapping[str, Any], *, board_slug: str
+    ) -> None:
         if set(payload) - self.AUDIT_FIELDS:
             raise ScopedTerminalPermitError("audit_failed")
-        self._audit_writer(kind, dict(payload))
+        board = _require_text(board_slug).strip().lower()
+        if not _BOARD.fullmatch(board):
+            raise ScopedTerminalPermitError("audit_failed")
+        if self._audit_writer is None:
+            _default_audit_writer(kind, dict(payload), board_slug=board)
+        else:
+            self._audit_writer(kind, dict(payload))
 
     def permit_status(self, permit_id: str) -> str | None:
         with self._lock:
@@ -1411,6 +1536,7 @@ class ScopedTerminalPermitIssuer:
                     self._write_audit(
                         "terminal_permit_cancelled",
                         self._audit_for_arm(arm, now, "issuer_unavailable"),
+                        board_slug=arm.board_slug,
                     )
                 except Exception:
                     pass
