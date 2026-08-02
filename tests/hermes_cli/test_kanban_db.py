@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -1216,9 +1217,103 @@ def test_goal_mode_controller_wait_requires_prepared_binding_and_cannot_auto_pro
         assert kb.unblock_task(conn, task_id) is False
         promoted, _ = kb.promote_task(conn, task_id, actor="test")
         assert promoted is False
-        assert kb.resume_controller_wait(conn, task_id)
         assert kb.resume_controller_wait(conn, task_id) is False
+        capability = kb._new_controller_wait_resume_capability(task_id)
+        assert kb.resume_controller_wait(conn, task_id, _capability=capability)
+        assert kb.resume_controller_wait(conn, task_id, _capability=capability) is False
         assert kb.get_task(conn, task_id).status == "ready"
+
+
+def test_controller_wait_requires_complete_prepared_and_consumed_bindings(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="controller wait", assignee="bookkeeper", goal_mode=True,
+        )
+        assert kb.claim_task(conn, task_id)
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        run_id = task.current_run_id
+        common = {
+            "contract_digest": "1" * 64,
+            "contract_path_digest": "2" * 64,
+            "operation_sequence_digest": "3" * 64,
+            "evidence_task_id": "evidence",
+            "evidence_artifact_digest": "4" * 64,
+        }
+        assert kb.record_controller_contract_prepared(
+            conn,
+            task_id=task_id,
+            run_id=run_id,
+            authorized_operation_index=0,
+            **common,
+        )
+        missing_path = dict(common)
+        missing_path.pop("contract_path_digest")
+        with pytest.raises(ValueError, match="contract_path_digest"):
+            kb.controller_wait_task(
+                conn,
+                task_id,
+                run_id=run_id,
+                authorized_operation_index=0,
+                contract_path_digest=None,
+                **missing_path,
+            )
+        current = kb.get_task(conn, task_id)
+        assert current is not None and current.status == "running"
+
+        kb.append_terminal_permit_event(
+            "terminal_permit_consumed",
+            {
+                "permit_id_digest": "5" * 64,
+                "task_id": task_id,
+                "run_id": run_id,
+                "operation_sequence_digest": common["operation_sequence_digest"],
+                "operation_index": 0,
+            },
+        )
+        assert kb.controller_wait_task(
+            conn,
+            task_id,
+            run_id=run_id,
+            authorized_operation_index=1,
+            predecessor_receipt_digest="5" * 64,
+            **common,
+        ) is False
+        current = kb.get_task(conn, task_id)
+        assert current is not None and current.status == "running"
+
+
+def test_controller_wait_binding_rejects_unknown_source_and_bare_resume(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="controller wait", assignee="bookkeeper", goal_mode=True,
+        )
+        assert kb.claim_task(conn, task_id)
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        binding = {
+            "contract_digest": "1" * 64,
+            "contract_path_digest": "2" * 64,
+            "operation_sequence_digest": "3" * 64,
+            "authorized_operation_index": 0,
+            "evidence_task_id": "evidence",
+            "evidence_artifact_digest": "4" * 64,
+        }
+        assert kb.record_controller_contract_prepared(
+            conn, task_id=task_id, run_id=task.current_run_id, **binding
+        )
+        assert kb.controller_wait_task(conn, task_id, run_id=task.current_run_id, **binding)
+        event = kb.list_events(conn, task_id)[-1]
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE id = ?",
+            (json.dumps({**(event.payload or {}), "source": "tampered"}), event.id),
+        )
+        conn.commit()
+        assert kb.controller_wait_binding_matches(conn, task_id, **binding) is False
+        assert kb.resume_controller_wait(conn, task_id) is False
+        capability = kb._new_controller_wait_resume_capability(task_id)
+        assert kb.resume_controller_wait(conn, task_id, _capability=capability)
+        assert kb.resume_controller_wait(conn, task_id, _capability=capability) is False
 
 
 def test_first_controller_prep_resume_respects_parent_dependency(kanban_home):

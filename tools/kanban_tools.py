@@ -741,6 +741,12 @@ def _handle_arm_terminal_permit(args: dict, **kw) -> str:
         finally:
             conn.close()
 
+        resume_capability = (
+            kb._new_controller_wait_resume_capability(task_id)
+            if target.goal_mode and target.block_kind == "controller_wait"
+            else None
+        )
+
         def _resume_target() -> bool:
             _, resume_conn = _connect(board=selected_board)
             try:
@@ -748,7 +754,11 @@ def _handle_arm_terminal_permit(args: dict, **kw) -> str:
                 if current is None or current.status != "blocked":
                     return False
                 if current.block_kind == "controller_wait":
-                    return kb.resume_controller_wait(resume_conn, task_id)
+                    return kb.resume_controller_wait(
+                        resume_conn,
+                        task_id,
+                        _capability=resume_capability,
+                    )
                 return kb.unblock_task(resume_conn, task_id)
             finally:
                 resume_conn.close()
@@ -1187,19 +1197,22 @@ def _handle_block(args: dict, **kw) -> str:
                 return tool_error(
                     "kanban_block: controller_wait binding arguments are required"
                 )
-            ok = kb.controller_wait_task(
-                conn,
-                tid,
-                run_id=_worker_run_id(tid),
-                contract_digest=contract_digest,
-                contract_path_digest=args.get("contract_path_digest"),
-                operation_sequence_digest=operation_sequence_digest,
-                authorized_operation_index=index,
-                evidence_task_id=args.get("evidence_task_id"),
-                evidence_artifact_digest=evidence_digest,
-                predecessor_receipt_digest=args.get("predecessor_receipt_digest"),
-                reason=reason,
-            )
+            try:
+                ok = kb.controller_wait_task(
+                    conn,
+                    tid,
+                    run_id=_worker_run_id(tid),
+                    contract_digest=contract_digest,
+                    contract_path_digest=args.get("contract_path_digest"),
+                    operation_sequence_digest=operation_sequence_digest,
+                    authorized_operation_index=index,
+                    evidence_task_id=args.get("evidence_task_id"),
+                    evidence_artifact_digest=evidence_digest,
+                    predecessor_receipt_digest=args.get("predecessor_receipt_digest"),
+                    reason=reason,
+                )
+            except ValueError:
+                ok = False
             if not ok:
                 conn.close()
                 return tool_error("kanban_block: controller_wait binding rejected")

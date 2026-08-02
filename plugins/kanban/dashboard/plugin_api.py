@@ -1024,6 +1024,13 @@ def _set_status_direct(
         ).fetchone()
         if prev is None:
             return False
+        block_kind = conn.execute(
+            "SELECT block_kind FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()["block_kind"]
+        if block_kind == "controller_wait":
+            # Controller waits leave the queue only through the authenticated
+            # arm callback; dashboard drag/drop is never an authorization path.
+            return False
 
         # Guard: don't allow promoting to 'ready' unless all parents are done.
         # Prevents the dispatcher from spawning a child whose upstream work

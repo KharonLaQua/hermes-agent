@@ -2025,6 +2025,48 @@ def test_dashboard_direct_status_change_within_same_state_is_noop_for_runs(kanba
         conn.close()
 
 
+def test_controller_wait_dashboard_and_tampered_status_cannot_bypass(kanban_home):
+    """Controller waits stay blocked across dashboard and status tampering."""
+    from plugins.kanban.dashboard.plugin_api import _set_status_direct
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="controller wait", assignee="worker", goal_mode=True,
+        )
+        assert kb.claim_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.current_run_id is not None
+        binding = {
+            "contract_digest": "1" * 64,
+            "contract_path_digest": "2" * 64,
+            "operation_sequence_digest": "3" * 64,
+            "authorized_operation_index": 0,
+            "evidence_task_id": "evidence",
+            "evidence_artifact_digest": "4" * 64,
+        }
+        assert kb.record_controller_contract_prepared(
+            conn, task_id=tid, run_id=task.current_run_id, **binding
+        )
+        assert kb.controller_wait_task(conn, tid, run_id=task.current_run_id, **binding)
+        assert _set_status_direct(conn, tid, "ready") is False
+        assert _set_status_direct(conn, tid, "todo") is False
+
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        conn.commit()
+        assert kb.recompute_ready(conn) == 0
+        current = kb.get_task(conn, tid)
+        assert current is not None and current.status == "blocked"
+
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        conn.commit()
+        assert kb.claim_task(conn, tid) is None
+        current = kb.get_task(conn, tid)
+        assert current is not None and current.status == "blocked"
+    finally:
+        conn.close()
+
+
 def test_cli_bulk_complete_with_summary_rejects(kanban_home):
     conn = kb.connect()
     try:

@@ -492,6 +492,27 @@ def test_gateway_arm_accepts_only_durable_controller_wait(monkeypatch, tmp_path)
     issuer = _install_arm_issuer(monkeypatch, profile="gateway")
     _bind_gateway_session("gateway")
     try:
+        original_resume = kb.resume_controller_wait
+        monkeypatch.setattr(kb, "resume_controller_wait", lambda *args, **kwargs: False)
+        failed = json.loads(
+            kt._handle_arm_terminal_permit(
+                {
+                    "task_id": target,
+                    "contract_path": str(prepared_path),
+                    "contract_sha256": prepared["contract_digest"],
+                    "evidence_task_id": evidence,
+                    "evidence_artifact_sha256": "4" * 64,
+                }
+            )
+        )
+        assert "resume_failed" in failed.get("error", "")
+        assert issuer._pending == {}
+        with kb.connect() as conn:
+            preserved = kb.get_task(conn, target)
+            assert preserved is not None
+            assert preserved.status == "blocked"
+            assert preserved.block_kind == "controller_wait"
+        monkeypatch.setattr(kb, "resume_controller_wait", original_resume)
         armed = json.loads(
             kt._handle_arm_terminal_permit(
                 {

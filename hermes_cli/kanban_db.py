@@ -3801,6 +3801,29 @@ def _controller_digest(value: Any, field: str) -> str:
     return value
 
 
+class _ControllerWaitResumeCapability:
+    """Private one-shot capability issued only by the arm bridge."""
+
+    __slots__ = ("_task_id", "_used")
+
+    def __init__(self, task_id: str) -> None:
+        self._task_id = task_id
+        self._used = False
+
+    def consume(self, task_id: str) -> bool:
+        if self._used or self._task_id != task_id:
+            return False
+        self._used = True
+        return True
+
+
+def _new_controller_wait_resume_capability(
+    task_id: str,
+) -> _ControllerWaitResumeCapability:
+    """Create the opaque resume proof used by the gateway arm callback."""
+    return _ControllerWaitResumeCapability(task_id)
+
+
 def _latest_event_payload(
     conn: sqlite3.Connection, task_id: str, kind: str,
 ) -> tuple[Optional[dict], Optional[int]]:
@@ -3894,8 +3917,9 @@ def controller_wait_task(
     The transition closes that run and records only the binding digests.
     """
     contract_digest = _controller_digest(contract_digest, "contract_digest")
-    if contract_path_digest is not None:
-        _controller_digest(contract_path_digest, "contract_path_digest")
+    if contract_path_digest is None:
+        raise ValueError("contract_path_digest is required for controller wait")
+    _controller_digest(contract_path_digest, "contract_path_digest")
     operation_sequence_digest = _controller_digest(
         operation_sequence_digest, "operation_sequence_digest"
     )
@@ -3912,6 +3936,10 @@ def controller_wait_task(
         or not evidence_task_id.strip()
     ):
         raise ValueError("controller wait binding is malformed")
+    if authorized_operation_index == 0 and predecessor_receipt_digest is not None:
+        raise ValueError("prepared controller wait cannot include a predecessor receipt")
+    if authorized_operation_index > 0 and predecessor_receipt_digest is None:
+        raise ValueError("consumed controller wait requires a predecessor receipt")
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, goal_mode, current_run_id FROM tasks WHERE id = ?",
@@ -3936,9 +3964,8 @@ def controller_wait_task(
             "authorized_operation_index": authorized_operation_index,
             "evidence_task_id": evidence_task_id,
             "evidence_artifact_digest": evidence_artifact_digest,
+            "contract_path_digest": contract_path_digest,
         }
-        if contract_path_digest is not None:
-            expected["contract_path_digest"] = contract_path_digest
         if predecessor_receipt_digest is not None:
             expected["predecessor_receipt_digest"] = predecessor_receipt_digest
 
@@ -3946,13 +3973,40 @@ def controller_wait_task(
             prepared_expected = {
                 key: value
                 for key, value in expected.items()
-                if key not in {"evidence_task_id", "evidence_artifact_digest"}
+                if key not in {
+                    "evidence_task_id", "evidence_artifact_digest",
+                    "predecessor_receipt_digest",
+                }
             }
             return (
                 authorized_operation_index == 0
                 and
                 prepared_run_id == active_run_id
                 and prepared is not None
+                and (
+                    frozenset(prepared)
+                    in {
+                        frozenset({
+                            "task_id", "run_id", "contract_digest",
+                            "contract_path_digest", "operation_sequence_digest",
+                            "authorized_operation_index",
+                        }),
+                        frozenset({
+                            "task_id", "run_id", "contract_digest",
+                            "contract_path_digest", "operation_sequence_digest",
+                            "authorized_operation_index", "evidence_task_id",
+                            "evidence_artifact_digest",
+                        }),
+                    }
+                )
+                and (
+                    "evidence_task_id" not in prepared
+                    or (
+                        prepared["evidence_task_id"] == evidence_task_id
+                        and prepared["evidence_artifact_digest"]
+                        == evidence_artifact_digest
+                    )
+                )
                 and all(prepared.get(k) == value for k, value in prepared_expected.items())
             )
 
@@ -3966,8 +4020,15 @@ def controller_wait_task(
         }
         matches_consumed = (
             authorized_operation_index > 0
+            and contract_path_digest is not None
+            and predecessor_receipt_digest is not None
             and consumed_run_id == active_run_id
             and consumed is not None
+            and {
+                "permit_id_digest", "task_id", "run_id",
+                "operation_sequence_digest", "operation_index",
+                "evidence_task_id", "evidence_artifact_digest",
+            }.issubset(consumed)
             and consumed.get("operation_index") == authorized_operation_index - 1
             and consumed.get("permit_id_digest") == predecessor_receipt_digest
             and all(
@@ -3981,6 +4042,8 @@ def controller_wait_task(
             return False
         payload = dict(expected)
         payload["source"] = source
+        if source == "prepared":
+            payload.pop("predecessor_receipt_digest", None)
         _end_run(conn, task_id, outcome="blocked", status="blocked", summary=reason)
         cur = conn.execute(
             "UPDATE tasks SET status = 'blocked', block_kind = ?, "
@@ -4058,6 +4121,12 @@ def controller_wait_binding_matches(
             contract_path_digest = _controller_digest(
                 contract_path_digest, "contract_path_digest"
             )
+        if (
+            isinstance(authorized_operation_index, bool)
+            or not isinstance(authorized_operation_index, int)
+            or authorized_operation_index < 0
+        ):
+            return False
     except ValueError:
         return False
     payload, event_run_id = _latest_event_payload(conn, task_id, "controller_wait")
@@ -4077,22 +4146,60 @@ def controller_wait_binding_matches(
         or event_run_id != latest_id
     ):
         return False
+    source = payload.get("source")
+    if source not in {"prepared", "consumed"}:
+        return False
+    if not isinstance(contract_path_digest, str):
+        return False
     expected = {
         "task_id": task_id,
         "run_id": latest_id,
         "contract_digest": contract_digest,
+        "contract_path_digest": contract_path_digest,
         "operation_sequence_digest": operation_sequence_digest,
         "authorized_operation_index": authorized_operation_index,
         "evidence_task_id": evidence_task_id,
         "evidence_artifact_digest": evidence_artifact_digest,
     }
-    if payload.get("source") == "prepared":
-        expected["contract_path_digest"] = contract_path_digest
+    if source == "prepared":
+        if authorized_operation_index != 0 or "predecessor_receipt_digest" in payload:
+            return False
+        expected_keys = {
+            "task_id", "run_id", "contract_digest", "contract_path_digest",
+            "operation_sequence_digest", "authorized_operation_index",
+            "evidence_task_id", "evidence_artifact_digest", "source",
+        }
+    else:
+        if authorized_operation_index <= 0:
+            return False
+        predecessor = payload.get("predecessor_receipt_digest")
+        if not isinstance(predecessor, str):
+            return False
+        try:
+            _controller_digest(predecessor, "predecessor_receipt_digest")
+        except ValueError:
+            return False
+        expected["predecessor_receipt_digest"] = predecessor
+        expected_keys = {
+            "task_id", "run_id", "contract_digest", "contract_path_digest",
+            "operation_sequence_digest", "authorized_operation_index",
+            "evidence_task_id", "evidence_artifact_digest",
+            "predecessor_receipt_digest", "source",
+        }
+    if set(payload) != expected_keys:
+        return False
     return all(payload.get(key) == value for key, value in expected.items())
 
 
-def resume_controller_wait(conn: sqlite3.Connection, task_id: str) -> bool:
+def resume_controller_wait(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    _capability: object = None,
+) -> bool:
     """Consume a controller wait and return the task to the work pool."""
+    if not isinstance(_capability, _ControllerWaitResumeCapability):
+        return False
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, block_kind, current_run_id FROM tasks WHERE id = ?",
@@ -4104,6 +4211,8 @@ def resume_controller_wait(conn: sqlite3.Connection, task_id: str) -> bool:
             or row["block_kind"] != "controller_wait"
             or row["current_run_id"] is not None
         ):
+            return False
+        if not _capability.consume(task_id):
             return False
         undone = conn.execute(
             "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
@@ -4345,6 +4454,12 @@ def recompute_ready(
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
     with write_txn(conn):
+        # Repair any externally tampered controller-wait status before looking
+        # for runnable work. The block kind is the durable lifecycle guard.
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked' "
+            "WHERE block_kind = 'controller_wait' AND status != 'blocked'"
+        )
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
@@ -4352,14 +4467,18 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            if cur_status == "blocked":
-                block_kind_row = conn.execute(
-                    "SELECT block_kind FROM tasks WHERE id = ?", (task_id,)
-                ).fetchone()
-                if block_kind_row and block_kind_row["block_kind"] == "controller_wait":
-                    # A controller wait is a deliberate one-shot lifecycle
-                    # state. Parent completion must not make it runnable.
-                    continue
+            block_kind_row = conn.execute(
+                "SELECT block_kind FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if block_kind_row and block_kind_row["block_kind"] == "controller_wait":
+                # A controller wait is a deliberate one-shot lifecycle state.
+                # Restore a tampered status to blocked before skipping it.
+                if cur_status != "blocked":
+                    conn.execute(
+                        "UPDATE tasks SET status = 'blocked' WHERE id = ?",
+                        (task_id,),
+                    )
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -4425,6 +4544,18 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        controller_wait = conn.execute(
+            "SELECT status FROM tasks WHERE id = ? AND block_kind = 'controller_wait'",
+            (task_id,),
+        ).fetchone()
+        if controller_wait:
+            if controller_wait["status"] == "ready":
+                conn.execute(
+                    "UPDATE tasks SET status = 'blocked' WHERE id = ? AND status = 'ready'",
+                    (task_id,),
+                )
+            _append_event(conn, task_id, "claim_rejected", {"reason": "controller_wait"})
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -6041,23 +6172,19 @@ def promote_task(
     promotion would succeed without mutating state.
     """
     row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
 
     cur_status = row["status"]
+    if row["block_kind"] == "controller_wait":
+        return False, "controller_wait requires a newly armed permit"
     if cur_status not in ("todo", "blocked"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
             f"'todo' or 'blocked'"
         )
-    if cur_status == "blocked":
-        kind_row = conn.execute(
-            "SELECT block_kind FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
-        if kind_row and kind_row["block_kind"] == "controller_wait":
-            return False, "controller_wait requires a newly armed permit"
 
     if not force:
         parents = conn.execute(
