@@ -1283,6 +1283,128 @@ def test_controller_wait_requires_complete_prepared_and_consumed_bindings(kanban
         assert current is not None and current.status == "running"
 
 
+_CONTROLLER_WAIT_CONSUMED_RECEIPT_FIELDS = (
+    "permit_id_digest",
+    "nonce_digest",
+    "issuer_key_id",
+    "arm_contract_digest",
+    "evidence_task_id",
+    "evidence_artifact_digest",
+    "task_id",
+    "run_id",
+    "profile",
+    "profile_home_digest",
+    "workspace_digest",
+    "source_digest",
+    "destination_digest",
+    "operation_sequence_digest",
+    "operation_index",
+    "command_digest",
+    "decision",
+    "failure_class",
+    "issued_at",
+    "expires_at",
+    "decided_at",
+)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "field"),
+    [
+        ("exact", None),
+        *[("remove", field) for field in _CONTROLLER_WAIT_CONSUMED_RECEIPT_FIELDS],
+        *[("tamper", field) for field in _CONTROLLER_WAIT_CONSUMED_RECEIPT_FIELDS],
+        ("extra", None),
+    ],
+)
+def test_controller_wait_requires_exact_canonical_consumed_receipt(
+    kanban_home, mutation, field,
+):
+    """Only the exact activated receipt can park a consumed continuation."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="controller wait", assignee="bookkeeper", goal_mode=True,
+        )
+        assert kb.claim_task(conn, task_id)
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+        run_id = task.current_run_id
+        binding = {
+            "contract_digest": "1" * 64,
+            "contract_path_digest": "2" * 64,
+            "operation_sequence_digest": "3" * 64,
+            "authorized_operation_index": 1,
+            "evidence_task_id": "evidence",
+            "evidence_artifact_digest": "4" * 64,
+            "predecessor_receipt_digest": "5" * 64,
+        }
+        receipt = {
+            "permit_id_digest": binding["predecessor_receipt_digest"],
+            "nonce_digest": "6" * 64,
+            "issuer_key_id": "7" * 64,
+            "arm_contract_digest": binding["contract_digest"],
+            "evidence_task_id": binding["evidence_task_id"],
+            "evidence_artifact_digest": binding["evidence_artifact_digest"],
+            "task_id": task_id,
+            "run_id": run_id,
+            "profile": "bookkeeper",
+            "profile_home_digest": "8" * 64,
+            "workspace_digest": "9" * 64,
+            "source_digest": "a" * 64,
+            "destination_digest": "b" * 64,
+            "operation_sequence_digest": binding["operation_sequence_digest"],
+            "operation_index": 0,
+            "command_digest": "c" * 64,
+            "decision": "allow",
+            "failure_class": None,
+            "issued_at": 100,
+            "expires_at": 200,
+            "decided_at": 150,
+        }
+        activated = {**receipt, "decision": "issued"}
+        kb.append_terminal_permit_event(
+            "terminal_permit_activated", activated,
+        )
+        if mutation == "remove":
+            receipt.pop(field)
+        elif mutation == "tamper":
+            if field.endswith("_digest") or field == "issuer_key_id":
+                receipt[field] = "f" * 64
+            elif field in {"run_id", "operation_index"}:
+                receipt[field] += 1
+            elif field == "issued_at":
+                receipt[field] = receipt["expires_at"]
+            elif field == "expires_at":
+                receipt[field] = receipt["issued_at"]
+            elif field == "decided_at":
+                receipt[field] = receipt["expires_at"] + 1
+            elif field == "decision":
+                receipt[field] = "deny"
+            elif field == "failure_class":
+                receipt[field] = "tampered"
+            else:
+                receipt[field] = f"{receipt[field]}-tampered"
+        elif mutation == "extra":
+            receipt["unexpected"] = "field"
+        if mutation == "remove" and field == "task_id":
+            kb._append_event(
+                conn, task_id, "terminal_permit_consumed", receipt, run_id=run_id,
+            )
+        else:
+            kb.append_terminal_permit_event("terminal_permit_consumed", receipt)
+
+        expected = mutation == "exact"
+        assert kb.controller_wait_task(conn, task_id, run_id=run_id, **binding) is expected
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == ("blocked" if expected else "running")
+        wait_events = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "controller_wait"
+        ]
+        assert bool(wait_events) is expected
+
+
 def test_controller_wait_binding_rejects_unknown_source_and_bare_resume(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(

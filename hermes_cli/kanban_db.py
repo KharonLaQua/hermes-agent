@@ -3794,6 +3794,47 @@ _CONTROLLER_DIGEST_FIELDS = (
     "evidence_artifact_digest",
 )
 
+_CONTROLLER_WAIT_CONSUMED_RECEIPT_FIELDS = frozenset({
+    "permit_id_digest",
+    "nonce_digest",
+    "issuer_key_id",
+    "arm_contract_digest",
+    "evidence_task_id",
+    "evidence_artifact_digest",
+    "task_id",
+    "run_id",
+    "profile",
+    "profile_home_digest",
+    "workspace_digest",
+    "source_digest",
+    "destination_digest",
+    "operation_sequence_digest",
+    "operation_index",
+    "command_digest",
+    "decision",
+    "failure_class",
+    "issued_at",
+    "expires_at",
+    "decided_at",
+})
+_CONTROLLER_WAIT_CONSUMED_RECEIPT_DIGEST_FIELDS = frozenset({
+    "permit_id_digest",
+    "nonce_digest",
+    "issuer_key_id",
+    "arm_contract_digest",
+    "evidence_artifact_digest",
+    "profile_home_digest",
+    "workspace_digest",
+    "source_digest",
+    "destination_digest",
+    "operation_sequence_digest",
+    "command_digest",
+})
+_CONTROLLER_WAIT_CONSUMED_RECEIPT_IDENTITY_FIELDS = (
+    _CONTROLLER_WAIT_CONSUMED_RECEIPT_FIELDS
+    - {"decision", "failure_class", "decided_at"}
+)
+
 
 def _controller_digest(value: Any, field: str) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
@@ -3942,7 +3983,7 @@ def controller_wait_task(
         raise ValueError("consumed controller wait requires a predecessor receipt")
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, goal_mode, current_run_id FROM tasks WHERE id = ?",
+            "SELECT status, goal_mode, current_run_id, assignee FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if row is None or row["status"] != "running" or not row["goal_mode"]:
@@ -3955,6 +3996,9 @@ def controller_wait_task(
         )
         consumed, consumed_run_id = _latest_event_payload(
             conn, task_id, "terminal_permit_consumed"
+        )
+        activated, activated_run_id = _latest_event_payload(
+            conn, task_id, "terminal_permit_activated"
         )
         expected = {
             "task_id": task_id,
@@ -4010,33 +4054,68 @@ def controller_wait_task(
                 and all(prepared.get(k) == value for k, value in prepared_expected.items())
             )
 
-        consumed_expected = {
-            key: value
-            for key, value in expected.items()
-            if key in {
-                "task_id", "run_id", "operation_sequence_digest",
-                "evidence_task_id", "evidence_artifact_digest",
+        def _matches_consumed() -> bool:
+            if (
+                authorized_operation_index <= 0
+                or predecessor_receipt_digest is None
+                or consumed_run_id != active_run_id
+                or activated_run_id != active_run_id
+                or not isinstance(consumed, dict)
+                or not isinstance(activated, dict)
+                or set(consumed) != _CONTROLLER_WAIT_CONSUMED_RECEIPT_FIELDS
+                or set(activated) != _CONTROLLER_WAIT_CONSUMED_RECEIPT_FIELDS
+                or consumed["decision"] != "allow"
+                or consumed["failure_class"] is not None
+                or activated["decision"] != "issued"
+                or activated["failure_class"] is not None
+                or not all(
+                    isinstance(consumed[field], str) and consumed[field].strip()
+                    for field in ("task_id", "evidence_task_id", "profile")
+                )
+                or any(
+                    isinstance(consumed[field], bool)
+                    or not isinstance(consumed[field], int)
+                    for field in (
+                        "run_id", "operation_index", "issued_at", "expires_at", "decided_at",
+                    )
+                )
+            ):
+                return False
+            try:
+                for field in _CONTROLLER_WAIT_CONSUMED_RECEIPT_DIGEST_FIELDS:
+                    _controller_digest(consumed[field], field)
+            except ValueError:
+                return False
+            if (
+                consumed["expires_at"] <= consumed["issued_at"]
+                or consumed["decided_at"] < consumed["issued_at"]
+                or consumed["decided_at"] > consumed["expires_at"]
+                or not isinstance(row["assignee"], str)
+                or consumed["profile"] != row["assignee"]
+            ):
+                return False
+            expected_consumed = {
+                "permit_id_digest": predecessor_receipt_digest,
+                "arm_contract_digest": contract_digest,
+                "task_id": task_id,
+                "run_id": active_run_id,
+                "operation_sequence_digest": operation_sequence_digest,
+                "operation_index": authorized_operation_index - 1,
+                "evidence_task_id": evidence_task_id,
+                "evidence_artifact_digest": evidence_artifact_digest,
             }
-        }
-        matches_consumed = (
-            authorized_operation_index > 0
-            and contract_path_digest is not None
-            and predecessor_receipt_digest is not None
-            and consumed_run_id == active_run_id
-            and consumed is not None
-            and {
-                "permit_id_digest", "task_id", "run_id",
-                "operation_sequence_digest", "operation_index",
-                "evidence_task_id", "evidence_artifact_digest",
-            }.issubset(consumed)
-            and consumed.get("operation_index") == authorized_operation_index - 1
-            and consumed.get("permit_id_digest") == predecessor_receipt_digest
-            and all(
-                consumed.get(k) == value
-                for k, value in consumed_expected.items()
-                if k != "contract_path_digest"
+            return (
+                all(consumed[field] == value for field, value in expected_consumed.items())
+                and all(
+                    consumed[field] == activated[field]
+                    for field in _CONTROLLER_WAIT_CONSUMED_RECEIPT_IDENTITY_FIELDS
+                )
+                and isinstance(activated["decided_at"], int)
+                and not isinstance(activated["decided_at"], bool)
+                and activated["decided_at"] <= consumed["decided_at"]
             )
-        )
+
+        matches_consumed = _matches_consumed()
         source = "prepared" if _matches_prepared() else "consumed" if matches_consumed else None
         if source is None:
             return False
