@@ -221,7 +221,7 @@ def _clear_controller_schema_caches():
 class TestApiServerScopedKanbanControllers:
     """Real adapter-to-AIAgent regression coverage for controller visibility."""
 
-    def _setup_authorized_context(self, monkeypatch, tmp_path):
+    def _setup_context(self, monkeypatch, tmp_path, *, profile, issuer_profile=None):
         from gateway.config import PlatformConfig
         from gateway.platforms.api_server import APIServerAdapter
         from gateway.session_context import set_session_vars
@@ -235,29 +235,63 @@ class TestApiServerScopedKanbanControllers:
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
         _clear_controller_schema_caches()
-        issuer = ScopedTerminalPermitIssuer(
+        issuer = None
+        try:
+            if issuer_profile is not None:
+                issuer = ScopedTerminalPermitIssuer(
+                    issuer_profile=issuer_profile,
+                    lock_owner_check=lambda: True,
+                )
+                assert install_active_issuer(issuer)
+            set_session_vars(
+                platform="api_server",
+                session_key="kanban-api-session",
+                session_id="kanban-api-session",
+                profile=profile,
+                async_delivery=False,
+            )
+            return APIServerAdapter(PlatformConfig(enabled=True)), issuer
+        except Exception:
+            self._cleanup(issuer)
+            raise
+
+    def _setup_authorized_context(self, monkeypatch, tmp_path):
+        return self._setup_context(
+            monkeypatch,
+            tmp_path,
+            profile="gateway",
             issuer_profile="gateway",
-            lock_owner_check=lambda: True,
         )
-        assert install_active_issuer(issuer)
+
+    @staticmethod
+    def _bind_session_profile(profile):
+        from gateway.session_context import set_session_vars
+
         set_session_vars(
             platform="api_server",
             session_key="kanban-api-session",
             session_id="kanban-api-session",
-            profile="gateway",
+            profile=profile,
             async_delivery=False,
         )
-        return APIServerAdapter(PlatformConfig(enabled=True)), issuer
 
     @staticmethod
     def _cleanup(issuer):
         from gateway.session_context import reset_session_vars
         from hermes_cli.scoped_terminal_permits import uninstall_active_issuer
 
-        reset_session_vars()
-        uninstall_active_issuer(issuer)
-        issuer.close()
-        _clear_controller_schema_caches()
+        try:
+            reset_session_vars()
+        finally:
+            try:
+                if issuer is not None:
+                    uninstall_active_issuer(issuer)
+            finally:
+                try:
+                    if issuer is not None:
+                        issuer.close()
+                finally:
+                    _clear_controller_schema_caches()
 
     def test_create_agent_assembles_only_scoped_controller_tools(self, monkeypatch, tmp_path):
         """The production API config seam reaches actual AIAgent assembly."""
@@ -311,6 +345,7 @@ class TestApiServerScopedKanbanControllers:
             authorized = _controller_tool_names(
                 _create_api_server_kanban_agent(monkeypatch, adapter)
             )
+            assert issuer is not None
             issuer.close()
             closed = _controller_tool_names(
                 _create_api_server_kanban_agent(monkeypatch, adapter)
@@ -320,5 +355,65 @@ class TestApiServerScopedKanbanControllers:
                 "kanban_arm_terminal_permit",
             }
             assert closed == set()
+        finally:
+            self._cleanup(issuer)
+
+    def test_create_agent_refreshes_controllers_after_matching_profile_binds(
+        self, monkeypatch, tmp_path
+    ):
+        """A profile transition from mismatch to the active issuer is fresh."""
+        adapter, issuer = self._setup_context(
+            monkeypatch,
+            tmp_path,
+            profile="other-profile",
+            issuer_profile="gateway",
+        )
+        try:
+            mismatched = _controller_tool_names(
+                _create_api_server_kanban_agent(monkeypatch, adapter)
+            )
+            self._bind_session_profile("gateway")
+            authorized = _controller_tool_names(
+                _create_api_server_kanban_agent(monkeypatch, adapter)
+            )
+            assert mismatched == set()
+            assert authorized == {
+                "kanban_first_prep_resume",
+                "kanban_arm_terminal_permit",
+            }
+        finally:
+            self._cleanup(issuer)
+
+    def test_create_agent_refreshes_controllers_after_new_matching_issuer(
+        self, monkeypatch, tmp_path
+    ):
+        """An issuer transition from absent to active is fresh."""
+        from hermes_cli.scoped_terminal_permits import (
+            ScopedTerminalPermitIssuer,
+            install_active_issuer,
+        )
+
+        adapter, issuer = self._setup_context(
+            monkeypatch,
+            tmp_path,
+            profile="gateway",
+        )
+        try:
+            unavailable = _controller_tool_names(
+                _create_api_server_kanban_agent(monkeypatch, adapter)
+            )
+            issuer = ScopedTerminalPermitIssuer(
+                issuer_profile="gateway",
+                lock_owner_check=lambda: True,
+            )
+            assert install_active_issuer(issuer)
+            authorized = _controller_tool_names(
+                _create_api_server_kanban_agent(monkeypatch, adapter)
+            )
+            assert unavailable == set()
+            assert authorized == {
+                "kanban_first_prep_resume",
+                "kanban_arm_terminal_permit",
+            }
         finally:
             self._cleanup(issuer)

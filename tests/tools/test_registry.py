@@ -5,7 +5,14 @@ import threading
 from pathlib import Path
 from unittest.mock import patch
 
-from tools.registry import ToolRegistry, _module_registers_tools, discover_builtin_tools
+from tools.registry import (
+    ToolRegistry,
+    _check_fn_cache,
+    _check_fn_last_good,
+    _module_registers_tools,
+    discover_builtin_tools,
+    invalidate_check_fn_cache,
+)
 
 
 def _dummy_handler(args, **kwargs):
@@ -177,6 +184,7 @@ class TestGetDefinitions:
 
     def test_context_sensitive_check_bypasses_ttl_while_normal_check_stays_cached(self):
         """Request-bound checks refresh every schema pass without changing TTL checks."""
+        invalidate_check_fn_cache()
         reg = ToolRegistry()
         normal_state = {"calls": 0, "available": True}
         context_state = {"calls": 0, "available": True}
@@ -198,15 +206,22 @@ class TestGetDefinitions:
             handler=_dummy_handler, check_fn=context_check, context_sensitive=True,
         )
 
-        first = reg.get_definitions({"normal", "context"})
-        normal_state["available"] = False
-        context_state["available"] = False
-        second = reg.get_definitions({"normal", "context"})
+        try:
+            first = reg.get_definitions({"normal", "context"})
+            normal_state["available"] = False
+            context_state["available"] = False
+            second = reg.get_definitions({"normal", "context"})
 
-        assert {entry["function"]["name"] for entry in first} == {"normal", "context"}
-        assert {entry["function"]["name"] for entry in second} == {"normal"}
-        assert normal_state["calls"] == 1
-        assert context_state["calls"] == 2
+            assert {entry["function"]["name"] for entry in first} == {"normal", "context"}
+            assert {entry["function"]["name"] for entry in second} == {"normal"}
+            assert normal_state["calls"] == 1
+            assert context_state["calls"] == 2
+        finally:
+            invalidate_check_fn_cache()
+            assert normal_check not in _check_fn_cache
+            assert normal_check not in _check_fn_last_good
+            assert context_check not in _check_fn_cache
+            assert context_check not in _check_fn_last_good
 
 
 class TestUnknownToolDispatch:
