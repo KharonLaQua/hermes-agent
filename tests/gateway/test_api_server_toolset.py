@@ -1,4 +1,5 @@
 """Tests for hermes-api-server toolset and API server tool availability."""
+import pytest
 from unittest.mock import patch, MagicMock
 
 
@@ -203,6 +204,49 @@ def _create_api_server_kanban_agent(monkeypatch, adapter):
         return adapter._create_agent(session_id="kanban-api-session")
 
 
+async def _run_api_server_kanban_agent(adapter, profile):
+    """Assemble a real agent through production ``_run_agent`` binding."""
+    from gateway.platforms.api_server import _api_request_profile
+    from run_agent import AIAgent
+
+    agent_ref = [None]
+
+    def _run_conversation(self, **kwargs):
+        return {"final_response": "captured"}
+
+    token = _api_request_profile.set(profile)
+    try:
+        with patch("gateway.run._resolve_runtime_agent_kwargs") as mock_kwargs, \
+             patch("gateway.run._resolve_gateway_model") as mock_model, \
+             patch("gateway.run._load_gateway_config") as mock_config, \
+             patch("gateway.run.GatewayRunner._load_reasoning_config") as mock_reasoning, \
+             patch("gateway.run.GatewayRunner._load_fallback_model") as mock_fallback, \
+             patch("gateway.run._current_max_iterations") as mock_iterations, \
+             patch.object(adapter, "_ensure_session_db", return_value=None), \
+             patch.object(AIAgent, "run_conversation", new=_run_conversation):
+            mock_kwargs.return_value = {
+                "api_key": "test-key", "base_url": "https://example.test/v1",
+                "provider": "openai", "api_mode": "chat_completions",
+                "command": None, "args": [],
+            }
+            mock_model.return_value = "test/model"
+            mock_config.return_value = {
+                "platform_toolsets": {"api_server": ["kanban"]},
+            }
+            mock_reasoning.return_value = {}
+            mock_fallback.return_value = None
+            mock_iterations.return_value = 1
+            await adapter._run_agent(
+                user_message="capture tools",
+                conversation_history=[],
+                session_id="kanban-api-session",
+                agent_ref=agent_ref,
+            )
+    finally:
+        _api_request_profile.reset(token)
+    return agent_ref[0]
+
+
 def _controller_tool_names(agent):
     return {
         name for name in agent.valid_tool_names
@@ -221,7 +265,9 @@ def _clear_controller_schema_caches():
 class TestApiServerScopedKanbanControllers:
     """Real adapter-to-AIAgent regression coverage for controller visibility."""
 
-    def _setup_context(self, monkeypatch, tmp_path, *, profile, issuer_profile=None):
+    def _setup_context(
+        self, monkeypatch, tmp_path, *, profile, issuer_profile=None, bind_session=True
+    ):
         from gateway.config import PlatformConfig
         from gateway.platforms.api_server import APIServerAdapter
         from gateway.session_context import set_session_vars
@@ -243,13 +289,14 @@ class TestApiServerScopedKanbanControllers:
                     lock_owner_check=lambda: True,
                 )
                 assert install_active_issuer(issuer)
-            set_session_vars(
-                platform="api_server",
-                session_key="kanban-api-session",
-                session_id="kanban-api-session",
-                profile=profile,
-                async_delivery=False,
-            )
+            if bind_session:
+                set_session_vars(
+                    platform="api_server",
+                    session_key="kanban-api-session",
+                    session_id="kanban-api-session",
+                    profile=profile,
+                    async_delivery=False,
+                )
             return APIServerAdapter(PlatformConfig(enabled=True)), issuer
         except Exception:
             self._cleanup(issuer)
@@ -274,6 +321,29 @@ class TestApiServerScopedKanbanControllers:
             profile=profile,
             async_delivery=False,
         )
+
+    @pytest.mark.asyncio
+    async def test_run_agent_binds_request_profile_before_assembling_agent(
+        self, monkeypatch, tmp_path
+    ):
+        """The production async entrypoint carries request profile authorization."""
+        adapter, issuer = self._setup_context(
+            monkeypatch,
+            tmp_path,
+            profile="gateway",
+            issuer_profile="gateway",
+            bind_session=False,
+        )
+        try:
+            (tmp_path / ".hermes" / "profiles" / "gateway").mkdir(parents=True)
+            agent = await _run_api_server_kanban_agent(adapter, "gateway")
+            assert _controller_tool_names(agent) == {
+                "kanban_first_prep_resume",
+                "kanban_arm_terminal_permit",
+            }
+            assert "kanban_prepare_terminal_contract" not in agent.valid_tool_names
+        finally:
+            self._cleanup(issuer)
 
     @staticmethod
     def _cleanup(issuer):

@@ -5674,6 +5674,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        profile: Optional[str] = None,
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -5697,6 +5698,7 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
+            profile=profile,
             async_delivery=False,
         )
 
@@ -5760,6 +5762,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
+                    profile=request_profile,
                 )
                 try:
                     agent = self._create_agent(
@@ -6205,6 +6208,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 chat_id=session_id or "",
                                 session_key=approval_session_key,
                                 session_id=session_id or "",
+                                profile=request_profile,
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             r = agent.run_conversation(
