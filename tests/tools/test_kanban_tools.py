@@ -134,7 +134,7 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     names = {s["function"].get("name") for s in schema if "function" in s}
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
-        "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_show", "kanban_prepare_terminal_contract", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
@@ -216,7 +216,6 @@ def test_arm_terminal_permit_requires_matching_contract_and_evidence_digests(
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
     with kb.connect() as conn:
-        target = kb.create_task(conn, title="target", assignee="gateway")
         evidence = kb.create_task(conn, title="evidence", assignee="reviewer")
         kb.claim_task(conn, evidence)
         assert kb.complete_task(
@@ -224,6 +223,9 @@ def test_arm_terminal_permit_requires_matching_contract_and_evidence_digests(
             evidence,
             summary="evidence",
             metadata={"artifact_sha256": "2" * 64},
+        )
+        target = kb.create_task(
+            conn, title="target", assignee="gateway", initial_status="blocked"
         )
     contract_path, contract_digest = _write_contract(tmp_path, _arm_contract(tmp_path))
     issuer = _install_arm_issuer(monkeypatch)
@@ -258,6 +260,160 @@ def test_arm_terminal_permit_requires_matching_contract_and_evidence_digests(
         assert result["issuer_profile"] == "gateway"
         assert "contract_path" not in result
         assert "source" not in result
+    finally:
+        from gateway.session_context import reset_session_vars
+
+        reset_session_vars()
+        _cleanup_arm_issuer(issuer)
+
+
+def test_authenticated_gateway_can_resume_foreign_bookkeeper_task(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        evidence = kb.create_task(conn, title="evidence", assignee="reviewer")
+        kb.claim_task(conn, evidence)
+        assert kb.complete_task(
+            conn,
+            evidence,
+            summary="evidence",
+            metadata={"artifact_sha256": "2" * 64},
+        )
+        target = kb.create_task(
+            conn, title="bookkeeper", assignee="bookkeeper", initial_status="blocked"
+        )
+    contract_path, contract_digest = _write_contract(
+        tmp_path, _arm_contract(tmp_path, profile="bookkeeper")
+    )
+    issuer = _install_arm_issuer(monkeypatch, profile="gateway")
+    _bind_gateway_session("gateway")
+    args = {
+        "task_id": target,
+        "contract_path": str(contract_path),
+        "contract_sha256": contract_digest,
+        "evidence_task_id": evidence,
+        "evidence_artifact_sha256": "2" * 64,
+    }
+    try:
+        result = json.loads(kt._handle_arm_terminal_permit(args))
+        assert result["ok"] is True
+        with kb.connect() as conn:
+            resumed = kb.get_task(conn, target)
+        assert resumed.status == "ready"
+        assert ("default", target) in issuer._pending
+    finally:
+        from gateway.session_context import reset_session_vars
+
+        reset_session_vars()
+        _cleanup_arm_issuer(issuer)
+
+
+def test_bookkeeper_preparation_writes_only_new_digest_bound_contract(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "bookkeeper")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        target = kb.create_task(
+            conn, title="bookkeeper", assignee="bookkeeper", initial_status="running"
+        )
+        assert kb.claim_task(conn, target)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", target)
+    contract = _arm_contract(tmp_path, profile="bookkeeper")
+    contract["workspace"] = str(workspace)
+    contract["operation_sequence"][0]["cwd"] = str(workspace)
+    contract["operation_sequence"][0]["argv"][2] = str(workspace / "source.bin")
+    source = workspace / "source.bin"
+    source.write_bytes(b"source")
+    output_path = workspace / "prepared.json"
+    result = json.loads(
+        kt._handle_prepare_terminal_contract(
+            {"task_id": target, "contract_path": str(output_path), "contract": contract}
+        )
+    )
+    assert result.get("ok") is True, repr(result)
+    assert output_path.is_file()
+    assert result["contract_digest"] == hashlib.sha256(output_path.read_bytes()).hexdigest()
+    assert "source" not in result
+    assert "s3://" not in result
+
+
+def test_continuation_requires_prior_consumed_operation_receipt(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.scoped_terminal_permits import _canonical_bytes, _normalize_contract
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        evidence = kb.create_task(conn, title="evidence", assignee="reviewer")
+        kb.claim_task(conn, evidence)
+        assert kb.complete_task(
+            conn,
+            evidence,
+            summary="receipt",
+            metadata={"artifact_sha256": "2" * 64},
+        )
+        target = kb.create_task(
+            conn, title="bookkeeper", assignee="bookkeeper", initial_status="blocked"
+        )
+    contract = _arm_contract(tmp_path, profile="bookkeeper")
+    contract["operation_sequence"].append(dict(contract["operation_sequence"][0], index=1))
+    contract["authorized_operation_index"] = 1
+    contract["predecessor_receipt_digest"] = "2" * 64
+    normalized = _normalize_contract(contract)
+    sequence_digest = hashlib.sha256(_canonical_bytes(normalized["operation_sequence"])).hexdigest()
+    source_digest = hashlib.sha256(_canonical_bytes(normalized["source"])).hexdigest()
+    destination_digest = hashlib.sha256(_canonical_bytes(normalized["destination"])).hexdigest()
+    kb.append_terminal_permit_event(
+        "terminal_permit_consumed",
+        {
+            "permit_id_digest": "3" * 64,
+            "task_id": target,
+            "run_id": 17,
+            "operation_sequence_digest": sequence_digest,
+            "operation_index": 0,
+            "source_digest": source_digest,
+            "destination_digest": destination_digest,
+            "profile": "bookkeeper",
+            "command_digest": normalized["command_digest"],
+            "evidence_task_id": evidence,
+            "evidence_artifact_digest": "2" * 64,
+        },
+    )
+    contract["predecessor_receipt_digest"] = "3" * 64
+    contract_path, contract_digest = _write_contract(tmp_path, contract)
+    issuer = _install_arm_issuer(monkeypatch, profile="gateway")
+    _bind_gateway_session("gateway")
+    args = {
+        "task_id": target,
+        "contract_path": str(contract_path),
+        "contract_sha256": contract_digest,
+        "evidence_task_id": evidence,
+        "evidence_artifact_sha256": "2" * 64,
+    }
+    try:
+        result = json.loads(kt._handle_arm_terminal_permit(args))
+        assert result["ok"] is True
     finally:
         from gateway.session_context import reset_session_vars
 

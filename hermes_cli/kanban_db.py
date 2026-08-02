@@ -3733,6 +3733,34 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     return out
 
 
+def latest_terminal_permit_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    kind: str = "terminal_permit_consumed",
+) -> Optional[Event]:
+    """Return the newest digest-only permit receipt for a task."""
+    row = conn.execute(
+        "SELECT * FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id, kind),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else None
+    except Exception:
+        payload = None
+    return Event(
+        id=row["id"],
+        task_id=row["task_id"],
+        kind=row["kind"],
+        payload=payload,
+        created_at=row["created_at"],
+        run_id=(int(row["run_id"]) if "run_id" in row.keys() and row["run_id"] is not None else None),
+    )
+
+
 def _append_event(
     conn: sqlite3.Connection,
     task_id: str,

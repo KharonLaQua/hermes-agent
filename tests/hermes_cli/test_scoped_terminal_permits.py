@@ -16,6 +16,7 @@ from hermes_cli.scoped_terminal_permits import (
     ScopedTerminalPermitIssuer,
     claim_worker_permit_channel,
     consume_scoped_terminal_permit,
+    prepare_scoped_terminal_contract,
     prepare_scoped_terminal_permit,
 )
 
@@ -56,7 +57,7 @@ def _contract(tmp_path):
             "expected_size_bytes": len(b"reviewed"),
             "content_sha256": hashlib.sha256(b"reviewed").hexdigest(),
             "manifest_path": str(manifest),
-            "manifest_sha256": _HEX_A,
+            "manifest_sha256": hashlib.sha256(b"[]").hexdigest(),
         },
         "destination": {
             "kind": "rclone_remote",
@@ -67,6 +68,27 @@ def _contract(tmp_path):
         "predecessor_receipt_digest": None,
         "command_digest": _HEX_B,
     }
+
+
+def test_prepare_scoped_terminal_contract_returns_canonical_digest_only_artifact(
+    tmp_path,
+):
+    contract = _contract(tmp_path)
+    prepared = prepare_scoped_terminal_contract(contract)
+
+    assert prepared.contract_digest == hashlib.sha256(prepared.canonical_bytes).hexdigest()
+    assert json.loads(prepared.canonical_bytes) == prepared.contract
+    assert prepared.operation_sequence_digest == hashlib.sha256(
+        json.dumps(
+            contract["operation_sequence"],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert prepared.source_size_bytes == len(b"reviewed")
+    assert prepared.source_content_sha256 == hashlib.sha256(b"reviewed").hexdigest()
+    assert "reviewed" not in prepared.readback_json
 
 
 @pytest.fixture
@@ -188,6 +210,26 @@ def test_issuer_requires_and_retains_dispatcher_ownership(monkeypatch, tmp_path)
             evidence_artifact_digest=_HEX_A,
         )
     assert exc.value.failure_class == "issuer_unavailable"
+
+
+def test_arm_and_resume_cancels_pending_arm_when_resume_fails(permit_factory, tmp_path):
+    _, issuer, _, events, _ = permit_factory
+
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        issuer.arm_and_resume(
+            board_slug="default",
+            task_id="t_resume_failed",
+            contract=_contract(tmp_path),
+            ttl_seconds=60,
+            evidence_task_id="t_evidence",
+            evidence_artifact_digest=_HEX_A,
+            resume=lambda: False,
+        )
+
+    assert exc.value.failure_class == "resume_failed"
+    assert issuer._pending == {}
+    assert events[-1][0] == "terminal_permit_cancelled"
+    assert events[-1][1]["failure_class"] == "resume_failed"
 
 
 def test_arm_copies_an_immutable_normalized_contract(permit_factory, tmp_path):

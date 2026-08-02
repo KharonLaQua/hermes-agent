@@ -15,6 +15,7 @@ import re
 import secrets
 import shlex
 import socket
+import stat
 import threading
 import time
 from dataclasses import dataclass
@@ -160,6 +161,20 @@ class PreparedPermitTicket:
             f"permit_id_digest={self._permit_id_digest!r}, "
             f"operation_index={self._operation_index})"
         )
+
+
+@dataclass(frozen=True)
+class PreparedTerminalContract:
+    """Non-authorizing, digest-only preparation result for a typed contract."""
+
+    contract: dict[str, Any]
+    canonical_bytes: bytes
+    contract_digest: str
+    operation_sequence_digest: str
+    source_size_bytes: int
+    source_content_sha256: str | None
+    manifest_sha256: str | None
+    readback_json: str
 
 
 @dataclass(frozen=True)
@@ -534,6 +549,114 @@ def _normalize_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
     return copied
 
 
+def _read_preparation_file_digest(path: str) -> tuple[int, str]:
+    """Read one canonical regular file for non-destructive preparation."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ScopedTerminalPermitError("preparation_source_unreadable") from exc
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ScopedTerminalPermitError("preparation_source_unreadable")
+        try:
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                size += len(chunk)
+        except OSError as exc:
+            raise ScopedTerminalPermitError("preparation_source_changed") from exc
+    finally:
+        os.close(fd)
+    if size != info.st_size:
+        raise ScopedTerminalPermitError("preparation_source_changed")
+    return size, digest.hexdigest()
+
+
+def _preparation_source_readback(source: Mapping[str, Any]) -> tuple[int, str | None, str | None]:
+    """Verify declared source metadata without writing or executing anything."""
+    path = source["canonical_path"]
+    try:
+        info = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise ScopedTerminalPermitError("preparation_source_unreadable") from exc
+    if source["kind"] == "file" or source["kind"] == "manifest":
+        if not stat.S_ISREG(info.st_mode):
+            raise ScopedTerminalPermitError("preparation_source_unreadable")
+        size, digest = _read_preparation_file_digest(path)
+    elif source["kind"] == "directory":
+        if not stat.S_ISDIR(info.st_mode):
+            raise ScopedTerminalPermitError("preparation_source_unreadable")
+        size = 0
+        for root, dirs, files in os.walk(path, followlinks=False):
+            for name in dirs:
+                if stat.S_ISLNK(os.lstat(os.path.join(root, name)).st_mode):
+                    raise ScopedTerminalPermitError("preparation_source_unreadable")
+            dirs[:] = sorted(dirs)
+            for name in sorted(files):
+                child = os.path.join(root, name)
+                child_info = os.lstat(child)
+                if not stat.S_ISREG(child_info.st_mode):
+                    raise ScopedTerminalPermitError("preparation_source_unreadable")
+                size += child_info.st_size
+        digest = None
+    else:  # pragma: no cover - _normalize_contract owns this check.
+        raise ScopedTerminalPermitError("malformed")
+    if size != source["expected_size_bytes"]:
+        raise ScopedTerminalPermitError("preparation_size_mismatch")
+    expected_content = source["content_sha256"]
+    if expected_content is not None and digest != expected_content:
+        raise ScopedTerminalPermitError("preparation_hash_mismatch")
+    manifest_digest = None
+    if source["manifest_path"] is not None:
+        _, manifest_digest = _read_preparation_file_digest(source["manifest_path"])
+        if manifest_digest != source["manifest_sha256"]:
+            raise ScopedTerminalPermitError("preparation_manifest_mismatch")
+    return size, digest, manifest_digest
+
+
+def prepare_scoped_terminal_contract(
+    contract: Mapping[str, Any],
+) -> PreparedTerminalContract:
+    """Validate and read back an exact contract without arming or executing it.
+
+    This is deliberately a pure preparation boundary: it may read the declared
+    source and manifest to verify size/digests, but it never grants authority,
+    opens a network connection, invokes a subprocess, or mutates storage.
+    """
+    normalized = _normalize_contract(contract)
+    source_size, content_digest, manifest_digest = _preparation_source_readback(
+        normalized["source"]
+    )
+    canonical = _canonical_bytes(normalized)
+    sequence_digest = _digest(_canonical_bytes(normalized["operation_sequence"]))
+    readback = _canonical_bytes(
+        {
+            "contract_digest": _digest(canonical),
+            "operation_sequence_digest": sequence_digest,
+            "authorized_operation_index": normalized["authorized_operation_index"],
+            "source_size_bytes": source_size,
+            "source_content_sha256": content_digest,
+            "manifest_sha256": manifest_digest,
+        }
+    ).decode("utf-8")
+    return PreparedTerminalContract(
+        contract=normalized,
+        canonical_bytes=canonical,
+        contract_digest=_digest(canonical),
+        operation_sequence_digest=sequence_digest,
+        source_size_bytes=source_size,
+        source_content_sha256=content_digest,
+        manifest_sha256=manifest_digest,
+        readback_json=readback,
+    )
+
+
 def _validate_payload(payload: dict[str, Any]) -> None:
     if set(payload) != _PAYLOAD_FIELDS or payload.get("version") != 1:
         raise ScopedTerminalPermitError("malformed")
@@ -747,6 +870,64 @@ class ScopedTerminalPermitIssuer:
                 issuer_profile=self.issuer_profile,
                 expires_at=now + ttl_seconds,
             )
+
+    def cancel_pending_arm(
+        self,
+        *,
+        board_slug: str,
+        task_id: str,
+        failure_class: str = "resume_failed",
+    ) -> bool:
+        """Spend a pending arm when the paired task resume cannot commit."""
+        with self._lock:
+            board = _require_text(board_slug).strip().lower()
+            task = _require_text(task_id)
+            arm = self._pending.pop((board, task), None)
+            if arm is None:
+                return False
+            now = int(self._clock())
+            try:
+                self._write_audit(
+                    "terminal_permit_cancelled",
+                    self._audit_for_arm(arm, now, failure_class),
+                )
+            except Exception:
+                raise ScopedTerminalPermitError("audit_failed") from None
+            return True
+
+    def arm_and_resume(
+        self,
+        *,
+        board_slug: str,
+        task_id: str,
+        contract: Mapping[str, Any],
+        ttl_seconds: int,
+        evidence_task_id: str,
+        evidence_artifact_digest: str,
+        resume: Callable[[], bool],
+    ) -> ArmReceipt:
+        """Arm and resume one task, cancelling authority if resume fails."""
+        with self._lock:
+            receipt = self.arm_next_run(
+                board_slug=board_slug,
+                task_id=task_id,
+                contract=contract,
+                ttl_seconds=ttl_seconds,
+                evidence_task_id=evidence_task_id,
+                evidence_artifact_digest=evidence_artifact_digest,
+            )
+            try:
+                resumed = resume()
+            except Exception:
+                resumed = False
+            if not resumed:
+                self.cancel_pending_arm(
+                    board_slug=board_slug,
+                    task_id=task_id,
+                    failure_class="resume_failed",
+                )
+                raise ScopedTerminalPermitError("resume_failed")
+            return receipt
 
     def activate_for_spawn(
         self,

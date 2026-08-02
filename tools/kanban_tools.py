@@ -429,6 +429,92 @@ def _check_arm_terminal_permit() -> bool:
     return profile is not None and profile == issuer.issuer_profile
 
 
+def _check_prepare_terminal_contract() -> bool:
+    """Expose preparation only to the current dispatcher-owned worker."""
+    return bool(
+        os.environ.get("HERMES_KANBAN_TASK")
+        and not _is_delegated_child_context()
+    )
+
+
+def _write_prepared_contract_once(path_value: Any, data: bytes, workspace: str) -> str:
+    """Create one private contract artifact under the worker workspace."""
+    if not isinstance(path_value, str) or not os.path.isabs(path_value):
+        raise ValueError("contract_path must be an absolute path")
+    if os.path.realpath(path_value) != path_value:
+        raise ValueError("contract_path must not contain symlink components")
+    if os.path.dirname(path_value) != workspace:
+        raise ValueError("contract_path must be directly under the signed workspace")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path_value, flags, 0o600)
+    except OSError as exc:
+        raise ValueError("contract_path is not a new workspace file") from exc
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise ValueError("contract artifact write failed")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return path_value
+
+
+def _handle_prepare_terminal_contract(args: dict, **kw) -> str:
+    """Prepare a typed, non-authorizing contract and return safe read-back."""
+    if not isinstance(args, dict) or not _check_prepare_terminal_contract():
+        return tool_error("kanban_prepare_terminal_contract: unavailable in this context")
+    task_id = _default_task_id(args.get("task_id"))
+    contract_path = args.get("contract_path")
+    contract = args.get("contract")
+    if not task_id or not isinstance(contract_path, str) or not isinstance(contract, dict):
+        return tool_error("kanban_prepare_terminal_contract: required arguments are invalid")
+    if task_id != os.environ.get("HERMES_KANBAN_TASK"):
+        return tool_error("kanban_prepare_terminal_contract: task ownership mismatch")
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.scoped_terminal_permits import prepare_scoped_terminal_contract
+
+        selected_board = kb._normalize_board_slug(args.get("board")) or kb.get_current_board()
+        _, conn = _connect(board=selected_board)
+        try:
+            task = kb.get_task(conn, task_id)
+            if task is None or task.status != "running":
+                return tool_error("kanban_prepare_terminal_contract: task is not running")
+            worker_profile = _normalize_profile(os.environ.get("HERMES_PROFILE"))
+            task_profile = _normalize_profile(task.assignee)
+            if not worker_profile or worker_profile != task_profile:
+                return tool_error("kanban_prepare_terminal_contract: worker profile mismatch")
+            workspace = os.path.realpath(os.environ.get("HERMES_KANBAN_WORKSPACE", ""))
+            if not workspace or not os.path.isdir(workspace):
+                return tool_error("kanban_prepare_terminal_contract: workspace unavailable")
+            if contract.get("profile", "").strip().lower() != worker_profile:
+                return tool_error("kanban_prepare_terminal_contract: contract profile mismatch")
+            if contract.get("workspace") != workspace:
+                return tool_error("kanban_prepare_terminal_contract: workspace mismatch")
+            prepared = prepare_scoped_terminal_contract(contract)
+            _write_prepared_contract_once(contract_path, prepared.canonical_bytes, workspace)
+        finally:
+            conn.close()
+        return _ok(
+            task_id=task_id,
+            contract_path_digest=hashlib.sha256(contract_path.encode()).hexdigest(),
+            contract_digest=prepared.contract_digest,
+            operation_sequence_digest=prepared.operation_sequence_digest,
+            authorized_operation_index=prepared.contract["authorized_operation_index"],
+            predecessor_receipt_digest=prepared.contract["predecessor_receipt_digest"],
+            source_size_bytes=prepared.source_size_bytes,
+            source_content_sha256=prepared.source_content_sha256,
+            manifest_sha256=prepared.manifest_sha256,
+        )
+    except Exception as exc:
+        failure = getattr(exc, "failure_class", None) or str(exc)
+        return tool_error(f"kanban_prepare_terminal_contract: {failure}")
+
+
 def _read_arm_contract_once(path_value: Any) -> bytes:
     """Read one absolute, regular, non-symlink contract file under the cap."""
     if not isinstance(path_value, str) or not os.path.isabs(path_value):
@@ -489,6 +575,7 @@ def _handle_arm_terminal_permit(args: dict, **kw) -> str:
     try:
         from hermes_cli import kanban_db as kb
         from hermes_cli.scoped_terminal_permits import (
+            _canonical_bytes,
             _normalize_contract,
             _parse_canonical,
         )
@@ -501,8 +588,6 @@ def _handle_arm_terminal_permit(args: dict, **kw) -> str:
         if not hmac.compare_digest(actual_contract_digest, contract_sha256):
             return tool_error("kanban_arm_terminal_permit: contract digest mismatch")
         contract = _normalize_contract(_parse_canonical(contract_bytes))
-        if contract["profile"] != profile:
-            return tool_error("kanban_arm_terminal_permit: contract profile mismatch")
 
         _, conn = _connect(board=selected_board)
         try:
@@ -510,10 +595,10 @@ def _handle_arm_terminal_permit(args: dict, **kw) -> str:
             evidence = kb.get_task(conn, evidence_task_id)
             if target is None or evidence is None:
                 return tool_error("kanban_arm_terminal_permit: task not found")
-            if target.status == "running":
-                return tool_error("kanban_arm_terminal_permit: target is already running")
+            if target.status != "blocked":
+                return tool_error("kanban_arm_terminal_permit: target is not blocked")
             target_profile = _normalize_profile(target.assignee)
-            if target_profile is None or target_profile.lower() != profile:
+            if target_profile is None or contract["profile"] != target_profile.lower():
                 return tool_error("kanban_arm_terminal_permit: target assignee mismatch")
             if evidence.status != "done":
                 return tool_error("kanban_arm_terminal_permit: evidence is not complete")
@@ -525,16 +610,57 @@ def _handle_arm_terminal_permit(args: dict, **kw) -> str:
                 or not hmac.compare_digest(recorded_digest, evidence_digest)
             ):
                 return tool_error("kanban_arm_terminal_permit: evidence digest mismatch")
+            if contract["authorized_operation_index"] > 0:
+                prior = kb.latest_terminal_permit_event(conn, task_id)
+                prior_payload = prior.payload if prior is not None else None
+                expected_sequence = hashlib.sha256(
+                    _canonical_bytes(contract["operation_sequence"])
+                ).hexdigest()
+                expected_source = hashlib.sha256(
+                    _canonical_bytes(contract["source"])
+                ).hexdigest()
+                expected_destination = hashlib.sha256(
+                    _canonical_bytes(contract["destination"])
+                ).hexdigest()
+                if (
+                    not isinstance(prior_payload, dict)
+                    or not isinstance(prior_payload.get("permit_id_digest"), str)
+                    or not hmac.compare_digest(
+                        prior_payload["permit_id_digest"],
+                        contract["predecessor_receipt_digest"],
+                    )
+                    or prior_payload.get("operation_index")
+                    != contract["authorized_operation_index"] - 1
+                    or prior_payload.get("operation_sequence_digest") != expected_sequence
+                    or prior_payload.get("source_digest") != expected_source
+                    or prior_payload.get("destination_digest") != expected_destination
+                    or prior_payload.get("profile") != contract["profile"]
+                    or prior_payload.get("command_digest") != contract["command_digest"]
+                    or prior_payload.get("evidence_task_id") != evidence_task_id
+                    or prior_payload.get("evidence_artifact_digest") != evidence_digest
+                ):
+                    return tool_error("kanban_arm_terminal_permit: predecessor receipt mismatch")
         finally:
             conn.close()
 
-        receipt = issuer.arm_next_run(
+        def _resume_target() -> bool:
+            _, resume_conn = _connect(board=selected_board)
+            try:
+                current = kb.get_task(resume_conn, task_id)
+                if current is None or current.status != "blocked":
+                    return False
+                return kb.unblock_task(resume_conn, task_id)
+            finally:
+                resume_conn.close()
+
+        receipt = issuer.arm_and_resume(
             board_slug=selected_board,
             task_id=task_id,
             contract=contract,
             ttl_seconds=issuer.max_ttl_seconds,
             evidence_task_id=evidence_task_id,
             evidence_artifact_digest=evidence_digest,
+            resume=_resume_target,
         )
         return _ok(
             arm_id_digest=receipt.arm_id_digest,
@@ -1622,6 +1748,35 @@ def _board_schema_prop() -> dict[str, str]:
     """
     return {"type": "string", "description": _DESC_BOARD}
 
+
+KANBAN_PREPARE_TERMINAL_CONTRACT_SCHEMA = {
+    "name": "kanban_prepare_terminal_contract",
+    "description": (
+        "Prepare one typed, exact terminal operation contract for the current "
+        "worker task. This is non-destructive and read-only except for creating "
+        "a new private contract artifact directly in the signed workspace; it "
+        "never arms, resumes, executes, uploads, or deletes. Returns only "
+        "digests, sizes, and operation-index metadata."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "contract_path": {
+                "type": "string",
+                "description": "New absolute contract artifact path directly under the worker workspace.",
+            },
+            "contract": {
+                "type": "object",
+                "description": "Typed contract fields; no card prose or shell command is interpreted.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["contract_path", "contract"],
+    },
+}
+
+
 KANBAN_ARM_TERMINAL_PERMIT_SCHEMA = {
     "name": "kanban_arm_terminal_permit",
     "description": (
@@ -2244,6 +2399,15 @@ KANBAN_LINK_SCHEMA = {
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
+
+registry.register(
+    name="kanban_prepare_terminal_contract",
+    toolset="kanban",
+    schema=KANBAN_PREPARE_TERMINAL_CONTRACT_SCHEMA,
+    handler=_handle_prepare_terminal_contract,
+    check_fn=_check_prepare_terminal_contract,
+    emoji="🧾",
+)
 
 registry.register(
     name="kanban_arm_terminal_permit",
