@@ -134,7 +134,7 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     names = {s["function"].get("name") for s in schema if "function" in s}
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
-        "kanban_show", "kanban_prepare_terminal_contract", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_show", "kanban_preflight_terminal_contract", "kanban_prepare_terminal_contract", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
@@ -653,6 +653,175 @@ def test_bookkeeper_preparation_writes_only_new_digest_bound_contract(monkeypatc
     assert result["contract_digest"] == hashlib.sha256(output_path.read_bytes()).hexdigest()
     assert "source" not in result
     assert "s3://" not in result
+
+
+def test_bookkeeper_manifest_preparation_writes_manifest_before_contract(monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    root = tmp_path / "source-root"
+    root.mkdir()
+    (root / "safe.txt").write_text("safe", encoding="utf-8")
+    secret_value = "sk-live-012345678901234567890123"
+    (root / "secret.txt").write_text(f'API_KEY="{secret_value}"', encoding="utf-8")
+    manifest_path = workspace / "members.json"
+    contract_path = workspace / "contract.json"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "bookkeeper")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        target = kb.create_task(
+            conn, title="bookkeeper", assignee="bookkeeper", initial_status="running"
+        )
+        assert kb.claim_task(conn, target)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", target)
+    contract = {
+        "profile": "bookkeeper",
+        "profile_home": str(tmp_path / "profile"),
+        "workspace": str(workspace),
+        "source": {
+            "kind": "directory",
+            "canonical_path": str(root),
+            "expected_size_bytes": None,
+            "content_sha256": None,
+            "manifest_path": str(manifest_path),
+            "manifest_sha256": None,
+        },
+        "destination": {"kind": "rclone_remote", "canonical_uri": "vault:archive"},
+        "operation_sequence": [{
+            "index": 0,
+            "kind": "manifest_prepare",
+            "argv": ["manifest", "prepare"],
+            "cwd": str(workspace),
+            "background": False,
+            "pty": False,
+            "source_ref": "source",
+            "destination_ref": "destination",
+            "manifest_ref": "manifest",
+            "execution_context_digest": "0" * 64,
+        }],
+        "authorized_operation_index": 0,
+        "predecessor_receipt_digest": None,
+        "command_digest": "1" * 64,
+    }
+    result = json.loads(
+        kt._handle_prepare_terminal_contract(
+            {"task_id": target, "contract_path": str(contract_path), "contract": contract}
+        )
+    )
+    assert result["ok"] is True, repr(result)
+    assert manifest_path.is_file() and contract_path.is_file()
+    assert secret_value.encode() not in manifest_path.read_bytes()
+    prepared = json.loads(contract_path.read_text(encoding="utf-8"))
+    assert prepared["source"]["manifest_sha256"] == hashlib.sha256(
+        manifest_path.read_bytes()
+    ).hexdigest()
+    assert all(secret_value not in json.dumps(operation) for operation in prepared["operation_sequence"])
+
+
+def test_bookkeeper_preflight_derives_digests_without_contract_or_permit_write(
+    monkeypatch, tmp_path,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "source.bin"
+    source.write_bytes(b"source")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "bookkeeper")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        target = kb.create_task(
+            conn, title="bookkeeper", assignee="bookkeeper", initial_status="running"
+        )
+        assert kb.claim_task(conn, target)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", target)
+    draft = _arm_contract(tmp_path, profile="bookkeeper")
+    draft["workspace"] = str(workspace)
+    draft["source"].update(
+        {
+            "canonical_path": str(source),
+            "expected_size_bytes": None,
+            "content_sha256": None,
+            "manifest_sha256": None,
+        }
+    )
+    draft["operation_sequence"][0]["cwd"] = str(workspace)
+    draft["operation_sequence"][0]["argv"][2] = str(source)
+
+    result = json.loads(
+        kt._handle_preflight_terminal_contract({"task_id": target, "contract": draft})
+    )
+
+    assert result["ok"] is True
+    assert result["task_id"] == target
+    assert result["source_size_bytes"] == len(b"source")
+    assert result["source_content_sha256"] == hashlib.sha256(b"source").hexdigest()
+    assert "source" not in result
+    assert sorted(path.name for path in workspace.iterdir()) == ["source.bin"]
+    with kb.connect() as conn:
+        current = kb.get_task(conn, target)
+        assert current is not None and current.status == "running"
+
+
+@pytest.mark.parametrize("failure", ["profile", "delegated_child"])
+def test_bookkeeper_preflight_rejects_untrusted_worker_contexts(monkeypatch, tmp_path, failure):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "source.bin"
+    source.write_bytes(b"source")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "bookkeeper")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        target = kb.create_task(
+            conn, title="bookkeeper", assignee="bookkeeper", initial_status="running"
+        )
+        assert kb.claim_task(conn, target)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", target)
+    draft = _arm_contract(tmp_path, profile="bookkeeper")
+    draft["workspace"] = str(workspace)
+    draft["source"].update(
+        {
+            "canonical_path": str(source),
+            "expected_size_bytes": None,
+            "content_sha256": None,
+            "manifest_sha256": None,
+        }
+    )
+    draft["operation_sequence"][0]["cwd"] = str(workspace)
+    draft["operation_sequence"][0]["argv"][2] = str(source)
+    if failure == "profile":
+        monkeypatch.setenv("HERMES_PROFILE", "other")
+    else:
+        monkeypatch.setattr(kt, "_is_delegated_child_context", lambda: True)
+
+    result = json.loads(
+        kt._handle_preflight_terminal_contract({"task_id": target, "contract": draft})
+    )
+
+    expected = "worker profile mismatch" if failure == "profile" else "unavailable in this context"
+    assert expected in result["error"]
+    assert source.read_bytes() == b"source"
 
 
 def test_continuation_requires_prior_consumed_operation_receipt(monkeypatch, tmp_path):
@@ -2738,7 +2907,13 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     assert "kanban_show()" in prompt
     assert "kanban_complete" in prompt
     assert "kanban_block" in prompt
+    assert "Enforcer FAIL: reuse released candidate" in prompt
     assert "kanban_create" in prompt
+    assert "dependency-gated reviewer" in prompt
+    assert "owning Enforcer lead" in prompt
+    assert "candidate-ready" in prompt
+    assert "five minutes" in prompt
+    assert "ten minutes" in prompt
     # Anti-shell guidance
     assert "Do not shell out" in prompt or "tools — they work" in prompt
 

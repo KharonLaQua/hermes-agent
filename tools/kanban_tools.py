@@ -474,6 +474,30 @@ def _write_prepared_contract_once(path_value: Any, data: bytes, workspace: str) 
     return path_value
 
 
+def _write_prepared_manifest_once(path_value: Any, data: bytes, workspace: str) -> str:
+    """Create one private immutable member manifest beside the contract."""
+    if not isinstance(path_value, str) or not os.path.isabs(path_value):
+        raise ValueError("manifest_path must be an absolute path")
+    if os.path.realpath(path_value) != path_value or os.path.dirname(path_value) != workspace:
+        raise ValueError("manifest_path must be directly under the signed workspace")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path_value, flags, 0o600)
+    except OSError as exc:
+        raise ValueError("manifest_path is not a new workspace file") from exc
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise ValueError("manifest artifact write failed")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return path_value
+
+
 def _handle_prepare_terminal_contract(args: dict, **kw) -> str:
     """Prepare a typed, non-authorizing contract and return safe read-back."""
     if not isinstance(args, dict) or not _check_prepare_terminal_contract():
@@ -507,6 +531,12 @@ def _handle_prepare_terminal_contract(args: dict, **kw) -> str:
             if contract.get("workspace") != workspace:
                 return tool_error("kanban_prepare_terminal_contract: workspace mismatch")
             prepared = prepare_scoped_terminal_contract(contract)
+            if prepared.manifest_bytes is not None:
+                _write_prepared_manifest_once(
+                    prepared.contract["source"]["manifest_path"],
+                    prepared.manifest_bytes,
+                    workspace,
+                )
             _write_prepared_contract_once(contract_path, prepared.canonical_bytes, workspace)
             if task.current_run_id is not None and not kb.record_controller_contract_prepared(
                 conn,
@@ -538,6 +568,55 @@ def _handle_prepare_terminal_contract(args: dict, **kw) -> str:
     except Exception as exc:
         failure = getattr(exc, "failure_class", None) or str(exc)
         return tool_error(f"kanban_prepare_terminal_contract: {failure}")
+
+
+def _handle_preflight_terminal_contract(args: dict, **kw) -> str:
+    """Derive only the source/sequence digests for one worker-owned draft."""
+    if not isinstance(args, dict) or not _check_prepare_terminal_contract():
+        return tool_error("kanban_preflight_terminal_contract: unavailable in this context")
+    task_id = _default_task_id(args.get("task_id"))
+    contract = args.get("contract")
+    if not task_id or not isinstance(contract, dict):
+        return tool_error("kanban_preflight_terminal_contract: required arguments are invalid")
+    if task_id != os.environ.get("HERMES_KANBAN_TASK"):
+        return tool_error("kanban_preflight_terminal_contract: task ownership mismatch")
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.scoped_terminal_permits import preflight_scoped_terminal_contract
+
+        selected_board = kb._normalize_board_slug(args.get("board")) or kb.get_current_board()
+        _, conn = _connect(board=selected_board)
+        try:
+            task = kb.get_task(conn, task_id)
+            if task is None or task.status != "running":
+                return tool_error("kanban_preflight_terminal_contract: task is not running")
+            worker_profile = _normalize_profile(os.environ.get("HERMES_PROFILE"))
+            task_profile = _normalize_profile(task.assignee)
+            if not worker_profile or worker_profile != task_profile:
+                return tool_error("kanban_preflight_terminal_contract: worker profile mismatch")
+            workspace = os.path.realpath(os.environ.get("HERMES_KANBAN_WORKSPACE", ""))
+            if not workspace or not os.path.isdir(workspace):
+                return tool_error("kanban_preflight_terminal_contract: workspace unavailable")
+            if contract.get("profile", "").strip().lower() != worker_profile:
+                return tool_error("kanban_preflight_terminal_contract: contract profile mismatch")
+            if contract.get("workspace") != workspace:
+                return tool_error("kanban_preflight_terminal_contract: workspace mismatch")
+            prepared = preflight_scoped_terminal_contract(contract)
+        finally:
+            conn.close()
+        return _ok(
+            task_id=task_id,
+            contract_digest=prepared.contract_digest,
+            operation_sequence_digest=prepared.operation_sequence_digest,
+            authorized_operation_index=prepared.contract["authorized_operation_index"],
+            predecessor_receipt_digest=prepared.contract["predecessor_receipt_digest"],
+            source_size_bytes=prepared.source_size_bytes,
+            source_content_sha256=prepared.source_content_sha256,
+            manifest_sha256=prepared.manifest_sha256,
+        )
+    except Exception as exc:
+        failure = getattr(exc, "failure_class", None) or str(exc)
+        return tool_error(f"kanban_preflight_terminal_contract: {failure}")
 
 
 def _handle_first_prep_resume(args: dict, **kw) -> str:
@@ -1230,6 +1309,7 @@ def _handle_block(args: dict, **kw) -> str:
                 conn, tid,
                 reason=reason,
                 kind=kind,
+                wait_on=args.get("wait_on"),
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -1630,6 +1710,7 @@ def _handle_create(args: dict, **kw) -> str:
     if bool_error:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
+    candidate_reuse_justification = args.get("candidate_reuse_justification")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
@@ -1668,11 +1749,19 @@ def _handle_create(args: dict, **kw) -> str:
                     if _self_task is not None and _self_task.project_id:
                         project_id = _self_task.project_id
                         project_source_task_id = _self_task.id
+            source_task_id = os.environ.get("HERMES_KANBAN_TASK") or None
+            # A worker environment can outlive a test/home/board switch. Only
+            # persist provenance when the source card belongs to this board;
+            # task creation otherwise retains its historical independent mode.
+            if source_task_id and kb.get_task(conn, source_task_id) is None:
+                source_task_id = None
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
                 body=body,
                 assignee=str(assignee),
+                source_task_id=source_task_id,
+                candidate_reuse_justification=candidate_reuse_justification,
                 parents=tuple(parents),
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,
@@ -1899,6 +1988,33 @@ def _board_schema_prop() -> dict[str, str]:
     only has to land in one place.
     """
     return {"type": "string", "description": _DESC_BOARD}
+
+
+KANBAN_PREFLIGHT_TERMINAL_CONTRACT_SCHEMA = {
+    "name": "kanban_preflight_terminal_contract",
+    "description": (
+        "Derive canonical source inventory and operation digests for one exact "
+        "current-worker contract draft. The draft must declare all scope and "
+        "operation fields while leaving source size/content/manifest digests "
+        "unset. This tool is read-only and non-authorizing: it never writes a "
+        "contract, arms, resumes, executes, uploads, unlinks, or removes."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "contract": {
+                "type": "object",
+                "description": (
+                    "Exact typed contract draft with source expected_size_bytes, "
+                    "content_sha256, and manifest_sha256 set to null."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["contract"],
+    },
+}
 
 
 KANBAN_PREPARE_TERMINAL_CONTRACT_SCHEMA = {
@@ -2175,6 +2291,16 @@ KANBAN_BLOCK_SCHEMA = {
                     "Omit only if none apply."
                 ),
             },
+            "wait_on": {
+                "oneOf": [
+                    {"type": "string"},
+                    {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 1},
+                ],
+                "description": (
+                    "For kind='dependency', the one active producer task id to wait on. "
+                    "The source task moves to todo and is promoted once that producer finishes."
+                ),
+            },
             "contract_digest": {"type": "string"},
             "contract_sha256": {"type": "string"},
             "contract_path_digest": {"type": "string"},
@@ -2442,6 +2568,14 @@ KANBAN_CREATE_SCHEMA = {
                     "a duplicate. Useful for retry-safe automation."
                 ),
             },
+            "candidate_reuse_justification": {
+                "type": "string",
+                "enum": ["distinct_scope", "owner_change", "workspace_change"],
+                "description": (
+                    "For a repeat Enforcer-source correction, use only when it is genuinely distinct rather "
+                    "than reusing the same-root, same-owner, same-workspace candidate."
+                ),
+            },
             "max_runtime_seconds": {
                 "type": "integer",
                 "description": (
@@ -2582,6 +2716,15 @@ KANBAN_FIRST_PREP_RESUME_SCHEMA = {
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
+
+registry.register(
+    name="kanban_preflight_terminal_contract",
+    toolset="kanban",
+    schema=KANBAN_PREFLIGHT_TERMINAL_CONTRACT_SCHEMA,
+    handler=_handle_preflight_terminal_contract,
+    check_fn=_check_prepare_terminal_contract,
+    emoji="🔎",
+)
 
 registry.register(
     name="kanban_prepare_terminal_contract",

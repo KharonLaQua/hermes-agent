@@ -102,6 +102,24 @@ _OPERATION_PREFIXES = {
     "rmdir_manifest_batch": ("rmdir", "--"),
 }
 _SHELL_META_CHARS = frozenset(";&|<>`$*?[]{}~'\\\"\x00")
+_MANIFEST_VERSION = 1
+_SECRET_VALUE_PATTERNS = (
+    re.compile(rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
+    re.compile(rb"\b(?:sk|rk)-live-[A-Za-z0-9_-]{12,}\b"),
+    re.compile(rb"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+    re.compile(rb"\bxox[baprs]-[A-Za-z0-9-]{12,}\b"),
+    re.compile(rb"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(
+        rb"(?i)\b(?:api[_-]?key|access[_-]?token|client[_-]?secret|password|passwd)"
+        rb"\s*[:=]\s*[\"']?[A-Za-z0-9_./+=:-]{12,}"
+    ),
+)
+_AMBIGUOUS_SECRET_NAMES = frozenset(
+    {".env", ".envrc", "credentials", "credentials.json", "token.json", "secrets.json"}
+)
+_SECRET_SCAN_MAX_BYTES = 64 * 1024 * 1024
+_MANIFEST_BATCH_MAX_TARGETS = 128
+_MANIFEST_MAX_CONTRACT_BYTES = 1024 * 1024
 
 
 class ScopedTerminalPermitError(RuntimeError):
@@ -175,6 +193,7 @@ class PreparedTerminalContract:
     source_content_sha256: str | None
     manifest_sha256: str | None
     readback_json: str
+    manifest_bytes: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -435,7 +454,7 @@ def _validate_manifest_targets(
     operation: Mapping[str, Any], source: Mapping[str, Any], *, directories: bool
 ) -> None:
     argv = operation["argv"]
-    if operation["manifest_ref"] is None or source["manifest_path"] is None:
+    if operation["manifest_ref"] != "manifest" or source["manifest_path"] is None:
         raise ScopedTerminalPermitError("operation_forbidden")
     targets = argv[2:]
     if not targets:
@@ -471,13 +490,22 @@ def _validate_operation_policy(
     if operation["source_ref"] != "source" or operation["destination_ref"] != "destination":
         raise ScopedTerminalPermitError("operation_forbidden")
     if kind in {"rclone_copy", "rclone_verify"}:
-        if (
-            len(argv) != 4
-            or tuple(argv[:2]) != prefix
-            or argv[2] != source["canonical_path"]
-            or argv[3] != destination["canonical_uri"]
-            or operation["manifest_ref"] is not None
-        ):
+        if len(argv) != 4 or tuple(argv[:2]) != prefix:
+            raise ScopedTerminalPermitError("operation_forbidden")
+        if operation["manifest_ref"] is None:
+            if argv[2] != source["canonical_path"] or argv[3] != destination["canonical_uri"]:
+                raise ScopedTerminalPermitError("operation_forbidden")
+            return
+        if operation["manifest_ref"] != "manifest" or source["manifest_path"] is None:
+            raise ScopedTerminalPermitError("operation_forbidden")
+        member_path = _canonical_operation_path(argv[2])
+        valid_member = (
+            member_path == source["canonical_path"]
+            if source["kind"] == "file"
+            else _path_is_within(member_path, source["canonical_path"])
+        )
+        remote_prefix = destination["canonical_uri"].rstrip("/") + "/"
+        if not valid_member or not argv[3].startswith(remote_prefix):
             raise ScopedTerminalPermitError("operation_forbidden")
         return
     if tuple(argv[:2]) != prefix:
@@ -495,8 +523,9 @@ def _validate_operations(
     source: Mapping[str, Any],
     destination: Mapping[str, Any],
     workspace: str,
+    allow_empty: bool = False,
 ) -> list[dict[str, Any]]:
-    if not isinstance(value, list) or not value:
+    if not isinstance(value, list) or (not value and not allow_empty):
         raise ScopedTerminalPermitError("malformed")
     normalized: list[dict[str, Any]] = []
     for expected_index, operation in enumerate(value):
@@ -522,7 +551,12 @@ def _validate_operations(
     return normalized
 
 
-def _normalize_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
+def _normalize_contract(
+    contract: Mapping[str, Any],
+    *,
+    allow_empty_operations: bool = False,
+    validate_manifest: bool = True,
+) -> dict[str, Any]:
     if not isinstance(contract, Mapping):
         raise ScopedTerminalPermitError("malformed")
     copied = _parse_canonical(_canonical_bytes(dict(contract)))
@@ -538,9 +572,19 @@ def _normalize_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         source=copied["source"],
         destination=copied["destination"],
         workspace=copied["workspace"],
+        allow_empty=allow_empty_operations,
     )
+    if validate_manifest and copied["operation_sequence"]:
+        _validate_manifest_operation_members(
+            copied["source"], copied["destination"], copied["operation_sequence"]
+        )
     index = _require_int(copied["authorized_operation_index"])
-    if index >= len(copied["operation_sequence"]):
+    if not copied["operation_sequence"]:
+        if not allow_empty_operations:
+            raise ScopedTerminalPermitError("malformed")
+        if index != 0:
+            raise ScopedTerminalPermitError("malformed")
+    elif index >= len(copied["operation_sequence"]):
         raise ScopedTerminalPermitError("malformed")
     copied["authorized_operation_index"] = index
     copied["predecessor_receipt_digest"] = _require_digest(
@@ -711,8 +755,23 @@ def _read_preparation_directory_digest(
     return size, _digest(_canonical_bytes(entries))
 
 
-def _preparation_source_readback(source: Mapping[str, Any]) -> tuple[int, str | None, str | None]:
+def _preparation_source_readback(source: Mapping[str, Any]) -> tuple[int, str, str | None]:
     """Verify declared source metadata without writing or executing anything."""
+    size, digest, manifest_digest = _read_preparation_source_metadata(source)
+    if size != source["expected_size_bytes"]:
+        raise ScopedTerminalPermitError("preparation_size_mismatch")
+    expected_content = source["content_sha256"]
+    if expected_content is not None and digest != expected_content:
+        raise ScopedTerminalPermitError("preparation_hash_mismatch")
+    if source["manifest_path"] is not None and manifest_digest != source["manifest_sha256"]:
+        raise ScopedTerminalPermitError("preparation_manifest_mismatch")
+    return size, digest, manifest_digest
+
+
+def _read_preparation_source_metadata(
+    source: Mapping[str, Any],
+) -> tuple[int, str, str | None]:
+    """Read canonical source metadata without granting authority or mutating state."""
     path = source["canonical_path"]
     try:
         info = os.stat(path, follow_symlinks=False)
@@ -726,34 +785,417 @@ def _preparation_source_readback(source: Mapping[str, Any]) -> tuple[int, str | 
         if not stat.S_ISDIR(info.st_mode):
             raise ScopedTerminalPermitError("preparation_source_unreadable")
         size, digest = _read_preparation_directory_digest(path, initial_stat=info)
+        if (
+            source["manifest_path"] is not None
+            and os.path.isfile(source["manifest_path"])
+            and _member_manifest_is_structured(source["manifest_path"])
+        ):
+            size, digest = _read_manifest_selected_metadata(source, info)
     else:  # pragma: no cover - _normalize_contract owns this check.
         raise ScopedTerminalPermitError("malformed")
-    if size != source["expected_size_bytes"]:
-        raise ScopedTerminalPermitError("preparation_size_mismatch")
-    expected_content = source["content_sha256"]
-    if expected_content is not None and digest != expected_content:
-        raise ScopedTerminalPermitError("preparation_hash_mismatch")
     manifest_digest = None
     if source["manifest_path"] is not None:
         _, manifest_digest = _read_preparation_file_digest(source["manifest_path"])
-        if manifest_digest != source["manifest_sha256"]:
-            raise ScopedTerminalPermitError("preparation_manifest_mismatch")
     return size, digest, manifest_digest
 
 
-def prepare_scoped_terminal_contract(
-    contract: Mapping[str, Any],
-) -> PreparedTerminalContract:
-    """Validate and read back an exact contract without arming or executing it.
+def _read_preparation_file_bytes(path: str, *, dir_fd: int | None = None) -> bytes:
+    """Read a bounded regular file for local secret classification only."""
+    before = _preparation_lstat(path, dir_fd=dir_fd)
+    if not stat.S_ISREG(before.st_mode):
+        raise ScopedTerminalPermitError("preparation_source_unreadable")
+    if before.st_size > _SECRET_SCAN_MAX_BYTES:
+        raise ScopedTerminalPermitError("preparation_ambiguous_secret")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags) if dir_fd is None else os.open(path, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        raise ScopedTerminalPermitError("preparation_source_unreadable") from exc
+    chunks: list[bytes] = []
+    size = 0
+    try:
+        opened = os.fstat(fd)
+        if _preparation_stat_identity(before) != _preparation_stat_identity(opened):
+            raise ScopedTerminalPermitError("preparation_source_changed")
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > _SECRET_SCAN_MAX_BYTES:
+                raise ScopedTerminalPermitError("preparation_ambiguous_secret")
+            chunks.append(chunk)
+        after = os.fstat(fd)
+    except OSError as exc:
+        raise ScopedTerminalPermitError("preparation_source_changed") from exc
+    finally:
+        os.close(fd)
+    final = _preparation_lstat(path, dir_fd=dir_fd)
+    if (
+        size != before.st_size
+        or _preparation_stat_identity(before) != _preparation_stat_identity(after)
+        or _preparation_stat_identity(before) != _preparation_stat_identity(final)
+    ):
+        raise ScopedTerminalPermitError("preparation_source_changed")
+    return b"".join(chunks)
 
-    This is deliberately a pure preparation boundary: it may read the declared
-    source and manifest to verify size/digests, but it never grants authority,
-    opens a network connection, invokes a subprocess, or mutates storage.
-    """
-    normalized = _normalize_contract(contract)
-    source_size, content_digest, manifest_digest = _preparation_source_readback(
-        normalized["source"]
+
+def _classify_manifest_bytes(relative_path: str, data: bytes) -> str:
+    """Classify without returning, logging, or persisting a secret value."""
+    name = os.path.basename(relative_path).lower()
+    suffix = os.path.splitext(name)[1]
+    if name in _AMBIGUOUS_SECRET_NAMES or suffix in {".pem", ".key", ".p12", ".pfx"}:
+        raise ScopedTerminalPermitError("preparation_ambiguous_secret")
+    if any(pattern.search(data) for pattern in _SECRET_VALUE_PATTERNS):
+        return "secret"
+    return "safe"
+
+
+def _inventory_manifest_members(root: str, initial_stat: os.stat_result) -> list[dict[str, Any]]:
+    """Inventory one stable directory into safe metadata and secret classifications."""
+    members: list[dict[str, Any]] = []
+
+    def visit(directory_fd: int, relative_root: str) -> None:
+        before = os.fstat(directory_fd)
+        if not stat.S_ISDIR(before.st_mode):
+            raise ScopedTerminalPermitError("preparation_source_unreadable")
+        try:
+            names = sorted(os.listdir(directory_fd))
+        except OSError as exc:
+            raise ScopedTerminalPermitError("preparation_source_changed") from exc
+        for name in names:
+            relative = f"{relative_root}/{name}" if relative_root else name
+            info = _preparation_lstat(name, dir_fd=directory_fd)
+            if stat.S_ISDIR(info.st_mode):
+                child_fd = _open_preparation_directory(name, dir_fd=directory_fd)
+                try:
+                    visit(child_fd, relative)
+                finally:
+                    os.close(child_fd)
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                raise ScopedTerminalPermitError("preparation_source_unreadable")
+            data = _read_preparation_file_bytes(name, dir_fd=directory_fd)
+            members.append(
+                {
+                    "kind": "file",
+                    "path": relative,
+                    "size": len(data),
+                    "sha256": _digest(data),
+                    "classification": _classify_manifest_bytes(relative, data),
+                }
+            )
+        after = os.fstat(directory_fd)
+        if _preparation_stat_identity(before) != _preparation_stat_identity(after):
+            raise ScopedTerminalPermitError("preparation_source_changed")
+
+    root_fd = _open_preparation_directory(root, expected=initial_stat)
+    try:
+        visit(root_fd, "")
+        final_descriptor = os.fstat(root_fd)
+        final_path = _preparation_lstat(root)
+        if (
+            _preparation_stat_identity(initial_stat) != _preparation_stat_identity(final_descriptor)
+            or _preparation_stat_identity(initial_stat) != _preparation_stat_identity(final_path)
+        ):
+            raise ScopedTerminalPermitError("preparation_source_changed")
+    finally:
+        os.close(root_fd)
+    return members
+
+
+def _load_member_manifest(path: str) -> tuple[bytes, list[dict[str, Any]]]:
+    data = _read_preparation_file_bytes(path)
+    try:
+        document = _parse_canonical(data)
+    except ScopedTerminalPermitError:
+        raise ScopedTerminalPermitError("preparation_manifest_malformed") from None
+    if set(document) != {"version", "members"} or document["version"] != _MANIFEST_VERSION:
+        raise ScopedTerminalPermitError("preparation_manifest_malformed")
+    members = document["members"]
+    if not isinstance(members, list) or not members:
+        raise ScopedTerminalPermitError("preparation_manifest_malformed")
+    normalized: list[dict[str, Any]] = []
+    for member in members:
+        if not isinstance(member, dict) or set(member) != {
+            "kind", "path", "size", "sha256", "classification"
+        }:
+            raise ScopedTerminalPermitError("preparation_manifest_malformed")
+        if member["kind"] != "file" or not isinstance(member["path"], str):
+            raise ScopedTerminalPermitError("preparation_manifest_malformed")
+        if (
+            not member["path"]
+            or os.path.isabs(member["path"])
+            or ".." in member["path"].replace("\\", "/").split("/")
+            or member["classification"] not in {"safe", "secret"}
+        ):
+            raise ScopedTerminalPermitError("preparation_manifest_malformed")
+        normalized.append(
+            {
+                "kind": "file",
+                "path": member["path"],
+                "size": _require_int(member["size"]),
+                "sha256": _require_digest(member["sha256"]),
+                "classification": member["classification"],
+            }
+        )
+    if len({member["path"] for member in normalized}) != len(normalized):
+        raise ScopedTerminalPermitError("preparation_manifest_malformed")
+    if normalized != sorted(normalized, key=lambda item: item["path"]):
+        raise ScopedTerminalPermitError("preparation_manifest_malformed")
+    return data, normalized
+
+
+def _member_manifest_is_structured(path: str) -> bool:
+    try:
+        data = _read_preparation_file_bytes(path)
+        value = json.loads(data.decode("utf-8"))
+    except (ScopedTerminalPermitError, UnicodeDecodeError, json.JSONDecodeError):
+        return True
+    return not isinstance(value, list)
+
+
+def _read_manifest_selected_metadata(
+    source: Mapping[str, Any], initial_stat: os.stat_result
+) -> tuple[int, str]:
+    manifest_path = source["manifest_path"]
+    _, declared = _load_member_manifest(manifest_path)
+    observed = _inventory_manifest_members(source["canonical_path"], initial_stat)
+    if observed != declared:
+        raise ScopedTerminalPermitError("preparation_manifest_mismatch")
+    safe = [member for member in declared if member["classification"] == "safe"]
+    if not safe:
+        raise ScopedTerminalPermitError("preparation_no_safe_members")
+    return sum(member["size"] for member in safe), _digest(_canonical_bytes(safe))
+
+
+def _validate_manifest_operation_members(
+    source: Mapping[str, Any], destination: Mapping[str, Any], operations: list[dict[str, Any]]
+) -> None:
+    manifest_operations = [operation for operation in operations if operation["manifest_ref"]]
+    if not manifest_operations:
+        return
+    if source["manifest_path"] is None or not os.path.isfile(source["manifest_path"]):
+        raise ScopedTerminalPermitError("preparation_manifest_unreadable")
+    if not _member_manifest_is_structured(source["manifest_path"]):
+        return
+    _, members = _load_member_manifest(source["manifest_path"])
+    safe_paths = {
+        _canonical_operation_path(os.path.join(source["canonical_path"], member["path"]))
+        for member in members
+        if member["classification"] == "safe"
+    }
+    copy_paths: set[str] = set()
+    verify_paths: set[str] = set()
+    unlink_paths: set[str] = set()
+    rmdir_paths: list[str] = []
+    phases: list[int] = []
+    for operation in manifest_operations:
+        targets = operation["argv"][2:]
+        if operation["kind"] in {"rclone_copy", "rclone_verify"}:
+            target = _canonical_operation_path(targets[0])
+            remote = targets[1]
+            relative = os.path.relpath(target, source["canonical_path"]).replace(os.sep, "/")
+            if target not in safe_paths or remote != _remote_member_uri(destination["canonical_uri"], relative):
+                raise ScopedTerminalPermitError("operation_forbidden")
+            (copy_paths if operation["kind"] == "rclone_copy" else verify_paths).add(target)
+            phases.append(0 if operation["kind"] == "rclone_copy" else 1)
+        elif operation["kind"] == "unlink_manifest_batch":
+            unlink_paths.update(_canonical_operation_path(target) for target in targets)
+            phases.append(2)
+        elif operation["kind"] == "rmdir_manifest_batch":
+            rmdir_paths.extend(_canonical_operation_path(target) for target in targets)
+            phases.append(3)
+    if (
+        copy_paths != safe_paths
+        or verify_paths != safe_paths
+        or unlink_paths != safe_paths
+        or len(copy_paths) != sum(1 for operation in manifest_operations if operation["kind"] == "rclone_copy")
+        or len(verify_paths) != sum(1 for operation in manifest_operations if operation["kind"] == "rclone_verify")
+        or len(unlink_paths) != sum(len(operation["argv"][2:]) for operation in manifest_operations if operation["kind"] == "unlink_manifest_batch")
+        or phases != sorted(phases)
+    ):
+        raise ScopedTerminalPermitError("operation_forbidden")
+    expected_dirs = {
+        os.path.dirname(path)
+        for path in safe_paths
+        if os.path.dirname(path) != source["canonical_path"]
+    }
+    if set(rmdir_paths) != expected_dirs or len(rmdir_paths) != len(set(rmdir_paths)):
+        raise ScopedTerminalPermitError("operation_forbidden")
+    if rmdir_paths != sorted(
+        rmdir_paths,
+        key=lambda path: (-len(os.path.relpath(path, source["canonical_path"]).split(os.sep)), path),
+    ):
+        raise ScopedTerminalPermitError("operation_forbidden")
+
+
+def _remote_member_uri(destination: str, relative_path: str) -> str:
+    return destination.rstrip("/") + "/" + relative_path
+
+
+def _manifest_operation(
+    *,
+    index: int,
+    kind: str,
+    argv: list[str],
+    workspace: str,
+    execution_context_digest: str,
+) -> dict[str, Any]:
+    return {
+        "index": index,
+        "kind": kind,
+        "argv": argv,
+        "cwd": workspace,
+        "background": False,
+        "pty": False,
+        "source_ref": "source",
+        "destination_ref": "destination",
+        "manifest_ref": "manifest",
+        "execution_context_digest": execution_context_digest,
+    }
+
+
+def _build_manifest_contract(
+    provisional: dict[str, Any],
+    members: list[dict[str, Any]],
+    manifest_bytes: bytes,
+    *,
+    context_digest: str | None = None,
+) -> tuple[dict[str, Any], bytes]:
+    """Freeze selected members and every copy/verify/delete operation."""
+    safe = [member for member in members if member["classification"] == "safe"]
+    if not safe:
+        raise ScopedTerminalPermitError("preparation_no_safe_members")
+    source = provisional["source"]
+    root = source["canonical_path"]
+    workspace = provisional["workspace"]
+    destination = provisional["destination"]["canonical_uri"]
+    context_digest = context_digest or _digest(_canonical_bytes({"workspace": workspace}))
+    safe_paths = [member["path"] for member in safe]
+    operations: list[dict[str, Any]] = []
+    for kind, command in (("rclone_copy", "copyto"), ("rclone_verify", "check")):
+        for member in safe:
+            operations.append(
+                _manifest_operation(
+                    index=len(operations),
+                    kind=kind,
+                    argv=[
+                        "rclone",
+                        command,
+                        os.path.join(root, member["path"]),
+                        _remote_member_uri(destination, member["path"]),
+                    ],
+                    workspace=workspace,
+                    execution_context_digest=context_digest,
+                )
+            )
+    file_targets = [os.path.join(root, path) for path in safe_paths]
+    for start in range(0, len(file_targets), _MANIFEST_BATCH_MAX_TARGETS):
+        operations.append(
+            _manifest_operation(
+                index=len(operations),
+                kind="unlink_manifest_batch",
+                argv=["rm", "--", *file_targets[start : start + _MANIFEST_BATCH_MAX_TARGETS]],
+                workspace=workspace,
+                execution_context_digest=context_digest,
+            )
+        )
+    directories = sorted(
+        {
+            os.path.dirname(os.path.join(root, path))
+            for path in safe_paths
+            if os.path.dirname(path)
+        },
+        key=lambda path: (-len(os.path.relpath(path, root).split(os.sep)), path),
     )
+    for start in range(0, len(directories), _MANIFEST_BATCH_MAX_TARGETS):
+        operations.append(
+            _manifest_operation(
+                index=len(operations),
+                kind="rmdir_manifest_batch",
+                argv=["rmdir", "--", *directories[start : start + _MANIFEST_BATCH_MAX_TARGETS]],
+                workspace=workspace,
+                execution_context_digest=context_digest,
+            )
+        )
+    final_contract = copy.deepcopy(provisional)
+    selected_digest = _digest(_canonical_bytes(safe))
+    final_contract["source"].update(
+        {
+            "expected_size_bytes": sum(member["size"] for member in safe),
+            "content_sha256": selected_digest,
+            "manifest_sha256": _digest(manifest_bytes),
+        }
+    )
+    final_contract["operation_sequence"] = operations
+    if len(manifest_bytes) > _MANIFEST_MAX_CONTRACT_BYTES:
+        raise ScopedTerminalPermitError("preparation_contract_too_large")
+    if len(_canonical_bytes(final_contract)) > _MANIFEST_MAX_CONTRACT_BYTES:
+        raise ScopedTerminalPermitError("preparation_contract_too_large")
+    return final_contract, manifest_bytes
+
+
+def _normalize_preflight_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate an exact scope draft whose observed source digests are unset.
+
+    The caller must declare every final contract field and every operation before
+    source traversal.  The three observed source values are deliberately the
+    only unset values; they are derived from descriptor-safe reads below, never
+    accepted from the worker.  The provisional normalized contract is used only
+    to validate the declared operation policy before touching the source.
+    """
+    if not isinstance(contract, Mapping):
+        raise ScopedTerminalPermitError("malformed")
+    copied = _parse_canonical(_canonical_bytes(dict(contract)))
+    if set(copied) != _CONTRACT_FIELDS or not isinstance(copied.get("source"), dict):
+        raise ScopedTerminalPermitError("malformed")
+    source = copied["source"]
+    if set(source) != _SOURCE_FIELDS:
+        raise ScopedTerminalPermitError("malformed")
+    if (
+        source.get("expected_size_bytes") is not None
+        or source.get("content_sha256") is not None
+        or source.get("manifest_sha256") is not None
+    ):
+        raise ScopedTerminalPermitError("preflight_metadata_must_be_unset")
+    operation_sequence = copied.get("operation_sequence")
+    generated = (
+        source["kind"] == "directory"
+        and source["manifest_path"] is not None
+        and isinstance(operation_sequence, list)
+        and (
+            not operation_sequence
+            or (
+                len(operation_sequence) == 1
+                and isinstance(operation_sequence[0], dict)
+                and operation_sequence[0].get("kind") == "manifest_prepare"
+            )
+        )
+    )
+    if generated:
+        copied["operation_sequence"] = []
+    # A deterministic zero digest exists only while _normalize_contract checks
+    # the declared paths/argv policy. It is replaced solely with observed data
+    # before this function returns a usable typed contract.
+    provisional = copy.deepcopy(copied)
+    provisional_source = provisional["source"]
+    provisional_source["expected_size_bytes"] = 0
+    provisional_source["content_sha256"] = "0" * 64
+    provisional_source["manifest_sha256"] = (
+        "0" * 64 if provisional_source["manifest_path"] is not None else None
+    )
+    return _normalize_contract(provisional, allow_empty_operations=generated)
+
+
+def _prepared_terminal_contract(
+    normalized: dict[str, Any],
+    *,
+    source_size: int,
+    content_digest: str,
+    manifest_digest: str | None,
+    manifest_bytes: bytes | None = None,
+) -> PreparedTerminalContract:
     canonical = _canonical_bytes(normalized)
     sequence_digest = _digest(_canonical_bytes(normalized["operation_sequence"]))
     readback = _canonical_bytes(
@@ -775,6 +1217,117 @@ def prepare_scoped_terminal_contract(
         source_content_sha256=content_digest,
         manifest_sha256=manifest_digest,
         readback_json=readback,
+        manifest_bytes=manifest_bytes,
+    )
+
+
+def preflight_scoped_terminal_contract(
+    contract: Mapping[str, Any],
+) -> PreparedTerminalContract:
+    """Derive source metadata for one exact, non-authorizing contract draft.
+
+    This function validates all declared paths and operation policy before a
+    descriptor-safe source/manifest read. It invokes no subprocess, opens no
+    network connection, writes no artifact, and never creates a permit.
+    """
+    provisional = _normalize_preflight_contract(contract)
+    if not provisional["operation_sequence"]:
+        source = provisional["source"]
+        if os.path.exists(source["manifest_path"]):
+            raise ScopedTerminalPermitError("preparation_manifest_exists")
+        info = _preparation_lstat(source["canonical_path"])
+        if not stat.S_ISDIR(info.st_mode):
+            raise ScopedTerminalPermitError("preparation_source_unreadable")
+        members = _inventory_manifest_members(source["canonical_path"], info)
+        manifest_bytes = _canonical_bytes(
+            {
+                "version": _MANIFEST_VERSION,
+                "members": sorted(members, key=lambda item: item["path"]),
+            }
+        )
+        marker_operations = contract.get("operation_sequence") if isinstance(contract, Mapping) else None
+        marker_context_digest = (
+            marker_operations[0].get("execution_context_digest")
+            if isinstance(marker_operations, list)
+            and marker_operations
+            and isinstance(marker_operations[0], Mapping)
+            else None
+        )
+        final_contract, _ = _build_manifest_contract(
+            provisional,
+            members,
+            manifest_bytes,
+            context_digest=marker_context_digest,
+        )
+        normalized = _normalize_contract(final_contract, validate_manifest=False)
+        safe = [member for member in members if member["classification"] == "safe"]
+        return _prepared_terminal_contract(
+            normalized,
+            source_size=sum(member["size"] for member in safe),
+            content_digest=_digest(_canonical_bytes(safe)),
+            manifest_digest=_digest(manifest_bytes),
+            manifest_bytes=manifest_bytes,
+        )
+    source_size, content_digest, manifest_digest = _read_preparation_source_metadata(
+        provisional["source"]
+    )
+    final_contract = copy.deepcopy(provisional)
+    final_contract["source"].update(
+        {
+            "expected_size_bytes": source_size,
+            "content_sha256": content_digest,
+            "manifest_sha256": manifest_digest,
+        }
+    )
+    normalized = _normalize_contract(final_contract)
+    return _prepared_terminal_contract(
+        normalized,
+        source_size=source_size,
+        content_digest=content_digest,
+        manifest_digest=manifest_digest,
+    )
+
+
+def prepare_scoped_terminal_contract(
+    contract: Mapping[str, Any],
+) -> PreparedTerminalContract:
+    """Validate and read back an exact contract without arming or executing it.
+
+    This is deliberately a pure preparation boundary: it may read the declared
+    source and manifest to verify size/digests, but it never grants authority,
+    opens a network connection, invokes a subprocess, or mutates storage.
+    """
+    if isinstance(contract, Mapping):
+        source = contract.get("source")
+        operations = contract.get("operation_sequence")
+        if (
+            isinstance(source, Mapping)
+            and source.get("kind") == "directory"
+            and source.get("manifest_path") is not None
+            and isinstance(operations, list)
+            and (
+                not operations
+                or (
+                    len(operations) == 1
+                    and isinstance(operations[0], Mapping)
+                    and operations[0].get("kind") == "manifest_prepare"
+                )
+            )
+            and all(
+                source.get(field) is None
+                for field in ("expected_size_bytes", "content_sha256", "manifest_sha256")
+            )
+        ):
+            return preflight_scoped_terminal_contract(contract)
+    normalized = _normalize_contract(contract)
+    source_size, content_digest, manifest_digest = _preparation_source_readback(
+        normalized["source"]
+    )
+    return _prepared_terminal_contract(
+        normalized,
+        source_size=source_size,
+        content_digest=content_digest,
+        manifest_digest=manifest_digest,
     )
 
 

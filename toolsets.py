@@ -71,7 +71,7 @@ _HERMES_CORE_TOOLS = [
     # spawned as a kanban worker (HERMES_KANBAN_TASK env set) or the current
     # profile explicitly enables the kanban toolset. Gated via check_fn in
     # tools/kanban_tools.py.
-    "kanban_show", "kanban_prepare_terminal_contract", "kanban_list",
+    "kanban_show", "kanban_preflight_terminal_contract", "kanban_prepare_terminal_contract", "kanban_list",
     "kanban_complete", "kanban_block", "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
@@ -271,7 +271,7 @@ TOOLSETS = {
             "(for orchestrators) list, unblock, and fan out tasks."
         ),
         "tools": [
-            "kanban_show", "kanban_prepare_terminal_contract", "kanban_list", "kanban_complete", "kanban_block",
+            "kanban_show", "kanban_preflight_terminal_contract", "kanban_prepare_terminal_contract", "kanban_list", "kanban_complete", "kanban_block",
             "kanban_first_prep_resume", "kanban_arm_terminal_permit",
             "kanban_heartbeat", "kanban_comment",
             "kanban_create", "kanban_link",

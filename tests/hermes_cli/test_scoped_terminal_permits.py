@@ -129,6 +129,56 @@ def _directory_contract(tmp_path, *, with_content_identity=True):
     return contract, root
 
 
+def _manifest_draft(tmp_path):
+    root = tmp_path / "manifest-source"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    (root / "safe.txt").write_text("ordinary archive data\n", encoding="utf-8")
+    (nested / "safe.bin").write_bytes(b"safe nested data")
+    secret_value = "sk-live-012345678901234567890123"
+    (root / "settings.txt").write_text(
+        f'API_KEY = "{secret_value}"\n', encoding="utf-8"
+    )
+    profile_home = tmp_path / "profile"
+    workspace = tmp_path / "workspace"
+    profile_home.mkdir()
+    workspace.mkdir()
+    manifest = workspace / "safe-members.json"
+    operation = {
+        "index": 0,
+        "kind": "manifest_prepare",
+        "argv": ["manifest", "prepare"],
+        "cwd": str(workspace),
+        "background": False,
+        "pty": False,
+        "source_ref": "source",
+        "destination_ref": "destination",
+        "manifest_ref": "manifest",
+        "execution_context_digest": _HEX_C,
+    }
+    return {
+        "profile": "bookkeeper",
+        "profile_home": str(profile_home),
+        "workspace": str(workspace),
+        "source": {
+            "kind": "directory",
+            "canonical_path": str(root),
+            "expected_size_bytes": None,
+            "content_sha256": None,
+            "manifest_path": str(manifest),
+            "manifest_sha256": None,
+        },
+        "destination": {
+            "kind": "rclone_remote",
+            "canonical_uri": "vault:reviewed/source",
+        },
+        "operation_sequence": [operation],
+        "authorized_operation_index": 0,
+        "predecessor_receipt_digest": None,
+        "command_digest": _HEX_B,
+    }, secret_value
+
+
 def test_prepare_scoped_terminal_contract_returns_canonical_digest_only_artifact(
     tmp_path,
 ):
@@ -148,6 +198,117 @@ def test_prepare_scoped_terminal_contract_returns_canonical_digest_only_artifact
     assert prepared.source_size_bytes == len(b"reviewed")
     assert prepared.source_content_sha256 == hashlib.sha256(b"reviewed").hexdigest()
     assert "reviewed" not in prepared.readback_json
+
+
+def test_preflight_scoped_terminal_contract_derives_source_and_sequence_digests(
+    tmp_path,
+):
+    from hermes_cli.scoped_terminal_permits import preflight_scoped_terminal_contract
+
+    draft = _contract(tmp_path)
+    draft["source"]["expected_size_bytes"] = None
+    draft["source"]["content_sha256"] = None
+    draft["source"]["manifest_sha256"] = None
+
+    preflight = preflight_scoped_terminal_contract(draft)
+
+    assert preflight.contract["source"]["expected_size_bytes"] == len(b"reviewed")
+    assert preflight.contract["source"]["content_sha256"] == hashlib.sha256(
+        b"reviewed"
+    ).hexdigest()
+    assert preflight.contract["source"]["manifest_sha256"] == hashlib.sha256(
+        b"[]"
+    ).hexdigest()
+    assert preflight.operation_sequence_digest == hashlib.sha256(
+        json.dumps(
+            draft["operation_sequence"],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert (tmp_path / "source.bin").read_bytes() == b"reviewed"
+    assert (tmp_path / "manifest.json").read_bytes() == b"[]"
+
+
+@pytest.mark.parametrize("mutation", ["expanded_copy", "expanded_unlink"])
+def test_preflight_scoped_terminal_contract_rejects_out_of_scope_operations(
+    tmp_path, mutation,
+):
+    from hermes_cli.scoped_terminal_permits import preflight_scoped_terminal_contract
+
+    draft = _contract(tmp_path)
+    draft["source"]["expected_size_bytes"] = None
+    draft["source"]["content_sha256"] = None
+    draft["source"]["manifest_sha256"] = None
+    if mutation == "expanded_copy":
+        draft["operation_sequence"][0]["argv"][2] = str(tmp_path / "outside.bin")
+    else:
+        draft["operation_sequence"][0].update(
+            {
+                "kind": "unlink_manifest_batch",
+                "argv": ["rm", "--", str(tmp_path / "outside.bin")],
+                "manifest_ref": "manifest",
+            }
+        )
+
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        preflight_scoped_terminal_contract(draft)
+
+    assert exc.value.failure_class == "operation_forbidden"
+    assert (tmp_path / "source.bin").read_bytes() == b"reviewed"
+
+
+def test_preflight_derives_secret_excluded_manifest_and_complete_sequence(tmp_path):
+    from hermes_cli.scoped_terminal_permits import preflight_scoped_terminal_contract
+
+    draft, secret_value = _manifest_draft(tmp_path)
+    prepared = preflight_scoped_terminal_contract(draft)
+
+    assert prepared.manifest_bytes is not None
+    assert secret_value.encode() not in prepared.manifest_bytes
+    assert secret_value not in prepared.readback_json
+    manifest = json.loads(prepared.manifest_bytes)
+    assert {entry["path"] for entry in manifest["members"]} == {
+        "nested/safe.bin",
+        "safe.txt",
+        "settings.txt",
+    }
+    assert next(entry for entry in manifest["members"] if entry["path"] == "settings.txt")[
+        "classification"
+    ] == "secret"
+    operations = prepared.contract["operation_sequence"]
+    assert [operation["kind"] for operation in operations] == [
+        "rclone_copy",
+        "rclone_copy",
+        "rclone_verify",
+        "rclone_verify",
+        "unlink_manifest_batch",
+        "rmdir_manifest_batch",
+    ]
+    assert all("settings.txt" not in operation["argv"] for operation in operations)
+    assert operations[-1]["argv"][-1].endswith("/nested")
+    assert prepared.contract["source"]["expected_size_bytes"] == len(
+        b"ordinary archive data\n" + b"safe nested data"
+    )
+    (tmp_path / "workspace" / "safe-members.json").write_bytes(prepared.manifest_bytes)
+    reprepared = prepare_scoped_terminal_contract(prepared.contract)
+    assert reprepared.contract_digest == prepared.contract_digest
+    (tmp_path / "manifest-source" / "safe.txt").write_text("mutated", encoding="utf-8")
+    with pytest.raises(ScopedTerminalPermitError):
+        prepare_scoped_terminal_contract(prepared.contract)
+
+
+def test_preflight_manifest_draft_rejects_ambiguous_member(tmp_path):
+    from hermes_cli.scoped_terminal_permits import preflight_scoped_terminal_contract
+
+    draft, _ = _manifest_draft(tmp_path)
+    (tmp_path / "manifest-source" / ".env").write_text(
+        "NO_SECRET_VALUE_DISCLOSED\n", encoding="utf-8"
+    )
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        preflight_scoped_terminal_contract(draft)
+    assert exc.value.failure_class == "preparation_ambiguous_secret"
 
 
 def test_prepare_directory_contract_returns_canonical_content_identity(tmp_path):
