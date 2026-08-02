@@ -574,7 +574,12 @@ def _preparation_lstat(path: str, *, dir_fd: int | None = None) -> os.stat_resul
         raise ScopedTerminalPermitError("preparation_source_unreadable") from exc
 
 
-def _open_preparation_directory(path: str, *, dir_fd: int | None = None) -> int:
+def _open_preparation_directory(
+    path: str,
+    *,
+    dir_fd: int | None = None,
+    expected: os.stat_result | None = None,
+) -> int:
     """Open a directory without following its final path component."""
     before = _preparation_lstat(path, dir_fd=dir_fd)
     if not stat.S_ISDIR(before.st_mode):
@@ -591,7 +596,10 @@ def _open_preparation_directory(path: str, *, dir_fd: int | None = None) -> int:
     if not stat.S_ISDIR(opened.st_mode):
         os.close(fd)
         raise ScopedTerminalPermitError("preparation_source_unreadable")
-    if _preparation_stat_identity(before) != _preparation_stat_identity(opened):
+    opened_identity = _preparation_stat_identity(opened)
+    if _preparation_stat_identity(before) != opened_identity or (
+        expected is not None and _preparation_stat_identity(expected) != opened_identity
+    ):
         os.close(fd)
         raise ScopedTerminalPermitError("preparation_source_changed")
     return fd
@@ -642,9 +650,12 @@ def _read_preparation_file_digest(
     return size, digest.hexdigest()
 
 
-def _read_preparation_directory_digest(path: str) -> tuple[int, str]:
+def _read_preparation_directory_digest(
+    path: str, *, initial_stat: os.stat_result
+) -> tuple[int, str]:
     """Read every directory entry through stable descriptor-relative paths."""
     entries: list[dict[str, Any]] = []
+    initial_identity = _preparation_stat_identity(initial_stat)
 
     def visit(directory_fd: int, relative_root: str) -> int:
         before = os.fstat(directory_fd)
@@ -685,9 +696,16 @@ def _read_preparation_directory_digest(path: str) -> tuple[int, str]:
             raise ScopedTerminalPermitError("preparation_source_changed")
         return size
 
-    root_fd = _open_preparation_directory(path)
+    root_fd = _open_preparation_directory(path, expected=initial_stat)
     try:
         size = visit(root_fd, "")
+        final_descriptor = os.fstat(root_fd)
+        final_path = _preparation_lstat(path)
+        if (
+            initial_identity != _preparation_stat_identity(final_descriptor)
+            or initial_identity != _preparation_stat_identity(final_path)
+        ):
+            raise ScopedTerminalPermitError("preparation_source_changed")
     finally:
         os.close(root_fd)
     return size, _digest(_canonical_bytes(entries))
@@ -707,7 +725,7 @@ def _preparation_source_readback(source: Mapping[str, Any]) -> tuple[int, str | 
     elif source["kind"] == "directory":
         if not stat.S_ISDIR(info.st_mode):
             raise ScopedTerminalPermitError("preparation_source_unreadable")
-        size, digest = _read_preparation_directory_digest(path)
+        size, digest = _read_preparation_directory_digest(path, initial_stat=info)
     else:  # pragma: no cover - _normalize_contract owns this check.
         raise ScopedTerminalPermitError("malformed")
     if size != source["expected_size_bytes"]:

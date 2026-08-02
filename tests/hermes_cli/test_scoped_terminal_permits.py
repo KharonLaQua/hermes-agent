@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import os
+import shutil
 import threading
 from dataclasses import replace
 
@@ -158,6 +159,62 @@ def test_prepare_directory_contract_returns_canonical_content_identity(tmp_path)
         path.stat().st_size for path in root.rglob("*") if path.is_file()
     )
     assert prepared.source_content_sha256 == contract["source"]["content_sha256"]
+
+
+def test_directory_preparation_rejects_same_content_root_swap_before_open(
+    monkeypatch, tmp_path
+):
+    contract, root = _directory_contract(tmp_path)
+    replacement = tmp_path / "same-content-replacement"
+    displaced = tmp_path / "displaced-reviewed-directory"
+    shutil.copytree(root, replacement)
+    original_open = permits._open_preparation_directory
+    swapped = False
+
+    def swap_before_root_open(path, *, dir_fd=None, **kwargs):
+        nonlocal swapped
+        if path == str(root) and dir_fd is None and not swapped:
+            root.rename(displaced)
+            replacement.rename(root)
+            swapped = True
+        return original_open(path, dir_fd=dir_fd, **kwargs)
+
+    monkeypatch.setattr(permits, "_open_preparation_directory", swap_before_root_open)
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        prepare_scoped_terminal_contract(contract)
+
+    assert swapped is True
+    assert exc.value.failure_class == "preparation_source_changed"
+
+
+def test_directory_preparation_rejects_same_content_root_swap_after_traversal(
+    monkeypatch, tmp_path
+):
+    contract, root = _directory_contract(tmp_path)
+    replacement = tmp_path / "same-content-replacement"
+    displaced = tmp_path / "displaced-reviewed-directory"
+    shutil.copytree(root, replacement)
+    original_lstat = permits._preparation_lstat
+    root_observations = 0
+    swapped = False
+
+    def swap_before_final_root_lstat(path, *, dir_fd=None):
+        nonlocal root_observations, swapped
+        if path == str(root) and dir_fd is None:
+            root_observations += 1
+            if root_observations == 2:
+                root.rename(displaced)
+                replacement.rename(root)
+                swapped = True
+        return original_lstat(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(permits, "_preparation_lstat", swap_before_final_root_lstat)
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        prepare_scoped_terminal_contract(contract)
+
+    assert root_observations == 2
+    assert swapped is True
+    assert exc.value.failure_class == "preparation_source_changed"
 
 
 def test_directory_preparation_rejects_manifest_only_identity_after_same_size_mutation(
