@@ -710,9 +710,18 @@ def test_bookkeeper_manifest_preparation_writes_manifest_before_contract(monkeyp
         "predecessor_receipt_digest": None,
         "command_digest": "1" * 64,
     }
+    preflight = json.loads(
+        kt._handle_preflight_terminal_contract({"task_id": target, "contract": contract})
+    )
+    assert preflight["ok"] is True, repr(preflight)
+    assert preflight["contract"]["operation_sequence"]
     result = json.loads(
         kt._handle_prepare_terminal_contract(
-            {"task_id": target, "contract_path": str(contract_path), "contract": contract}
+            {
+                "task_id": target,
+                "contract_path": str(contract_path),
+                "contract": preflight["contract"],
+            }
         )
     )
     assert result["ok"] is True, repr(result)

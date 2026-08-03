@@ -492,6 +492,9 @@ def _validate_operation_policy(
     if kind in {"rclone_copy", "rclone_verify"}:
         if len(argv) != 4 or tuple(argv[:2]) != prefix:
             raise ScopedTerminalPermitError("operation_forbidden")
+        if source["kind"] == "directory" and source["manifest_path"] is not None:
+            if operation["manifest_ref"] != "manifest":
+                raise ScopedTerminalPermitError("operation_forbidden")
         if operation["manifest_ref"] is None:
             if argv[2] != source["canonical_path"] or argv[3] != destination["canonical_uri"]:
                 raise ScopedTerminalPermitError("operation_forbidden")
@@ -785,11 +788,7 @@ def _read_preparation_source_metadata(
         if not stat.S_ISDIR(info.st_mode):
             raise ScopedTerminalPermitError("preparation_source_unreadable")
         size, digest = _read_preparation_directory_digest(path, initial_stat=info)
-        if (
-            source["manifest_path"] is not None
-            and os.path.isfile(source["manifest_path"])
-            and _member_manifest_is_structured(source["manifest_path"])
-        ):
+        if source["manifest_path"] is not None:
             size, digest = _read_manifest_selected_metadata(source, info)
     else:  # pragma: no cover - _normalize_contract owns this check.
         raise ScopedTerminalPermitError("malformed")
@@ -946,40 +945,55 @@ def _load_member_manifest(path: str) -> tuple[bytes, list[dict[str, Any]]]:
     return data, normalized
 
 
-def _member_manifest_is_structured(path: str) -> bool:
-    try:
-        data = _read_preparation_file_bytes(path)
-        value = json.loads(data.decode("utf-8"))
-    except (ScopedTerminalPermitError, UnicodeDecodeError, json.JSONDecodeError):
-        return True
-    return not isinstance(value, list)
-
-
 def _read_manifest_selected_metadata(
     source: Mapping[str, Any], initial_stat: os.stat_result
 ) -> tuple[int, str]:
     manifest_path = source["manifest_path"]
-    _, declared = _load_member_manifest(manifest_path)
+    manifest_bytes, declared = _load_member_manifest(manifest_path)
     observed = _inventory_manifest_members(source["canonical_path"], initial_stat)
     if observed != declared:
         raise ScopedTerminalPermitError("preparation_manifest_mismatch")
-    safe = [member for member in declared if member["classification"] == "safe"]
+    return _manifest_selected_metadata(declared)
+
+
+def _manifest_selected_metadata(members: list[dict[str, Any]]) -> tuple[int, str]:
+    safe = [member for member in members if member["classification"] == "safe"]
     if not safe:
         raise ScopedTerminalPermitError("preparation_no_safe_members")
     return sum(member["size"] for member in safe), _digest(_canonical_bytes(safe))
 
 
-def _validate_manifest_operation_members(
-    source: Mapping[str, Any], destination: Mapping[str, Any], operations: list[dict[str, Any]]
+def _validate_manifest_source_metadata(
+    source: Mapping[str, Any], manifest_bytes: bytes, members: list[dict[str, Any]]
 ) -> None:
-    manifest_operations = [operation for operation in operations if operation["manifest_ref"]]
-    if not manifest_operations:
+    selected_size, selected_digest = _manifest_selected_metadata(members)
+    if (
+        _digest(manifest_bytes) != source["manifest_sha256"]
+        or selected_size != source["expected_size_bytes"]
+        or selected_digest != source["content_sha256"]
+    ):
+        raise ScopedTerminalPermitError("preparation_manifest_mismatch")
+
+
+def _validate_manifest_operation_members(
+    source: Mapping[str, Any],
+    destination: Mapping[str, Any],
+    operations: list[dict[str, Any]],
+    *,
+    manifest_bytes: bytes | None = None,
+    members: list[dict[str, Any]] | None = None,
+    validate_source_metadata: bool = True,
+) -> None:
+    if source["kind"] != "directory" or source["manifest_path"] is None:
         return
-    if source["manifest_path"] is None or not os.path.isfile(source["manifest_path"]):
-        raise ScopedTerminalPermitError("preparation_manifest_unreadable")
-    if not _member_manifest_is_structured(source["manifest_path"]):
-        return
-    _, members = _load_member_manifest(source["manifest_path"])
+    if any(operation["manifest_ref"] != "manifest" for operation in operations):
+        raise ScopedTerminalPermitError("operation_forbidden")
+    if members is None or manifest_bytes is None:
+        if not os.path.isfile(source["manifest_path"]):
+            raise ScopedTerminalPermitError("preparation_manifest_unreadable")
+        manifest_bytes, members = _load_member_manifest(source["manifest_path"])
+    if validate_source_metadata:
+        _validate_manifest_source_metadata(source, manifest_bytes, members)
     safe_paths = {
         _canonical_operation_path(os.path.join(source["canonical_path"], member["path"]))
         for member in members
@@ -990,7 +1004,7 @@ def _validate_manifest_operation_members(
     unlink_paths: set[str] = set()
     rmdir_paths: list[str] = []
     phases: list[int] = []
-    for operation in manifest_operations:
+    for operation in operations:
         targets = operation["argv"][2:]
         if operation["kind"] in {"rclone_copy", "rclone_verify"}:
             target = _canonical_operation_path(targets[0])
@@ -1010,9 +1024,9 @@ def _validate_manifest_operation_members(
         copy_paths != safe_paths
         or verify_paths != safe_paths
         or unlink_paths != safe_paths
-        or len(copy_paths) != sum(1 for operation in manifest_operations if operation["kind"] == "rclone_copy")
-        or len(verify_paths) != sum(1 for operation in manifest_operations if operation["kind"] == "rclone_verify")
-        or len(unlink_paths) != sum(len(operation["argv"][2:]) for operation in manifest_operations if operation["kind"] == "unlink_manifest_batch")
+        or len(copy_paths) != sum(1 for operation in operations if operation["kind"] == "rclone_copy")
+        or len(verify_paths) != sum(1 for operation in operations if operation["kind"] == "rclone_verify")
+        or len(unlink_paths) != sum(len(operation["argv"][2:]) for operation in operations if operation["kind"] == "unlink_manifest_batch")
         or phases != sorted(phases)
     ):
         raise ScopedTerminalPermitError("operation_forbidden")
@@ -1028,6 +1042,158 @@ def _validate_manifest_operation_members(
         key=lambda path: (-len(os.path.relpath(path, source["canonical_path"]).split(os.sep)), path),
     ):
         raise ScopedTerminalPermitError("operation_forbidden")
+
+
+def _manifest_relative_parts(relative_path: str) -> list[str]:
+    parts = relative_path.split("/")
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ScopedTerminalPermitError("preparation_manifest_malformed")
+    return parts
+
+
+def _live_lstat_or_missing(name: str, *, dir_fd: int | None = None) -> os.stat_result | None:
+    try:
+        if dir_fd is None:
+            return os.stat(name, follow_symlinks=False)
+        return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ScopedTerminalPermitError("preparation_source_unreadable") from exc
+
+
+def _live_manifest_file_digest(
+    root: str, relative_path: str, *, allow_missing: bool
+) -> tuple[int, str] | None:
+    """Read one selected member through stable directory descriptors."""
+    initial_root = _preparation_lstat(root)
+    root_fd = _open_preparation_directory(root, expected=initial_root)
+    descriptors = [root_fd]
+    current_fd = root_fd
+    result: tuple[int, str] | None = None
+    try:
+        for component in _manifest_relative_parts(relative_path)[:-1]:
+            child_info = _live_lstat_or_missing(component, dir_fd=current_fd)
+            if child_info is None:
+                break
+            if not stat.S_ISDIR(child_info.st_mode):
+                raise ScopedTerminalPermitError("preparation_source_unreadable")
+            child_fd = _open_preparation_directory(
+                component, dir_fd=current_fd, expected=child_info
+            )
+            descriptors.append(child_fd)
+            current_fd = child_fd
+        else:
+            name = _manifest_relative_parts(relative_path)[-1]
+            member_info = _live_lstat_or_missing(name, dir_fd=current_fd)
+            if member_info is not None:
+                if not stat.S_ISREG(member_info.st_mode):
+                    raise ScopedTerminalPermitError("preparation_source_unreadable")
+                result = _read_preparation_file_digest(name, dir_fd=current_fd)
+        if result is None and not allow_missing:
+            raise ScopedTerminalPermitError("preparation_manifest_mismatch")
+        if (
+            _preparation_stat_identity(initial_root)
+            != _preparation_stat_identity(os.fstat(root_fd))
+            or _preparation_stat_identity(initial_root)
+            != _preparation_stat_identity(_preparation_lstat(root))
+        ):
+            raise ScopedTerminalPermitError("preparation_source_changed")
+        return result
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _live_manifest_directory_exists(root: str, relative_path: str) -> bool:
+    """Check a selected deletion directory without following replacement links."""
+    initial_root = _preparation_lstat(root)
+    root_fd = _open_preparation_directory(root, expected=initial_root)
+    descriptors = [root_fd]
+    current_fd = root_fd
+    exists = True
+    try:
+        for component in _manifest_relative_parts(relative_path):
+            child_info = _live_lstat_or_missing(component, dir_fd=current_fd)
+            if child_info is None:
+                exists = False
+                break
+            if not stat.S_ISDIR(child_info.st_mode):
+                raise ScopedTerminalPermitError("preparation_source_unreadable")
+            child_fd = _open_preparation_directory(
+                component, dir_fd=current_fd, expected=child_info
+            )
+            descriptors.append(child_fd)
+            current_fd = child_fd
+        if (
+            _preparation_stat_identity(initial_root)
+            != _preparation_stat_identity(os.fstat(root_fd))
+            or _preparation_stat_identity(initial_root)
+            != _preparation_stat_identity(_preparation_lstat(root))
+        ):
+            raise ScopedTerminalPermitError("preparation_source_changed")
+        return exists
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _revalidate_live_manifest_operation(payload: Mapping[str, Any]) -> None:
+    """Re-read only the members the next signed operation is allowed to touch."""
+    source = payload["source"]
+    if source["kind"] != "directory" or source["manifest_path"] is None:
+        return
+    manifest_bytes, members = _load_member_manifest(source["manifest_path"])
+    _validate_manifest_source_metadata(source, manifest_bytes, members)
+    operations = payload["operation_sequence"]
+    _validate_manifest_operation_members(
+        source,
+        payload["destination"],
+        operations,
+        manifest_bytes=manifest_bytes,
+        members=members,
+    )
+    root = source["canonical_path"]
+    safe_members = {
+        _canonical_operation_path(os.path.join(root, member["path"])): member
+        for member in members
+        if member["classification"] == "safe"
+    }
+    current_index = payload["authorized_operation_index"]
+    expected_removed_files: set[str] = set()
+    expected_removed_directories: set[str] = set()
+    for previous in operations[:current_index]:
+        if previous["kind"] == "unlink_manifest_batch":
+            expected_removed_files.update(previous["argv"][2:])
+        elif previous["kind"] == "rmdir_manifest_batch":
+            expected_removed_directories.update(previous["argv"][2:])
+    for path in expected_removed_files:
+        relative = os.path.relpath(path, root).replace(os.sep, "/")
+        if _live_manifest_file_digest(root, relative, allow_missing=True) is not None:
+            raise ScopedTerminalPermitError("preparation_manifest_mismatch")
+    for path in expected_removed_directories:
+        relative = os.path.relpath(path, root).replace(os.sep, "/")
+        if _live_manifest_directory_exists(root, relative):
+            raise ScopedTerminalPermitError("preparation_manifest_mismatch")
+    operation = operations[current_index]
+    if operation["kind"] in {"rclone_copy", "rclone_verify"}:
+        targets = [operation["argv"][2]]
+    else:
+        targets = operation["argv"][2:]
+    if operation["kind"] == "rmdir_manifest_batch":
+        for path in targets:
+            relative = os.path.relpath(path, root).replace(os.sep, "/")
+            if not _live_manifest_directory_exists(root, relative):
+                raise ScopedTerminalPermitError("preparation_manifest_mismatch")
+        return
+    for path in targets:
+        member = safe_members.get(path)
+        if member is None:
+            raise ScopedTerminalPermitError("preparation_manifest_mismatch")
+        relative = os.path.relpath(path, root).replace(os.sep, "/")
+        observed = _live_manifest_file_digest(root, relative, allow_missing=False)
+        if observed != (member["size"], member["sha256"]):
+            raise ScopedTerminalPermitError("preparation_manifest_mismatch")
 
 
 def _remote_member_uri(destination: str, relative_path: str) -> str:
@@ -1136,6 +1302,25 @@ def _build_manifest_contract(
     return final_contract, manifest_bytes
 
 
+def _validate_manifest_prepare_marker(marker: Any, workspace: str) -> None:
+    """Require the only accepted generated-manifest request to be fully typed."""
+    if not isinstance(marker, dict) or set(marker) != _OPERATION_FIELDS:
+        raise ScopedTerminalPermitError("malformed")
+    if (
+        _require_int(marker["index"]) != 0
+        or marker["kind"] != "manifest_prepare"
+        or marker["argv"] != ["manifest", "prepare"]
+        or _canonical_operation_path(marker["cwd"]) != workspace
+        or marker["background"] is not False
+        or marker["pty"] is not False
+        or marker["source_ref"] != "source"
+        or marker["destination_ref"] != "destination"
+        or marker["manifest_ref"] != "manifest"
+    ):
+        raise ScopedTerminalPermitError("operation_forbidden")
+    _require_digest(marker["execution_context_digest"])
+
+
 def _normalize_preflight_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
     """Validate an exact scope draft whose observed source digests are unset.
 
@@ -1164,16 +1349,12 @@ def _normalize_preflight_contract(contract: Mapping[str, Any]) -> dict[str, Any]
         source["kind"] == "directory"
         and source["manifest_path"] is not None
         and isinstance(operation_sequence, list)
-        and (
-            not operation_sequence
-            or (
-                len(operation_sequence) == 1
-                and isinstance(operation_sequence[0], dict)
-                and operation_sequence[0].get("kind") == "manifest_prepare"
-            )
-        )
+        and len(operation_sequence) == 1
+        and isinstance(operation_sequence[0], dict)
+        and operation_sequence[0].get("kind") == "manifest_prepare"
     )
-    if generated:
+    if generated and isinstance(operation_sequence, list):
+        _validate_manifest_prepare_marker(operation_sequence[0], copied["workspace"])
         copied["operation_sequence"] = []
     # A deterministic zero digest exists only while _normalize_contract checks
     # the declared paths/argv policy. It is replaced solely with observed data
@@ -1185,7 +1366,19 @@ def _normalize_preflight_contract(contract: Mapping[str, Any]) -> dict[str, Any]
     provisional_source["manifest_sha256"] = (
         "0" * 64 if provisional_source["manifest_path"] is not None else None
     )
-    return _normalize_contract(provisional, allow_empty_operations=generated)
+    normalized = _normalize_contract(
+        provisional,
+        allow_empty_operations=generated,
+        validate_manifest=False,
+    )
+    if not generated:
+        _validate_manifest_operation_members(
+            normalized["source"],
+            normalized["destination"],
+            normalized["operation_sequence"],
+            validate_source_metadata=False,
+        )
+    return normalized
 
 
 def _prepared_terminal_contract(
@@ -1260,6 +1453,13 @@ def preflight_scoped_terminal_contract(
             context_digest=marker_context_digest,
         )
         normalized = _normalize_contract(final_contract, validate_manifest=False)
+        _validate_manifest_operation_members(
+            normalized["source"],
+            normalized["destination"],
+            normalized["operation_sequence"],
+            manifest_bytes=manifest_bytes,
+            members=members,
+        )
         safe = [member for member in members if member["classification"] == "safe"]
         return _prepared_terminal_contract(
             normalized,
@@ -1297,29 +1497,38 @@ def prepare_scoped_terminal_contract(
     source and manifest to verify size/digests, but it never grants authority,
     opens a network connection, invokes a subprocess, or mutates storage.
     """
-    if isinstance(contract, Mapping):
-        source = contract.get("source")
-        operations = contract.get("operation_sequence")
-        if (
-            isinstance(source, Mapping)
-            and source.get("kind") == "directory"
-            and source.get("manifest_path") is not None
-            and isinstance(operations, list)
-            and (
-                not operations
-                or (
-                    len(operations) == 1
-                    and isinstance(operations[0], Mapping)
-                    and operations[0].get("kind") == "manifest_prepare"
-                )
-            )
-            and all(
-                source.get(field) is None
-                for field in ("expected_size_bytes", "content_sha256", "manifest_sha256")
-            )
-        ):
-            return preflight_scoped_terminal_contract(contract)
-    normalized = _normalize_contract(contract)
+    raw_source = contract.get("source") if isinstance(contract, Mapping) else None
+    manifest_missing = (
+        isinstance(raw_source, Mapping)
+        and raw_source.get("kind") == "directory"
+        and isinstance(raw_source.get("manifest_path"), str)
+        and not os.path.exists(raw_source["manifest_path"])
+    )
+    normalized = _normalize_contract(contract, validate_manifest=not manifest_missing)
+    if manifest_missing:
+        source = normalized["source"]
+        info = _preparation_lstat(source["canonical_path"])
+        if not stat.S_ISDIR(info.st_mode):
+            raise ScopedTerminalPermitError("preparation_source_unreadable")
+        members = _inventory_manifest_members(source["canonical_path"], info)
+        manifest_bytes = _canonical_bytes(
+            {"version": _MANIFEST_VERSION, "members": sorted(members, key=lambda item: item["path"])}
+        )
+        _validate_manifest_operation_members(
+            source,
+            normalized["destination"],
+            normalized["operation_sequence"],
+            manifest_bytes=manifest_bytes,
+            members=members,
+        )
+        source_size, content_digest = _manifest_selected_metadata(members)
+        return _prepared_terminal_contract(
+            normalized,
+            source_size=source_size,
+            content_digest=content_digest,
+            manifest_digest=_digest(manifest_bytes),
+            manifest_bytes=manifest_bytes,
+        )
     source_size, content_digest, manifest_digest = _preparation_source_readback(
         normalized["source"]
     )
@@ -2466,6 +2675,10 @@ class _WorkerPermitClient:
             _discard_prepared_ticket(ticket, self)
             self._prepared_ticket = None
             self._prepared_ticket_binding = None
+        try:
+            _revalidate_live_manifest_operation(self._payload)
+        except ScopedTerminalPermitError as exc:
+            self._reject_pre_send_input(exc.failure_class)
         challenge = secrets.token_hex(32)
         request = {
             "version": 1,

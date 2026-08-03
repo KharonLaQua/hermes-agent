@@ -606,6 +606,7 @@ def _handle_preflight_terminal_contract(args: dict, **kw) -> str:
             conn.close()
         return _ok(
             task_id=task_id,
+            contract=prepared.contract,
             contract_digest=prepared.contract_digest,
             operation_sequence_digest=prepared.operation_sequence_digest,
             authorized_operation_index=prepared.contract["authorized_operation_index"],
@@ -1993,11 +1994,12 @@ def _board_schema_prop() -> dict[str, str]:
 KANBAN_PREFLIGHT_TERMINAL_CONTRACT_SCHEMA = {
     "name": "kanban_preflight_terminal_contract",
     "description": (
-        "Derive canonical source inventory and operation digests for one exact "
-        "current-worker contract draft. The draft must declare all scope and "
-        "operation fields while leaving source size/content/manifest digests "
-        "unset. This tool is read-only and non-authorizing: it never writes a "
-        "contract, arms, resumes, executes, uploads, unlinks, or removes."
+        "Derive a canonical final contract and source inventory for one exact "
+        "current-worker draft. The draft must declare all scope and operation "
+        "fields while leaving source size/content/manifest digests unset. The "
+        "read-only result includes contract: use that exact enriched object in "
+        "the subsequent preparation request. This tool never writes a contract, "
+        "arms, resumes, executes, uploads, unlinks, or removes."
     ),
     "parameters": {
         "type": "object",
@@ -2007,7 +2009,8 @@ KANBAN_PREFLIGHT_TERMINAL_CONTRACT_SCHEMA = {
                 "type": "object",
                 "description": (
                     "Exact typed contract draft with source expected_size_bytes, "
-                    "content_sha256, and manifest_sha256 set to null."
+                    "content_sha256, and manifest_sha256 set to null. Generated "
+                    "member-manifest drafts require one complete typed manifest_prepare marker."
                 ),
             },
             "board": _board_schema_prop(),
@@ -2023,8 +2026,10 @@ KANBAN_PREPARE_TERMINAL_CONTRACT_SCHEMA = {
         "Prepare one typed, exact terminal operation contract for the current "
         "worker task. This is non-destructive and read-only except for creating "
         "a new private contract artifact directly in the signed workspace; it "
-        "never arms, resumes, executes, uploads, or deletes. Returns only "
-        "digests, sizes, and operation-index metadata."
+        "never arms, resumes, executes, uploads, or deletes. For generated "
+        "member manifests, pass the exact enriched contract returned by read-only "
+        "preflight, not the marker draft. Returns only digests, sizes, and "
+        "operation-index metadata."
     ),
     "parameters": {
         "type": "object",

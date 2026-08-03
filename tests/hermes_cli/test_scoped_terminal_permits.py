@@ -106,8 +106,6 @@ def _directory_contract(tmp_path, *, with_content_identity=True):
     (nested / "child.bin").write_bytes(b"child-data")
 
     contract = _contract(tmp_path)
-    manifest = tmp_path / "directory-manifest.json"
-    manifest.write_text("[]", encoding="utf-8")
     contract["source"] = {
         "kind": "directory",
         "canonical_path": str(root),
@@ -117,8 +115,8 @@ def _directory_contract(tmp_path, *, with_content_identity=True):
         "content_sha256": _directory_content_digest(root)
         if with_content_identity
         else None,
-        "manifest_path": str(manifest),
-        "manifest_sha256": hashlib.sha256(b"[]").hexdigest(),
+        "manifest_path": None,
+        "manifest_sha256": None,
     }
     contract["operation_sequence"][0]["argv"] = [
         "rclone",
@@ -266,6 +264,7 @@ def test_preflight_derives_secret_excluded_manifest_and_complete_sequence(tmp_pa
     prepared = preflight_scoped_terminal_contract(draft)
 
     assert prepared.manifest_bytes is not None
+    assert len(prepared.manifest_bytes) <= 1_048_576
     assert secret_value.encode() not in prepared.manifest_bytes
     assert secret_value not in prepared.readback_json
     manifest = json.loads(prepared.manifest_bytes)
@@ -297,6 +296,80 @@ def test_preflight_derives_secret_excluded_manifest_and_complete_sequence(tmp_pa
     (tmp_path / "manifest-source" / "safe.txt").write_text("mutated", encoding="utf-8")
     with pytest.raises(ScopedTerminalPermitError):
         prepare_scoped_terminal_contract(prepared.contract)
+
+
+def test_preflight_manifest_generation_marker_must_be_a_complete_typed_request(tmp_path):
+    from hermes_cli.scoped_terminal_permits import preflight_scoped_terminal_contract
+
+    draft, _ = _manifest_draft(tmp_path)
+    draft["operation_sequence"] = [{"kind": "manifest_prepare"}]
+
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        preflight_scoped_terminal_contract(draft)
+
+    assert exc.value.failure_class == "malformed"
+    assert not (tmp_path / "workspace" / "safe-members.json").exists()
+
+
+@pytest.mark.parametrize("operation_index", [0, 2])
+def test_manifest_contract_rejects_unbound_whole_root_copy_or_check(tmp_path, operation_index):
+    from hermes_cli.scoped_terminal_permits import (
+        _normalize_contract,
+        preflight_scoped_terminal_contract,
+    )
+
+    draft, _ = _manifest_draft(tmp_path)
+    prepared = preflight_scoped_terminal_contract(draft)
+    manifest_path = tmp_path / "workspace" / "safe-members.json"
+    manifest_path.write_bytes(prepared.manifest_bytes)
+    unbound = copy.deepcopy(prepared.contract["operation_sequence"][operation_index])
+    executable = "copyto" if unbound["kind"] == "rclone_copy" else "check"
+    unbound.update(
+        {
+            "index": 0,
+            "argv": [
+                "rclone",
+                executable,
+                prepared.contract["source"]["canonical_path"],
+                prepared.contract["destination"]["canonical_uri"],
+            ],
+            "manifest_ref": None,
+        }
+    )
+    contract = copy.deepcopy(prepared.contract)
+    contract["operation_sequence"] = [unbound]
+
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        _normalize_contract(contract)
+
+    assert exc.value.failure_class == "operation_forbidden"
+
+
+def test_manifest_contract_rejects_legacy_list_and_excluded_in_root_deletion(tmp_path):
+    from hermes_cli.scoped_terminal_permits import (
+        _normalize_contract,
+        preflight_scoped_terminal_contract,
+    )
+
+    draft, _ = _manifest_draft(tmp_path)
+    prepared = preflight_scoped_terminal_contract(draft)
+    manifest_path = tmp_path / "workspace" / "safe-members.json"
+    manifest_path.write_text("[]", encoding="utf-8")
+    contract = copy.deepcopy(prepared.contract)
+    contract["source"]["manifest_sha256"] = hashlib.sha256(b"[]").hexdigest()
+    excluded = copy.deepcopy(prepared.contract["operation_sequence"][-2])
+    excluded.update(
+        {
+            "index": 0,
+            "argv": ["rm", "--", str(tmp_path / "manifest-source" / "settings.txt")],
+        }
+    )
+    contract["operation_sequence"] = [excluded]
+
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        _normalize_contract(contract)
+
+    assert exc.value.failure_class == "preparation_manifest_malformed"
 
 
 def test_preflight_manifest_draft_rejects_ambiguous_member(tmp_path):
@@ -728,7 +801,7 @@ def test_arm_accepts_exact_rclone_verify_argv(permit_factory, tmp_path):
 
 
 @pytest.mark.parametrize("kind", ["unlink_manifest_batch", "rmdir_manifest_batch"])
-def test_arm_accepts_manifest_bounded_batch_forms(permit_factory, tmp_path, kind):
+def test_arm_rejects_bare_manifest_batch_forms(permit_factory, tmp_path, kind):
     _, issuer, _, _, _ = permit_factory
     contract = _contract(tmp_path)
     root = str(tmp_path)
@@ -743,14 +816,17 @@ def test_arm_accepts_manifest_bounded_batch_forms(permit_factory, tmp_path, kind
         targets = [str(tmp_path / "nested" / "empty"), str(tmp_path / "nested")]
         executable = "rmdir"
     contract["operation_sequence"][0]["argv"] = [executable, "--", *targets]
-    issuer.arm_next_run(
-        board_slug="default",
-        task_id=f"t_{kind}",
-        contract=contract,
-        ttl_seconds=60,
-        evidence_task_id="t_evidence",
-        evidence_artifact_digest=_HEX_A,
-    )
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        issuer.arm_next_run(
+            board_slug="default",
+            task_id=f"t_{kind}",
+            contract=contract,
+            ttl_seconds=60,
+            evidence_task_id="t_evidence",
+            evidence_artifact_digest=_HEX_A,
+        )
+
+    assert exc.value.failure_class == "preparation_manifest_malformed"
 
 
 def test_activate_binds_claimed_run_profile_home_and_workspace(permit_factory):
@@ -1484,6 +1560,94 @@ def test_worker_execution_context_combines_live_identity_with_signed_scope(
     )
     client.close()
     channel.close()
+
+
+def test_worker_consume_rejects_manifest_member_changed_after_phase_a(
+    monkeypatch, tmp_path
+):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    monkeypatch.setattr(permits, "_WORKER_CHANNEL_CLAIMED", False)
+    monkeypatch.setattr(permits, "_WORKER_PERMIT_CLIENT", None)
+    monkeypatch.setattr(permits, "_PREPARED_TICKET_ORIGINS", {})
+    now = [1_800_000_000]
+    monkeypatch.setattr(permits.time, "time", lambda: now[0])
+    issuer = ScopedTerminalPermitIssuer(
+        issuer_profile="bookkeeper",
+        lock_owner_check=lambda: True,
+        clock=lambda: now[0],
+        audit_writer=lambda *_args: None,
+    )
+    draft, _ = _manifest_draft(tmp_path)
+    prepared_contract = permits.preflight_scoped_terminal_contract(draft)
+    manifest_path = tmp_path / "workspace" / "safe-members.json"
+    manifest_path.write_bytes(prepared_contract.manifest_bytes)
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id="t_live_manifest",
+        contract=prepared_contract.contract,
+        ttl_seconds=60,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest=_HEX_A,
+    )
+    channel = issuer.activate_spawn_channel(
+        board_slug="default",
+        task_id="t_live_manifest",
+        run_id=47,
+        profile="bookkeeper",
+        profile_home=str(tmp_path / "profile"),
+        workspace=str(tmp_path / "workspace"),
+    )
+    channel.send_envelope()
+    monkeypatch.setenv(permits.PERMIT_FD_ENV, str(os.dup(channel.child_fd)))
+    client = claim_worker_permit_channel()
+    issuer.release_spawn_child(channel)
+    payload = json.loads(channel.permit.payload)
+    context = {key: copy.deepcopy(payload[key]) for key in issuer.CONTEXT_FIELDS}
+    command = " ".join(payload["operation_sequence"][0]["argv"])
+    ticket = prepare_scoped_terminal_permit(command, "local", context, client=client)
+    with open(payload["operation_sequence"][0]["argv"][2], "wb") as changed_member:
+        changed_member.write(b"changed")
+
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        consume_scoped_terminal_permit(ticket, context)
+
+    assert exc.value.failure_class == "preparation_manifest_mismatch"
+    assert client._closed is True
+    assert issuer.permit_status(payload["permit_id"]) == "issued"
+    channel.close()
+
+
+def test_live_manifest_readback_allows_expected_prior_unlink_and_rmdir_progression(tmp_path):
+    draft, _ = _manifest_draft(tmp_path)
+    second_directory = tmp_path / "manifest-source" / "second"
+    second_directory.mkdir()
+    (second_directory / "safe.bin").write_bytes(b"second safe member")
+    prepared = permits.preflight_scoped_terminal_contract(draft)
+    manifest_path = tmp_path / "workspace" / "safe-members.json"
+    manifest_path.write_bytes(prepared.manifest_bytes)
+    operations = copy.deepcopy(prepared.contract["operation_sequence"])
+    rmdir = operations.pop()
+    first_target, second_target = rmdir["argv"][2:]
+    first_rmdir = copy.deepcopy(rmdir)
+    first_rmdir["argv"] = ["rmdir", "--", first_target]
+    second_rmdir = copy.deepcopy(rmdir)
+    second_rmdir["index"] += 1
+    second_rmdir["argv"] = ["rmdir", "--", second_target]
+    operations.extend([first_rmdir, second_rmdir])
+    for operation in operations:
+        if operation["kind"] == "unlink_manifest_batch":
+            for path in operation["argv"][2:]:
+                os.unlink(path)
+    os.rmdir(first_target)
+    payload = {
+        "source": prepared.contract["source"],
+        "destination": prepared.contract["destination"],
+        "operation_sequence": operations,
+        "authorized_operation_index": second_rmdir["index"],
+    }
+
+    getattr(permits, "_revalidate_live_manifest_operation")(payload)
 
 
 @pytest.mark.parametrize(
