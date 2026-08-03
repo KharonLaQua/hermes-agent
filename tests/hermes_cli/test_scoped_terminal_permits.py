@@ -7,6 +7,7 @@ import os
 import shutil
 import threading
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -177,6 +178,19 @@ def _manifest_draft(tmp_path):
     }, secret_value
 
 
+def _prepared_manifest_revalidation_payload(tmp_path):
+    draft, _ = _manifest_draft(tmp_path)
+    prepared = permits.preflight_scoped_terminal_contract(draft)
+    manifest_path = tmp_path / "workspace" / "safe-members.json"
+    manifest_path.write_bytes(prepared.manifest_bytes)
+    return prepared, {
+        "source": prepared.contract["source"],
+        "destination": prepared.contract["destination"],
+        "operation_sequence": prepared.contract["operation_sequence"],
+        "authorized_operation_index": 0,
+    }
+
+
 def test_prepare_scoped_terminal_contract_returns_canonical_digest_only_artifact(
     tmp_path,
 ):
@@ -296,6 +310,45 @@ def test_preflight_derives_secret_excluded_manifest_and_complete_sequence(tmp_pa
     (tmp_path / "manifest-source" / "safe.txt").write_text("mutated", encoding="utf-8")
     with pytest.raises(ScopedTerminalPermitError):
         prepare_scoped_terminal_contract(prepared.contract)
+
+
+def test_preflight_manifest_binds_descriptor_observed_root_identity(tmp_path):
+    draft, _ = _manifest_draft(tmp_path)
+    prepared = permits.preflight_scoped_terminal_contract(draft)
+    assert prepared.manifest_bytes is not None
+    manifest = json.loads(prepared.manifest_bytes)
+    root_info = (tmp_path / "manifest-source").stat()
+
+    assert manifest["root_identity"] == {
+        "device": root_info.st_dev,
+        "inode": root_info.st_ino,
+    }
+
+
+def test_prepare_rejects_oversized_existing_manifest_at_common_boundary(
+    monkeypatch, tmp_path
+):
+    draft, _ = _manifest_draft(tmp_path)
+    root = tmp_path / "manifest-source"
+    for index in range(40):
+        (root / f"secret-{index:02d}.txt").write_text(
+            'API_KEY="abcdefghijklmnop"\n', encoding="utf-8"
+        )
+    prepared = permits.preflight_scoped_terminal_contract(draft)
+    assert prepared.manifest_bytes is not None
+    manifest_path = tmp_path / "workspace" / "safe-members.json"
+    manifest_path.write_bytes(prepared.manifest_bytes)
+    assert len(prepared.manifest_bytes) > len(prepared.canonical_bytes)
+    monkeypatch.setattr(
+        permits,
+        "_MANIFEST_MAX_CONTRACT_BYTES",
+        (len(prepared.manifest_bytes) + len(prepared.canonical_bytes)) // 2,
+    )
+
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        prepare_scoped_terminal_contract(prepared.contract)
+
+    assert exc.value.failure_class == "preparation_contract_too_large"
 
 
 def test_preflight_manifest_generation_marker_must_be_a_complete_typed_request(tmp_path):
@@ -1616,6 +1669,60 @@ def test_worker_consume_rejects_manifest_member_changed_after_phase_a(
     assert client._closed is True
     assert issuer.permit_status(payload["permit_id"]) == "issued"
     channel.close()
+
+
+@pytest.mark.parametrize("mutation", ["secret_changed", "member_added", "excluded_removed"])
+def test_live_manifest_readback_rejects_complete_inventory_mutation(
+    tmp_path, mutation
+):
+    _prepared, payload = _prepared_manifest_revalidation_payload(tmp_path)
+    root = tmp_path / "manifest-source"
+    if mutation == "secret_changed":
+        (root / "settings.txt").write_text(
+            'API_KEY = "different-secret-value"\n', encoding="utf-8"
+        )
+    elif mutation == "member_added":
+        (root / "unplanned.txt").write_text("unplanned", encoding="utf-8")
+    else:
+        (root / "settings.txt").unlink()
+
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        getattr(permits, "_revalidate_live_manifest_operation")(payload)
+
+    assert exc.value.failure_class == "preparation_manifest_mismatch"
+
+
+def test_live_manifest_readback_rejects_same_byte_member_under_replaced_root(tmp_path):
+    _prepared, payload = _prepared_manifest_revalidation_payload(tmp_path)
+    root = tmp_path / "manifest-source"
+    replacement = tmp_path / "same-content-replacement"
+    displaced = tmp_path / "displaced-manifest-source"
+    selected_target = payload["operation_sequence"][0]["argv"][2]
+    selected_bytes = Path(selected_target).read_bytes()
+    shutil.copytree(root, replacement)
+    root.rename(displaced)
+    replacement.rename(root)
+    assert Path(selected_target).read_bytes() == selected_bytes
+
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        getattr(permits, "_revalidate_live_manifest_operation")(payload)
+
+    assert exc.value.failure_class == "preparation_source_changed"
+
+
+def test_live_manifest_readback_rejects_wrong_expected_prior_removal(tmp_path):
+    prepared, payload = _prepared_manifest_revalidation_payload(tmp_path)
+    unlink = next(
+        operation
+        for operation in prepared.contract["operation_sequence"]
+        if operation["kind"] == "unlink_manifest_batch"
+    )
+    payload["authorized_operation_index"] = unlink["index"] + 1
+
+    with pytest.raises(ScopedTerminalPermitError) as exc:
+        getattr(permits, "_revalidate_live_manifest_operation")(payload)
+
+    assert exc.value.failure_class == "preparation_manifest_mismatch"
 
 
 def test_live_manifest_readback_allows_expected_prior_unlink_and_rmdir_progression(tmp_path):

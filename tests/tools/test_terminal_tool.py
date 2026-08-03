@@ -1,10 +1,13 @@
 """Regression tests for terminal security and dispatch boundaries."""
-
+import copy
 import json
+import os
+import threading
 from types import SimpleNamespace
 
 import pytest
 
+import hermes_cli.scoped_terminal_permits as permits
 import tools.terminal_tool as terminal_tool
 
 
@@ -116,11 +119,22 @@ def test_scoped_permit_consumes_immediately_before_stubbed_foreground_dispatch(m
         consume,
         raising=False,
     )
+    monkeypatch.setattr(
+        terminal_tool,
+        "revalidate_scoped_terminal_permit_dispatch",
+        lambda _decision: events.append(("revalidate",)),
+    )
 
     result = json.loads(terminal_tool.terminal_tool(command="rclone copyto source target"))
 
     assert result["exit_code"] == 0
-    assert [event[0] for event in events] == ["context", "guard", "consume", "execute"]
+    assert [event[0] for event in events] == [
+        "context",
+        "guard",
+        "consume",
+        "revalidate",
+        "execute",
+    ]
     assert events[2][1] is ticket
     assert events[2][2] is events[1][3]
     assert events[1][3] == {
@@ -155,6 +169,134 @@ def test_scoped_permit_rejection_never_calls_environment_execute(monkeypatch):
     assert result["status"] == "blocked"
     assert result["exit_code"] == -1
     assert "task_mismatch" in result["error"]
+    assert not any(event[0] == "execute" for event in events)
+
+
+def test_scoped_permit_revalidates_after_broker_allow_before_environment_execute(
+    monkeypatch, tmp_path
+):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    monkeypatch.setattr(permits, "_WORKER_CHANNEL_CLAIMED", False)
+    monkeypatch.setattr(permits, "_WORKER_PERMIT_CLIENT", None)
+    monkeypatch.setattr(permits, "_PREPARED_TICKET_ORIGINS", {})
+    profile_home = tmp_path / "profile"
+    workspace = tmp_path / "workspace"
+    root = tmp_path / "source"
+    for path in (profile_home, workspace, root):
+        path.mkdir()
+    (root / "safe.txt").write_text("safe", encoding="utf-8")
+    secret = root / "secret.txt"
+    secret.write_text('API_KEY="abcdefghijklmnop"\n', encoding="utf-8")
+    manifest_path = workspace / "manifest.json"
+    marker = {
+        "index": 0,
+        "kind": "manifest_prepare",
+        "argv": ["manifest", "prepare"],
+        "cwd": str(workspace),
+        "background": False,
+        "pty": False,
+        "source_ref": "source",
+        "destination_ref": "destination",
+        "manifest_ref": "manifest",
+        "execution_context_digest": "c" * 64,
+    }
+    draft = {
+        "profile": "bookkeeper",
+        "profile_home": str(profile_home),
+        "workspace": str(workspace),
+        "source": {
+            "kind": "directory",
+            "canonical_path": str(root),
+            "expected_size_bytes": None,
+            "content_sha256": None,
+            "manifest_path": str(manifest_path),
+            "manifest_sha256": None,
+        },
+        "destination": {
+            "kind": "rclone_remote",
+            "canonical_uri": "vault:reviewed/source",
+        },
+        "operation_sequence": [marker],
+        "authorized_operation_index": 0,
+        "predecessor_receipt_digest": None,
+        "command_digest": "b" * 64,
+    }
+    prepared_contract = permits.preflight_scoped_terminal_contract(draft)
+    assert prepared_contract.manifest_bytes is not None
+    manifest_path.write_bytes(prepared_contract.manifest_bytes)
+    issuer = permits.ScopedTerminalPermitIssuer(
+        issuer_profile="bookkeeper",
+        lock_owner_check=lambda: True,
+        audit_writer=lambda *_args: None,
+    )
+    issuer.arm_next_run(
+        board_slug="default",
+        task_id="t_broker_pause",
+        contract=prepared_contract.contract,
+        ttl_seconds=60,
+        evidence_task_id="t_evidence",
+        evidence_artifact_digest="a" * 64,
+    )
+    channel = issuer.activate_spawn_channel(
+        board_slug="default",
+        task_id="t_broker_pause",
+        run_id=47,
+        profile="bookkeeper",
+        profile_home=str(profile_home),
+        workspace=str(workspace),
+    )
+    channel.send_envelope()
+    monkeypatch.setenv(permits.PERMIT_FD_ENV, str(os.dup(channel.child_fd)))
+    client = permits.claim_worker_permit_channel()
+    issuer.release_spawn_child(channel)
+    payload = json.loads(channel.permit.payload)
+    signed_context = {
+        key: copy.deepcopy(payload[key]) for key in issuer.CONTEXT_FIELDS
+    }
+    command = " ".join(payload["operation_sequence"][0]["argv"])
+    ticket = permits.prepare_scoped_terminal_permit(
+        command, "local", signed_context, client=client
+    )
+    events = _install_scoped_terminal_harness(
+        monkeypatch, context_overrides=signed_context
+    )
+    monkeypatch.setattr(
+        terminal_tool, "_check_all_guards", _prepared_approval(ticket, events)
+    )
+    first_revalidation = threading.Event()
+    revalidation_calls = []
+    original_revalidate = permits._revalidate_live_manifest_operation
+
+    def observe_revalidation(live_payload):
+        revalidation_calls.append(live_payload)
+        original_revalidate(live_payload)
+        if len(revalidation_calls) == 1:
+            first_revalidation.set()
+
+    monkeypatch.setattr(
+        permits, "_revalidate_live_manifest_operation", observe_revalidation
+    )
+    original_handle = issuer._handle_consume_request
+
+    def mutate_after_allow(channel_arg, request_bytes):
+        assert first_revalidation.wait(timeout=1)
+        response = original_handle(channel_arg, request_bytes)
+        secret.write_text('API_KEY="different-secret-value"\n', encoding="utf-8")
+        return response
+
+    monkeypatch.setattr(issuer, "_handle_consume_request", mutate_after_allow)
+    try:
+        result = json.loads(
+            terminal_tool.terminal_tool(command=command, workdir=str(workspace))
+        )
+    finally:
+        channel.close()
+        issuer.close()
+
+    assert result["status"] == "blocked"
+    assert "preparation_manifest_mismatch" in result["error"]
+    assert len(revalidation_calls) == 2
     assert not any(event[0] == "execute" for event in events)
 
 
@@ -277,6 +419,11 @@ def test_scoped_permit_never_retries_after_consumption(monkeypatch):
         "consume_scoped_terminal_permit",
         consume,
         raising=False,
+    )
+    monkeypatch.setattr(
+        terminal_tool,
+        "revalidate_scoped_terminal_permit_dispatch",
+        lambda _decision: None,
     )
 
     result = json.loads(terminal_tool.terminal_tool(command="rclone copyto source target"))

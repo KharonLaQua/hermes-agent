@@ -18,7 +18,7 @@ import socket
 import stat
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, NoReturn, Optional
 
 from cryptography.exceptions import InvalidSignature
@@ -264,6 +264,9 @@ class PermitDecision:
     allowed: bool
     failure_class: str | None
     permit_id_digest: str | None
+    _dispatch_payload: dict[str, Any] | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 @dataclass(frozen=True)
@@ -850,6 +853,11 @@ def _classify_manifest_bytes(relative_path: str, data: bytes) -> str:
     return "safe"
 
 
+def _manifest_root_identity(info: os.stat_result) -> dict[str, int]:
+    """Canonical root identity stable across planned child removals."""
+    return {"device": info.st_dev, "inode": info.st_ino}
+
+
 def _inventory_manifest_members(root: str, initial_stat: os.stat_result) -> list[dict[str, Any]]:
     """Inventory one stable directory into safe metadata and secret classifications."""
     members: list[dict[str, Any]] = []
@@ -903,14 +911,26 @@ def _inventory_manifest_members(root: str, initial_stat: os.stat_result) -> list
     return members
 
 
-def _load_member_manifest(path: str) -> tuple[bytes, list[dict[str, Any]]]:
+def _load_member_manifest(
+    path: str,
+) -> tuple[bytes, dict[str, int], list[dict[str, Any]]]:
     data = _read_preparation_file_bytes(path)
     try:
         document = _parse_canonical(data)
     except ScopedTerminalPermitError:
         raise ScopedTerminalPermitError("preparation_manifest_malformed") from None
-    if set(document) != {"version", "members"} or document["version"] != _MANIFEST_VERSION:
+    if (
+        set(document) != {"version", "root_identity", "members"}
+        or document["version"] != _MANIFEST_VERSION
+    ):
         raise ScopedTerminalPermitError("preparation_manifest_malformed")
+    root_identity = document["root_identity"]
+    if not isinstance(root_identity, dict) or set(root_identity) != {"device", "inode"}:
+        raise ScopedTerminalPermitError("preparation_manifest_malformed")
+    normalized_root_identity = {
+        "device": _require_int(root_identity["device"]),
+        "inode": _require_int(root_identity["inode"]),
+    }
     members = document["members"]
     if not isinstance(members, list) or not members:
         raise ScopedTerminalPermitError("preparation_manifest_malformed")
@@ -942,16 +962,19 @@ def _load_member_manifest(path: str) -> tuple[bytes, list[dict[str, Any]]]:
         raise ScopedTerminalPermitError("preparation_manifest_malformed")
     if normalized != sorted(normalized, key=lambda item: item["path"]):
         raise ScopedTerminalPermitError("preparation_manifest_malformed")
-    return data, normalized
+    return data, normalized_root_identity, normalized
 
 
 def _read_manifest_selected_metadata(
     source: Mapping[str, Any], initial_stat: os.stat_result
 ) -> tuple[int, str]:
     manifest_path = source["manifest_path"]
-    manifest_bytes, declared = _load_member_manifest(manifest_path)
+    manifest_bytes, prepared_root_identity, declared = _load_member_manifest(manifest_path)
     observed = _inventory_manifest_members(source["canonical_path"], initial_stat)
-    if observed != declared:
+    if (
+        _manifest_root_identity(initial_stat) != prepared_root_identity
+        or observed != declared
+    ):
         raise ScopedTerminalPermitError("preparation_manifest_mismatch")
     return _manifest_selected_metadata(declared)
 
@@ -991,7 +1014,7 @@ def _validate_manifest_operation_members(
     if members is None or manifest_bytes is None:
         if not os.path.isfile(source["manifest_path"]):
             raise ScopedTerminalPermitError("preparation_manifest_unreadable")
-        manifest_bytes, members = _load_member_manifest(source["manifest_path"])
+        manifest_bytes, _, members = _load_member_manifest(source["manifest_path"])
     if validate_source_metadata:
         _validate_manifest_source_metadata(source, manifest_bytes, members)
     safe_paths = {
@@ -1139,11 +1162,13 @@ def _live_manifest_directory_exists(root: str, relative_path: str) -> bool:
 
 
 def _revalidate_live_manifest_operation(payload: Mapping[str, Any]) -> None:
-    """Re-read only the members the next signed operation is allowed to touch."""
+    """Compare complete live inventory/root identity to the signed baseline."""
     source = payload["source"]
     if source["kind"] != "directory" or source["manifest_path"] is None:
         return
-    manifest_bytes, members = _load_member_manifest(source["manifest_path"])
+    manifest_bytes, prepared_root_identity, members = _load_member_manifest(
+        source["manifest_path"]
+    )
     _validate_manifest_source_metadata(source, manifest_bytes, members)
     operations = payload["operation_sequence"]
     _validate_manifest_operation_members(
@@ -1167,6 +1192,21 @@ def _revalidate_live_manifest_operation(payload: Mapping[str, Any]) -> None:
             expected_removed_files.update(previous["argv"][2:])
         elif previous["kind"] == "rmdir_manifest_batch":
             expected_removed_directories.update(previous["argv"][2:])
+    live_root = _preparation_lstat(root)
+    if (
+        not stat.S_ISDIR(live_root.st_mode)
+        or _manifest_root_identity(live_root) != prepared_root_identity
+    ):
+        raise ScopedTerminalPermitError("preparation_source_changed")
+    observed_members = _inventory_manifest_members(root, live_root)
+    expected_members = [
+        member
+        for member in members
+        if _canonical_operation_path(os.path.join(root, member["path"]))
+        not in expected_removed_files
+    ]
+    if observed_members != expected_members:
+        raise ScopedTerminalPermitError("preparation_manifest_mismatch")
     for path in expected_removed_files:
         relative = os.path.relpath(path, root).replace(os.sep, "/")
         if _live_manifest_file_digest(root, relative, allow_missing=True) is not None:
@@ -1295,10 +1335,6 @@ def _build_manifest_contract(
         }
     )
     final_contract["operation_sequence"] = operations
-    if len(manifest_bytes) > _MANIFEST_MAX_CONTRACT_BYTES:
-        raise ScopedTerminalPermitError("preparation_contract_too_large")
-    if len(_canonical_bytes(final_contract)) > _MANIFEST_MAX_CONTRACT_BYTES:
-        raise ScopedTerminalPermitError("preparation_contract_too_large")
     return final_contract, manifest_bytes
 
 
@@ -1390,6 +1426,18 @@ def _prepared_terminal_contract(
     manifest_bytes: bytes | None = None,
 ) -> PreparedTerminalContract:
     canonical = _canonical_bytes(normalized)
+    if len(canonical) > _MANIFEST_MAX_CONTRACT_BYTES:
+        raise ScopedTerminalPermitError("preparation_contract_too_large")
+    cap_manifest_bytes = manifest_bytes
+    if cap_manifest_bytes is None and normalized["source"]["manifest_path"] is not None:
+        cap_manifest_bytes = _read_preparation_file_bytes(
+            normalized["source"]["manifest_path"]
+        )
+    if (
+        cap_manifest_bytes is not None
+        and len(cap_manifest_bytes) > _MANIFEST_MAX_CONTRACT_BYTES
+    ):
+        raise ScopedTerminalPermitError("preparation_contract_too_large")
     sequence_digest = _digest(_canonical_bytes(normalized["operation_sequence"]))
     readback = _canonical_bytes(
         {
@@ -1435,6 +1483,7 @@ def preflight_scoped_terminal_contract(
         manifest_bytes = _canonical_bytes(
             {
                 "version": _MANIFEST_VERSION,
+                "root_identity": _manifest_root_identity(info),
                 "members": sorted(members, key=lambda item: item["path"]),
             }
         )
@@ -1512,7 +1561,11 @@ def prepare_scoped_terminal_contract(
             raise ScopedTerminalPermitError("preparation_source_unreadable")
         members = _inventory_manifest_members(source["canonical_path"], info)
         manifest_bytes = _canonical_bytes(
-            {"version": _MANIFEST_VERSION, "members": sorted(members, key=lambda item: item["path"])}
+            {
+                "version": _MANIFEST_VERSION,
+                "root_identity": _manifest_root_identity(info),
+                "members": sorted(members, key=lambda item: item["path"]),
+            }
         )
         _validate_manifest_operation_members(
             source,
@@ -2732,7 +2785,12 @@ class _WorkerPermitClient:
             if response["allowed"]:
                 if response["failure_class"] is not None:
                     raise ScopedTerminalPermitError("broker_protocol_error")
-                return PermitDecision(True, None, self.permit_id_digest)
+                return PermitDecision(
+                    True,
+                    None,
+                    self.permit_id_digest,
+                    copy.deepcopy(self._payload),
+                )
             return PermitDecision(
                 False,
                 response["failure_class"] or "malformed",
@@ -2917,3 +2975,11 @@ def consume_scoped_terminal_permit(
     if not isinstance(ticket, PreparedPermitTicket):
         raise ScopedTerminalPermitError("malformed")
     return origin.consume(ticket, execution_context)
+
+
+def revalidate_scoped_terminal_permit_dispatch(decision: object) -> None:
+    """Run the authenticated decision's final live guard at dispatch time."""
+    payload = getattr(decision, "_dispatch_payload", None)
+    if not getattr(decision, "allowed", False) or not isinstance(payload, Mapping):
+        raise ScopedTerminalPermitError("malformed")
+    _revalidate_live_manifest_operation(payload)

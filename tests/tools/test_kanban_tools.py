@@ -655,6 +655,53 @@ def test_bookkeeper_preparation_writes_only_new_digest_bound_contract(monkeypatc
     assert "s3://" not in result
 
 
+def test_bookkeeper_direct_prepare_rejects_over_cap_before_artifact_or_binding(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "bookkeeper")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        target = kb.create_task(
+            conn, title="bookkeeper", assignee="bookkeeper", initial_status="running"
+        )
+        assert kb.claim_task(conn, target)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", target)
+    contract = _arm_contract(tmp_path, profile="bookkeeper")
+    contract["workspace"] = str(workspace)
+    contract["operation_sequence"][0]["cwd"] = str(workspace)
+    source = workspace / "source.bin"
+    source.write_bytes(b"source")
+    contract["source"]["canonical_path"] = str(source)
+    contract["operation_sequence"][0]["argv"][2] = str(source)
+    oversized_remote = "s3://bucket/" + ("x" * 1_048_576)
+    contract["destination"]["canonical_uri"] = oversized_remote
+    contract["operation_sequence"][0]["argv"][3] = oversized_remote
+    output_path = workspace / "must-not-exist.json"
+
+    def reject_binding(*_args, **_kwargs):
+        raise AssertionError("over-cap preparation must not bind controller state")
+
+    monkeypatch.setattr(kb, "record_controller_contract_prepared", reject_binding)
+    result = json.loads(
+        kt._handle_prepare_terminal_contract(
+            {"task_id": target, "contract_path": str(output_path), "contract": contract}
+        )
+    )
+
+    assert "preparation_contract_too_large" in result.get("error", "")
+    assert not output_path.exists()
+
+
 def test_bookkeeper_manifest_preparation_writes_manifest_before_contract(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt

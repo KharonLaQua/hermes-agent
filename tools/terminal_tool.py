@@ -260,6 +260,7 @@ from hermes_cli.scoped_terminal_permits import (
     ScopedTerminalPermitError,
     build_worker_permit_execution_context,
     consume_scoped_terminal_permit,
+    revalidate_scoped_terminal_permit_dispatch,
 )
 
 
@@ -2849,6 +2850,19 @@ def terminal_tool(
                         _approved_run = True
                         from tools.interrupt import clear_current_thread_interrupt
                         clear_current_thread_interrupt()
+                        try:
+                            revalidate_scoped_terminal_permit_dispatch(permit_decision)
+                        except ScopedTerminalPermitError as exc:
+                            return json.dumps({
+                                "output": "",
+                                "exit_code": -1,
+                                "error": (
+                                    "BLOCKED: scoped terminal permit dispatch revalidation "
+                                    f"failed ({exc.failure_class}). Do NOT retry or fall back "
+                                    "to ordinary approval."
+                                ),
+                                "status": "blocked",
+                            }, ensure_ascii=False)
                     result = env.execute(command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
