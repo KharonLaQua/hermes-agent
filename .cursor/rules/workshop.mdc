@@ -1,0 +1,16 @@
+---
+description: Workshop constraints for Cursor agents and Bot-launched cloud runs
+alwaysApply: true
+---
+
+- Multi-step or Bot-launched work starts with `manager`. Pairing on one seam may pin `builder` mode instead.
+- `manager` writes no product code. `builder` is the only implementer.
+- Do not write large diffs in the unnamed parent if `manager` or `builder` exists.
+- Follow existing patterns. Do not invent a new architecture or framework.
+- Improve KITT as voice/driving radio only. Do not rebuild it. Device hands = Bossy (separate). Never brand Sightless/Hermes/Herald/Fleet/Nous as the product name.
+- Hermes (`~/.hermes`) is the local brain default. Do not stand up a second one.
+- Never commit secrets, tokens, or live Discord / gateway credentials.
+- After `builder` finishes, `verifier` before claiming done or opening a PR.
+- If the diff touches auth, config, tokens, IPC, HID, or network, spawn `security-auditor` before merge.
+- Keep diffs small. One job per PR. No drive-by refactors.
+- Use the repo's real check command. Do not invent a test runner.
